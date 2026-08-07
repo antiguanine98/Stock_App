@@ -1,8 +1,26 @@
+﻿# Secrets / local config
+config.json
+
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
 .env
-*.egg-info/
-.pytest_cache/
-.DS_Store
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# IDE / OS
+.idea/
+.vscode/
+.cursor/
+*.xlsx
+Thumbs.db
+Desktop.ini
+
+# Local backup
+_gh_backup/
