@@ -1,4 +1,4 @@
-"""헤드리스 GUI 스모크 테스트 (xvfb 권장)."""
+"""헤드리스 GUI 스모크 테스트 (QT_QPA_PLATFORM=offscreen 권장)."""
 
 from __future__ import annotations
 
@@ -26,8 +26,20 @@ def main() -> int:
     assert win.item_combo.count() == 5
     assert "STD-001" in win.item_combo.itemText(0)
 
+    # 드롭존 / 상태바
+    assert "테스트파일1.xlsx" in win.drop_zone.file_label.text()
+    assert "테스트파일1.xlsx" in win.status_file.text()
+    assert "소급 보정" in win.status_correction.text()
+    assert win._correction_count >= 1  # STD-002 동일일자 보정
+
+    # API 키 상태
+    win.api_key_edit.setText("")
+    win.refresh_api_status()
+    assert "미연결" in win.status_api.text()
+    win.api_key_edit.setText("dummy-key")
+    assert "연결 준비됨" in win.status_api.text()
+
     # 표 더블클릭 → 차트 탭 + 해당 관리번호 선택
-    # NST-014 는 두 번째 행(index 1)
     win.on_table_double_clicked(1, 0)
     assert win.tabs.currentIndex() == 1
     assert win.item_combo.currentData() == "NST-014"
