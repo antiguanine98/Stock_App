@@ -1,6 +1,11 @@
-# Stock_App v1.1
+# Stock_App v1.11
 
 생약표준품 재고 엑셀을 연도별 최종 재고량 기준으로 소급 보정하고, 품목/카테고리 추이 차트·3D 시각화·Gemini AI 분석을 제공하는 데스크톱 앱입니다.
+
+## v1.11 주요 변경
+
+- 스플래시: 이중 테두리 + **반투명 유리창** 패널
+- 3D 시각화 포인트 **마우스 오버 정보**(품목·구분·일자·재고량)
 
 ## v1.1 주요 변경
 
@@ -36,7 +41,7 @@ Gemini API Key는 앱 상단 입력란에 입력 후 [저장]하면 `config.json
 python -m PyInstaller --noconfirm --clean main.spec
 ```
 
-생성 위치: `dist/Stock_App_v1.1.exe`
+생성 위치: `dist/Stock_App_v1.11.exe`
 
 ## 탭 기능
 

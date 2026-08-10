@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.1
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.11
 """
 
 from __future__ import annotations
@@ -16,7 +16,17 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QPainter, QPixmap
+from PyQt6.QtGui import (
+    QBrush,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -52,7 +62,7 @@ except ImportError:  # pragma: no cover
     mplcursors = None
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
-APP_VERSION = "v1.1"
+APP_VERSION = "v1.11"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -721,9 +731,23 @@ class Chart3D(FigureCanvas):
         self.figure.set_facecolor("#ffffff")
         super().__init__(self.figure)
         self.setParent(parent)
+        self._ax3d = None
+        self._annot = None
+        self._hover_points: list[dict[str, Any]] = []
+        self._scatter = None
+        self._cursor = None
+        self.mpl_connect("motion_notify_event", self._on_hover)
         self._show_placeholder("엑셀을 로드하면 품목×시간×재고량 3D 시각화가 표시됩니다.")
 
+    def _clear_hover(self) -> None:
+        self._ax3d = None
+        self._annot = None
+        self._hover_points = []
+        self._scatter = None
+        self._cursor = None
+
     def _show_placeholder(self, message: str) -> None:
+        self._clear_hover()
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         ax.text(0.5, 0.5, message, ha="center", va="center", color="#64748b", fontsize=12)
@@ -733,6 +757,38 @@ class Chart3D(FigureCanvas):
             spine.set_visible(False)
         self.figure.tight_layout()
         self.draw()
+
+    def _on_hover(self, event) -> None:
+        """3D 포인트를 화면 좌표로 투영해 가장 가까운 점의 정보를 표시."""
+        if self._ax3d is None or self._annot is None or not self._hover_points:
+            return
+        if event.inaxes != self._ax3d or event.x is None or event.y is None:
+            if self._annot.get_visible():
+                self._annot.set_visible(False)
+                self.draw_idle()
+            return
+
+        from mpl_toolkits.mplot3d import proj3d
+
+        best: dict[str, Any] | None = None
+        best_dist = float("inf")
+        proj = self._ax3d.get_proj()
+        for point in self._hover_points:
+            x2, y2, _ = proj3d.proj_transform(point["x"], point["y"], point["z"], proj)
+            disp = self._ax3d.transData.transform((x2, y2))
+            dist = (disp[0] - event.x) ** 2 + (disp[1] - event.y) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best = point
+
+        # ~22px 이내일 때만 표시
+        if best is not None and best_dist <= 484:
+            self._annot.set_text(best["text"])
+            self._annot.set_visible(True)
+            self.draw_idle()
+        elif self._annot.get_visible():
+            self._annot.set_visible(False)
+            self.draw_idle()
 
     def plot_items(self, items: list[dict[str, Any]], category: str = "전체") -> None:
         filtered = [
@@ -745,13 +801,20 @@ class Chart3D(FigureCanvas):
 
         # 성능·가독성: 최대 40품목
         filtered = filtered[:40]
+        self._clear_hover()
         self.figure.clear()
         ax = self.figure.add_subplot(111, projection="3d")
         ax.set_facecolor("#fafbfc")
+        self._ax3d = ax
 
         all_dates = sorted({d for it in filtered for d in it["dates"]})
         date_to_x = {d: i for i, d in enumerate(all_dates)}
         colors = matplotlib.cm.viridis(np.linspace(0.15, 0.9, len(filtered)))
+
+        all_xs: list[float] = []
+        all_ys: list[float] = []
+        all_zs: list[float] = []
+        all_colors: list[Any] = []
 
         for i, item in enumerate(filtered):
             xs, ys, zs = [], [], []
@@ -761,8 +824,58 @@ class Chart3D(FigureCanvas):
                 xs.append(date_to_x[d])
                 ys.append(i)
                 zs.append(q)
+                self._hover_points.append(
+                    {
+                        "x": float(date_to_x[d]),
+                        "y": float(i),
+                        "z": float(q),
+                        "text": (
+                            f"{item['label']}\n"
+                            f"구분: {item.get('std_type') or '-'}\n"
+                            f"일자: {d}\n"
+                            f"재고량: {q:g}"
+                        ),
+                    }
+                )
+                all_xs.append(date_to_x[d])
+                all_ys.append(i)
+                all_zs.append(q)
+                all_colors.append(colors[i])
             if xs:
-                ax.plot(xs, ys, zs, color=colors[i], linewidth=1.6, marker="o", markersize=3)
+                ax.plot(xs, ys, zs, color=colors[i], linewidth=1.6, alpha=0.85)
+
+        if all_xs:
+            self._scatter = ax.scatter(
+                all_xs, all_ys, all_zs,
+                c=all_colors, s=36, depthshade=True, edgecolors="white", linewidths=0.4,
+            )
+            # mplcursors가 3D scatter를 지원하면 보조로 사용
+            if mplcursors is not None:
+                try:
+                    self._cursor = mplcursors.cursor(self._scatter, hover=True)
+
+                    @self._cursor.connect("add")
+                    def _on_add(sel):  # type: ignore[no-untyped-def]
+                        idx = int(sel.index) if sel.index is not None else 0
+                        if 0 <= idx < len(self._hover_points):
+                            sel.annotation.set_text(self._hover_points[idx]["text"])
+                        sel.annotation.get_bbox_patch().set(fc="#0b1f3a", alpha=0.92)
+                        sel.annotation.set_color("white")
+                except Exception:
+                    self._cursor = None
+
+        self._annot = ax.text2D(
+            0.02,
+            0.98,
+            "",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            color="white",
+            bbox=dict(boxstyle="round,pad=0.4", fc="#0b1f3a", ec="none", alpha=0.92),
+        )
+        self._annot.set_visible(False)
 
         ax.set_xlabel("시간(일자 순서)")
         ax.set_ylabel("품목")
@@ -960,6 +1073,9 @@ class MainWindow(QMainWindow):
         viz_row.addWidget(self.viz_category_combo)
         viz_row.addStretch(1)
         viz_layout.addLayout(viz_row)
+        viz_hint = QLabel("데이터 포인트에 마우스를 올리면 품목·구분·일자·재고량이 표시됩니다.")
+        viz_hint.setStyleSheet("color: #64748b; font-size: 12px;")
+        viz_layout.addWidget(viz_hint)
         self.chart3d = Chart3D()
         viz_layout.addWidget(self.chart3d, stretch=1)
         self.tabs.addTab(viz_wrap, "3D/통합 시각화")
@@ -1231,35 +1347,91 @@ class MainWindow(QMainWindow):
 
 
 def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar]:
-    pix = QPixmap(520, 300)
-    pix.fill(QColor("#0b1f3a"))
+    """반투명 패널 + 아웃라인 테두리 스플래시."""
+    w, h = 540, 320
+    pix = QPixmap(w, h)
+    pix.fill(Qt.GlobalColor.transparent)
+
     painter = QPainter(pix)
-    painter.setPen(QColor("#ffffff"))
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+    panel = QPainterPath()
+    panel.addRoundedRect(14, 14, w - 28, h - 28, 18, 18)
+
+    # 반투명 유리창 느낌의 배경
+    fill = QColor("#f4f7fb")
+    fill.setAlpha(210)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(fill))
+    painter.drawPath(panel)
+
+    # 은은한 상단 하이라이트 (반투명)
+    highlight = QColor("#ffffff")
+    highlight.setAlpha(70)
+    painter.setBrush(QBrush(highlight))
+    painter.drawRoundedRect(18, 18, w - 36, (h - 36) // 2, 16, 16)
+
+    # 바깥 프레임 테두리
+    outer = QPen(QColor("#1e3a5f"))
+    outer.setWidth(2)
+    outer.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(outer)
+    painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+    painter.drawPath(panel)
+
+    # 안쪽 얇은 이중 테두리
+    inner = QPen(QColor("#6b87a8"))
+    inner.setWidth(1)
+    painter.setPen(inner)
+    painter.drawRoundedRect(26, 26, w - 52, h - 52, 14, 14)
+
+    # 상단 로고 마크: 마름모+원 아웃라인
+    cx, cy = w // 2, 78
+    logo_pen = QPen(QColor("#1e3a5f"))
+    logo_pen.setWidth(2)
+    painter.setPen(logo_pen)
+    painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+    diamond = QPainterPath()
+    diamond.moveTo(cx, cy - 22)
+    diamond.lineTo(cx + 22, cy)
+    diamond.lineTo(cx, cy + 22)
+    diamond.lineTo(cx - 22, cy)
+    diamond.closeSubpath()
+    painter.drawPath(diamond)
+    painter.drawEllipse(cx - 10, cy - 10, 20, 20)
+
+    # 타이틀 / 버전
+    painter.setPen(QColor("#0b1f3a"))
     painter.setFont(QFont("Malgun Gothic", 16, QFont.Weight.Bold))
-    painter.drawText(pix.rect().adjusted(0, -30, 0, 0), Qt.AlignmentFlag.AlignCenter, "생약표준품 재고 분석 시스템")
+    painter.drawText(40, 130, w - 80, 36, Qt.AlignmentFlag.AlignHCenter, "생약표준품 재고 분석 시스템")
     painter.setFont(QFont("Malgun Gothic", 11))
-    painter.setPen(QColor("#93c5fd"))
-    painter.drawText(
-        pix.rect().adjusted(0, 30, 0, 0),
-        Qt.AlignmentFlag.AlignCenter,
-        f"{APP_VERSION} 초기화 중...",
-    )
+    painter.setPen(QColor("#3d5a80"))
+    painter.drawText(40, 168, w - 80, 28, Qt.AlignmentFlag.AlignHCenter, f"{APP_VERSION} 초기화 중...")
     painter.end()
 
     splash = QSplashScreen(pix)
+    splash.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+    splash.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     splash.show()
+
     bar = QProgressBar(splash)
-    bar.setGeometry(60, 230, 400, 18)
+    bar.setGeometry(70, 250, w - 140, 16)
     bar.setRange(0, 100)
     bar.setValue(0)
-    bar.setTextVisible(True)
+    bar.setTextVisible(False)
     bar.setStyleSheet(
         """
         QProgressBar {
-            background: #1e3a5f; border: 1px solid #3b82f6; border-radius: 6px; color: white;
-            text-align: center;
+            background: rgba(255, 255, 255, 120);
+            border: 1px solid #1e3a5f;
+            border-radius: 8px;
         }
-        QProgressBar::chunk { background-color: #3b82f6; border-radius: 5px; }
+        QProgressBar::chunk {
+            background-color: rgba(30, 58, 95, 210);
+            border-radius: 7px;
+            margin: 2px;
+        }
         """
     )
     bar.show()
@@ -1294,7 +1466,7 @@ def main() -> None:
             splash.showMessage(
                 labels[i],
                 Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
-                QColor("#dbeafe"),
+                QColor("#3d5a80"),
             )
             state["i"] += 1
             app.processEvents()
