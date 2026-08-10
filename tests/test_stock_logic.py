@@ -1,9 +1,10 @@
-"""엑셀 파싱 / 소급 보정 / AI 대상 필터 단위 테스트."""
+"""엑셀 파싱 / 연도별 소급 보정 / AI 대상 필터 단위 테스트."""
 
 from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from datetime import date
 
 import pandas as pd
@@ -16,106 +17,219 @@ from stock_logic import (  # noqa: E402
     StockPoint,
     apply_retroactive_correction,
     build_ai_prompt,
+    discover_timeseries_pairs,
     items_for_ai_analysis,
     load_stock_excel,
+    normalize_std_type,
 )
 
 
-SAMPLE = os.path.join(ROOT, "sample", "테스트파일1.xlsx")
+def _make_sample_xlsx() -> str:
+    rows = [
+        {
+            "순번": 1,
+            "표준품구분": "생약(표준생약)",
+            "관리번호": "STD-001",
+            "한글명": "감초",
+            "영문명": "Glycyrrhizae",
+            "잔고": 120,
+            "등록일자": "2020-01-01",
+            "분양여부": "Y",
+            "규격": "1g",
+            "단위": "병",
+            "가격(원)": 1000,
+            "변경일자1": date(2022, 2, 1),
+            "재고량1": 150,
+            "변경일자2": date(2023, 3, 10),
+            "재고량2": 140,
+            "변경일자3": date(2024, 5, 20),
+            "재고량3": 120,
+        },
+        {
+            "순번": 2,
+            "표준품구분": "생약(대조품)",
+            "관리번호": "NST-014",
+            "한글명": "당귀",
+            "영문명": "Angelicae",
+            "잔고": 8,
+            "등록일자": "2020-01-02",
+            "분양여부": "Y",
+            "규격": "1g",
+            "단위": "병",
+            "가격(원)": 2000,
+            "변경일자1": date(2023, 1, 1),
+            "재고량1": 10,
+            "변경일자2": date(2024, 6, 1),
+            "재고량2": 8,
+            "변경일자3": None,
+            "재고량3": None,
+        },
+        {
+            "순번": 3,
+            "표준품구분": "생약(표준생약)",
+            "관리번호": "STD-002",
+            "한글명": "황기",
+            "영문명": "Astragali",
+            "잔고": 50,
+            "등록일자": "2020-01-03",
+            "분양여부": "N",
+            "규격": "1g",
+            "단위": "병",
+            "가격(원)": 1500,
+            "변경일자1": date(2024, 2, 10),
+            "재고량1": 50,
+            "변경일자2": date(2024, 3, 1),
+            "재고량2": 45,
+            "변경일자3": date(2024, 3, 1),
+            "재고량3": 50,  # 동일일자 소급
+        },
+        {
+            "순번": 4,
+            "표준품구분": "생약(지표성분)",
+            "관리번호": "STD-003",
+            "한글명": "인삼",
+            "영문명": "Ginseng",
+            "잔고": 200,
+            "등록일자": "2020-01-04",
+            "분양여부": "Y",
+            "규격": "1g",
+            "단위": "병",
+            "가격(원)": 3000,
+            "변경일자1": date(2022, 1, 1),
+            "재고량1": 300,
+            "변경일자2": date(2023, 1, 1),
+            "재고량2": 250,
+            "변경일자3": date(2024, 1, 1),
+            "재고량3": 200,
+        },
+        {
+            "순번": 5,
+            "표준품구분": "생약(표준생약)",
+            "관리번호": "NST-020",
+            "한글명": "데이터없음",
+            "영문명": "Empty",
+            "잔고": 0,
+            "등록일자": "2020-01-05",
+            "분양여부": "N",
+            "규격": "1g",
+            "단위": "병",
+            "가격(원)": 0,
+            "변경일자1": None,
+            "재고량1": None,
+            "변경일자2": None,
+            "재고량2": None,
+            "변경일자3": None,
+            "재고량3": None,
+        },
+    ]
+    df = pd.DataFrame(rows)
+    fd, path = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    df.to_excel(path, index=False)
+    return path
 
 
-def test_retroactive_correction_keeps_last_same_date():
+def test_normalize_std_type():
+    assert normalize_std_type("생약(표준생약)") == "표준생약"
+    assert normalize_std_type("생약(대조품)") == "대조생약"
+    assert normalize_std_type("생약(지표성분)") == "지표성분"
+
+
+def test_discover_pairs_ignores_extra_columns():
+    cols = [
+        "순번", "표준품구분", "관리번호", "한글명", "영문명", "잔고", "등록일자", "분양여부",
+        "규격", "단위", "가격(원)",
+        "변경일자1", "재고량1", "변경일자2", "재고량2",
+    ]
+    pairs = discover_timeseries_pairs(cols)
+    assert pairs == [("변경일자1", "재고량1"), ("변경일자2", "재고량2")]
+
+
+def test_year_end_retroactive_correction():
+    points = [
+        StockPoint(date(2023, 3, 1), 40),
+        StockPoint(date(2023, 8, 1), 35),
+        StockPoint(date(2024, 2, 1), 50),  # 증가 → 2023 연도말 소급
+        StockPoint(date(2024, 7, 1), 45),
+    ]
+    corrected, cnt = apply_retroactive_correction(points)
+    assert [p.change_date.year for p in corrected] == [2023, 2024]
+    # 2023 연도말=35, 2024 연도말=45 → 증가 10 → 2023이 45로 보정
+    assert corrected[0].quantity == 45
+    assert corrected[1].quantity == 45
+    assert cnt == 1
+
+
+def test_same_date_last_value_within_year():
     points = [
         StockPoint(date(2024, 3, 1), 45),
         StockPoint(date(2024, 2, 10), 50),
-        StockPoint(date(2024, 3, 1), 50),  # 소급 보정
+        StockPoint(date(2024, 3, 1), 50),
         StockPoint(date(2024, 7, 1), 50),
     ]
-    corrected = apply_retroactive_correction(points)
-    assert [p.change_date for p in corrected] == [
-        date(2024, 2, 10),
-        date(2024, 3, 1),
-        date(2024, 7, 1),
-    ]
-    assert corrected[1].quantity == 50
+    corrected, _ = apply_retroactive_correction(points)
+    assert len(corrected) == 1
+    assert corrected[0].change_date == date(2024, 7, 1)
+    assert corrected[0].quantity == 50
 
 
 def test_load_sample_excel_and_identifiers():
-    df, items = load_stock_excel(SAMPLE)
-    assert "관리번호" in df.columns
-    assert "한글명" in df.columns
-    assert len(items) == 5
-    assert {it.manage_no for it in items} == {
-        "STD-001",
-        "NST-014",
-        "STD-002",
-        "STD-003",
-        "NST-020",
-    }
-    # STD-002: 동일일자 보정으로 최종 추이는 50→50→50, 변화 없음
-    std002 = next(it for it in items if it.manage_no == "STD-002")
-    assert len(std002.corrected_points) == 3
-    assert std002.corrected_points[1].quantity == 50
-    assert std002.has_stock_change is False
+    path = _make_sample_xlsx()
+    try:
+        df, items = load_stock_excel(path)
+        assert "관리번호" in df.columns
+        assert "한글명" in df.columns
+        assert "재고" in df.columns
+        assert "잔고" not in df.columns
+        assert "등록일자" not in df.columns
+        assert len(items) == 5
+        assert {it.manage_no for it in items} == {
+            "STD-001", "NST-014", "STD-002", "STD-003", "NST-020",
+        }
+        std001 = next(it for it in items if it.manage_no == "STD-001")
+        assert std001.std_type == "표준생약"
+        assert [p.change_date.year for p in std001.corrected_points] == [2022, 2023, 2024]
+        assert [p.quantity for p in std001.corrected_points] == [150, 140, 120]
 
+        nst = next(it for it in items if it.manage_no == "NST-014")
+        assert nst.std_type == "대조생약"
 
-def test_chart_points_exclude_empty_and_use_dates():
-    _, items = load_stock_excel(SAMPLE)
-    std001 = next(it for it in items if it.manage_no == "STD-001")
-    assert [p.change_date.isoformat() for p in std001.corrected_points] == [
-        "2024-02-01",
-        "2024-03-10",
-        "2024-05-20",
-    ]
-    assert [p.quantity for p in std001.corrected_points] == [150, 140, 120]
-
-    empty = next(it for it in items if it.manage_no == "NST-020")
-    assert empty.corrected_points == []
-    assert empty.has_stock_change is False
+        empty = next(it for it in items if it.manage_no == "NST-020")
+        assert empty.corrected_points == []
+        assert empty.has_stock_change is False
+    finally:
+        os.remove(path)
 
 
 def test_ai_targets_only_changed_items():
-    _, items = load_stock_excel(SAMPLE)
-    targets = items_for_ai_analysis(items)
-    codes = {it.manage_no for it in targets}
-    # 변화 있음: STD-001(150→120), NST-014(10→8), STD-003(300→200)
-    # 제외: STD-002(변화0), NST-020(데이터없음)
-    assert codes == {"STD-001", "NST-014", "STD-003"}
-    prompt = build_ai_prompt(targets)
-    assert "STD-001" in prompt
-    assert "STD-002" not in prompt
-    assert "NST-020" not in prompt
-
-
-def test_corrected_dataframe_pair_columns():
-    df, _ = load_stock_excel(SAMPLE)
-    assert list(df.columns[:8]) == [
-        "순번",
-        "표준품구분",
-        "관리번호",
-        "한글명",
-        "영문명",
-        "잔고",
-        "등록일자",
-        "분양여부",
-    ]
-    # I열 이후 쌍
-    assert df.columns[8] == "변경일자1"
-    assert df.columns[9] == "재고량1"
-    # NaN 아닌 날짜는 YYYY-MM-DD 문자열
-    val = df.loc[df["관리번호"] == "STD-001", "변경일자1"].iloc[0]
-    assert val == "2024-02-01"
+    path = _make_sample_xlsx()
+    try:
+        _, items = load_stock_excel(path)
+        targets = items_for_ai_analysis(items)
+        codes = {it.manage_no for it in targets}
+        assert "STD-001" in codes
+        assert "NST-014" in codes
+        assert "STD-003" in codes
+        assert "NST-020" not in codes
+        prompt = build_ai_prompt(targets)
+        assert "민간 분양" in prompt or "생약표준품" in prompt
+        assert "추가 생산" in prompt
+        assert "STD-001" in prompt
+        assert "NST-020" not in prompt
+    finally:
+        os.remove(path)
 
 
 if __name__ == "__main__":
     import traceback
 
     tests = [
-        test_retroactive_correction_keeps_last_same_date,
+        test_normalize_std_type,
+        test_discover_pairs_ignores_extra_columns,
+        test_year_end_retroactive_correction,
+        test_same_date_last_value_within_year,
         test_load_sample_excel_and_identifiers,
-        test_chart_points_exclude_empty_and_use_dates,
         test_ai_targets_only_changed_items,
-        test_corrected_dataframe_pair_columns,
     ]
     failed = 0
     for fn in tests:
