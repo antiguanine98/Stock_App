@@ -12,7 +12,9 @@ venv/
 # Build artifacts
 build/
 dist/
+# Keep packaging spec in repo; ignore other local specs
 *.spec
+!main.spec
 
 # IDE / OS
 .idea/

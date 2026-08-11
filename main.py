@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.11
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.12
 """
 
 from __future__ import annotations
@@ -69,9 +69,22 @@ try:
 except ImportError:  # pragma: no cover
     QWebEngineView = None  # type: ignore[misc, assignment]
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
-VIEWER_HTML_PATH = Path(__file__).parent / "viewer.html"
-APP_VERSION = "v1.11"
+def _app_dir() -> Path:
+    """개발 실행과 PyInstaller 동결 실행 모두에서 리소스 경로를 찾는다."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
+
+def _writable_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+CONFIG_PATH = _writable_dir() / "config.json"
+VIEWER_HTML_PATH = _app_dir() / "viewer.html"
+APP_VERSION = "v1.12"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
