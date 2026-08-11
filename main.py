@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.12
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.2
 """
 
 from __future__ import annotations
@@ -52,6 +52,8 @@ from stock_logic import (
     StockItem,
     build_ai_prompt,
     build_scatter3d_records,
+    collect_ai_analysis_flags,
+    extract_mentioned_codes_from_report,
     process_excel,
 )
 
@@ -84,7 +86,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.12"
+APP_VERSION = "v1.2"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -754,7 +756,7 @@ class Scatter3DView(QWidget):
         super().__init__(parent)
         self.setObjectName("scatter3dHost")
         self.setStyleSheet(
-            "#scatter3dHost { background-color: #0f1612; border: 1px solid #24332b; border-radius: 8px; }"
+            "#scatter3dHost { background-color: #f7faf8; border: 1px solid #d5e0da; border-radius: 8px; }"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -765,7 +767,7 @@ class Scatter3DView(QWidget):
         )
         self._fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._fallback.setWordWrap(True)
-        self._fallback.setStyleSheet("color: #B9CCC0; font-size: 13px; padding: 24px;")
+        self._fallback.setStyleSheet("color: #3d5348; font-size: 13px; padding: 24px;")
         layout.addWidget(self._fallback)
 
         self._web: Any = None
@@ -773,7 +775,7 @@ class Scatter3DView(QWidget):
             try:
                 web = QWebEngineView(self)
                 web.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-                web.page().setBackgroundColor(QColor(15, 22, 18))
+                web.page().setBackgroundColor(QColor(247, 250, 248))
                 layout.addWidget(web, stretch=1)
                 self._web = web
                 self._fallback.hide()
@@ -819,7 +821,7 @@ class Scatter3DView(QWidget):
         )
         html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
-html,body{{margin:0;height:100%;background:transparent;color:#B9CCC0;
+html,body{{margin:0;height:100%;background:#f7faf8;color:#3d5348;
 font-family:-apple-system,'Malgun Gothic',sans-serif;}}
 .wrap{{display:flex;align-items:center;justify-content:center;height:100%;
 padding:28px;text-align:center;line-height:1.7;font-size:14px;}}
@@ -1014,18 +1016,31 @@ class MainWindow(QMainWindow):
         viz_layout = QVBoxLayout(viz_wrap)
         viz_layout.setContentsMargins(10, 10, 10, 10)
         viz_row = QHBoxLayout()
-        viz_label = QLabel("표준품구분 필터")
+        viz_label = QLabel("표준품구분")
         viz_label.setObjectName("sectionLabel")
         viz_row.addWidget(viz_label)
         self.viz_category_combo = QComboBox()
         self.viz_category_combo.addItem("전체")
         self.viz_category_combo.currentIndexChanged.connect(self._refresh_3d)
         viz_row.addWidget(self.viz_category_combo)
+
+        ai_label = QLabel("AI 연동")
+        ai_label.setObjectName("sectionLabel")
+        viz_row.addWidget(ai_label)
+        self.viz_ai_filter = QComboBox()
+        self.viz_ai_filter.addItem("전체 표시", "all")
+        self.viz_ai_filter.addItem("5년 고갈 위험", "deplete")
+        self.viz_ai_filter.addItem("최근 분양 급증", "surge")
+        self.viz_ai_filter.addItem("고갈+급증", "deplete_surge")
+        self.viz_ai_filter.addItem("AI 리포트 언급", "mentioned")
+        self.viz_ai_filter.setMinimumWidth(150)
+        self.viz_ai_filter.currentIndexChanged.connect(self._refresh_3d)
+        viz_row.addWidget(self.viz_ai_filter)
         viz_row.addStretch(1)
         viz_layout.addLayout(viz_row)
         viz_hint = QLabel(
-            "드래그로 회전 · 휠/핀치로 확대축소 · 호버/탭으로 품목 정보 "
-            "(X: 총 변동량 · Y: 잔존 예상 소진기간 · Z: 연평균 분양량)"
+            "AI 고갈(빨강 링) · 급증(주황 링) · 리포트 언급(파랑 링) 표시 · "
+            "드래그 회전 · 휠/핀치 확대 · 호버/탭 정보"
         )
         viz_hint.setStyleSheet("color: #64748b; font-size: 12px;")
         viz_layout.addWidget(viz_hint)
@@ -1119,11 +1134,17 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "파일 처리 오류", message)
 
     def _on_excel_loaded(self, data: dict[str, Any]) -> None:
+        stock_items = list(data.get("stock_items") or [])
+        data["ai_flags"] = collect_ai_analysis_flags(stock_items)
+        data["ai_mentioned_codes"] = []
         self.inventory_data = data
         changed = sum(1 for it in data["items"] if it["has_change"])
+        deplete_n = len(data["ai_flags"].get("deplete_codes") or [])
+        surge_n = len(data["ai_flags"].get("surge_codes") or [])
         self.status_excel.setText(f"파일: {data['file_name']} ({data['row_count']}품목)")
         self.status_correction.setText(
-            f"소급 보정: {data['correction_count']:,}건 · 변동품목 {changed}건"
+            f"소급 보정: {data['correction_count']:,}건 · 변동 {changed}건 · "
+            f"고갈후보 {deplete_n} · 급증 {surge_n}"
         )
         self._populate_table(data)
         self._populate_filters(data)
@@ -1264,11 +1285,18 @@ class MainWindow(QMainWindow):
         if not self.inventory_data:
             return
         category = self.viz_category_combo.currentText() or "전체"
+        ai_mode = self.viz_ai_filter.currentData() if hasattr(self, "viz_ai_filter") else "all"
         stock_items: list[StockItem] = list(self.inventory_data.get("stock_items") or [])
         if category != "전체":
             stock_items = [it for it in stock_items if it.std_type == category]
+        ai_flags = self.inventory_data.get("ai_flags")
+        mentioned = set(self.inventory_data.get("ai_mentioned_codes") or [])
         try:
-            records = build_scatter3d_records(stock_items)
+            records = build_scatter3d_records(
+                stock_items,
+                ai_flags=ai_flags,
+                mentioned_codes=mentioned,
+            )
         except Exception as exc:
             self.chart3d.show_message(
                 "3D 산점도 데이터를 준비하지 못했습니다.\n"
@@ -1276,11 +1304,27 @@ class MainWindow(QMainWindow):
                 f"{exc}"
             )
             return
+
+        if ai_mode == "deplete":
+            records = [r for r in records if r.get("depleteWithin5y")]
+        elif ai_mode == "surge":
+            records = [r for r in records if r.get("recentSurge")]
+        elif ai_mode == "deplete_surge":
+            records = [r for r in records if r.get("depleteWithin5y") or r.get("recentSurge")]
+        elif ai_mode == "mentioned":
+            records = [r for r in records if r.get("aiMentioned")]
+
         if not records:
-            self.chart3d.show_message(
-                "3D 산점도로 표시할 품목이 없습니다.\n"
-                "등록일자와 변경이력(변경일자/재고량)이 있는 행이 필요합니다."
-            )
+            if ai_mode == "mentioned" and not mentioned:
+                self.chart3d.show_message(
+                    "아직 AI 리포트에서 언급된 품목이 없습니다.\n"
+                    "AI 분석이 완료되면 리포트에 등장한 관리번호가 여기에 표시됩니다."
+                )
+            else:
+                self.chart3d.show_message(
+                    "선택한 필터에 해당하는 3D 품목이 없습니다.\n"
+                    "표준품구분/AI 연동 필터를 바꿔 보세요."
+                )
             return
         self.chart3d.plot_records(
             records,
@@ -1291,6 +1335,8 @@ class MainWindow(QMainWindow):
         key = self.api_key_input.text().strip()
         stock_items = data.get("stock_items") or []
         changed = [it for it in stock_items if it.has_stock_change]
+        if "ai_flags" not in data:
+            data["ai_flags"] = collect_ai_analysis_flags(stock_items)
         if not changed:
             self.report_edit.setPlainText(
                 "분석 대상 없음\n\n수량 변화가 있는 품목이 없어 AI 분석을 건너뛰었습니다."
@@ -1302,8 +1348,12 @@ class MainWindow(QMainWindow):
                 f"(변동 품목 {len(changed)}건 대기 중)"
             )
             return
+        flags = data.get("ai_flags") or {}
+        deplete_n = len(flags.get("deplete_codes") or [])
+        surge_n = len(flags.get("surge_codes") or [])
         self.report_edit.setPlainText(
-            f"AI 분석 리포트 생성 중... (변동 품목 {len(changed)}건)\n잠시만 기다려 주세요."
+            f"AI 분석 리포트 생성 중... (변동 {len(changed)}건 · "
+            f"고갈후보 {deplete_n} · 급증 {surge_n})\n잠시만 기다려 주세요."
         )
         prompt = build_ai_prompt(stock_items)
         self.gemini_worker = GeminiWorker(key, prompt)
@@ -1314,13 +1364,23 @@ class MainWindow(QMainWindow):
     def _on_report_ready(self, text: str) -> None:
         self.report_edit.setMarkdown(text)
         self._set_api_status(True, f"연결됨 ({get_active_gemini_model()})")
+        if self.inventory_data is not None:
+            codes = [
+                it.manage_no
+                for it in (self.inventory_data.get("stock_items") or [])
+                if getattr(it, "manage_no", None)
+            ]
+            mentioned = extract_mentioned_codes_from_report(text, codes)
+            self.inventory_data["ai_mentioned_codes"] = mentioned
+            # AI 언급 품목을 3D에 즉시 반영
+            self._refresh_3d()
 
     def _on_report_error(self, message: str) -> None:
         self.report_edit.setPlainText(f"AI 분석 생성 실패:\n\n{message}")
         self._set_api_status(False, message)
 
 
-def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar]:
+def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar, QLabel]:
     """반투명 패널 + 아웃라인 테두리 스플래시."""
     w, h = 540, 320
     pix = QPixmap(w, h)
@@ -1389,8 +1449,18 @@ def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar]:
     splash.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
     splash.show()
 
+    # 상태 멘트: 하단 테두리에 잘리지 않도록 프로그레스바 위쪽에 배치
+    status = QLabel(splash)
+    status.setGeometry(40, 214, w - 80, 24)
+    status.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+    status.setStyleSheet(
+        "color: #3d5a80; font-size: 12px; font-family: 'Malgun Gothic'; background: transparent;"
+    )
+    status.setText("모듈 로드 중...")
+    status.show()
+
     bar = QProgressBar(splash)
-    bar.setGeometry(70, 250, w - 140, 16)
+    bar.setGeometry(70, 246, w - 140, 16)
     bar.setRange(0, 100)
     bar.setValue(0)
     bar.setTextVisible(False)
@@ -1410,7 +1480,7 @@ def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar]:
     )
     bar.show()
     app.processEvents()
-    return splash, bar
+    return splash, bar, status
 
 
 def main() -> None:
@@ -1423,7 +1493,7 @@ def main() -> None:
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)
 
-    splash, bar = create_splash(app)
+    splash, bar, status_label = create_splash(app)
     window = MainWindow()
 
     steps = [15, 35, 55, 75, 90, 100]
@@ -1442,11 +1512,7 @@ def main() -> None:
         i = state["i"]
         if i < len(steps):
             bar.setValue(steps[i])
-            splash.showMessage(
-                labels[i],
-                Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
-                QColor("#3d5a80"),
-            )
+            status_label.setText(labels[i])
             state["i"] += 1
             app.processEvents()
             QTimer.singleShot(320, tick)

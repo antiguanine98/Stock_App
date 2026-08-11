@@ -6,65 +6,78 @@
 <title>재고 이력의 지형도 — 표준품 3차원 구조 분석</title>
 <style>
   :root{
-    --ink:#F3F6F2; --ink-dim:#B9CCC0; --ink-faint:#8CA296;
-    --sage:#8FE0B0; --indigo:#7AA8FF; --clay:#F0916A;
-    --axis-x:#F2C55C; --axis-y:#F28FB4; --axis-z:#8FE3EE;
-    --panel-line: rgba(180,210,196,0.22);
+    --ink:#1a2b22; --ink-dim:#3d5348; --ink-faint:#6b7f74;
+    --sage:#1f8a54; --indigo:#2f62c9; --clay:#c45a32;
+    --axis-x:#b8860b; --axis-y:#c2185b; --axis-z:#0e7490;
+    --panel-line: rgba(30,58,50,0.14);
+    --panel-bg: #f7faf8;
+    --card-bg: rgba(255,255,255,0.88);
     --sans: -apple-system, 'Malgun Gothic', 'Pretendard', sans-serif;
     --serif: Georgia, 'Noto Serif KR', serif;
   }
   *{box-sizing:border-box; margin:0; padding:0;}
   html,body{
-    background: transparent;
+    background: var(--panel-bg);
     color: var(--ink); font-family: var(--sans); min-height:100vh; overflow-x:hidden;
   }
   body{ display:flex; flex-direction:column; min-height:100vh; }
-  header{ padding: 26px 26px 16px; border-bottom: 1px solid var(--panel-line); }
+  header{ padding: 26px 26px 16px; border-bottom: 1px solid var(--panel-line); background: #ffffff; }
   .eyebrow{ font-size:11px; letter-spacing:.24em; text-transform:uppercase; color: var(--sage); font-weight:600;
     margin-bottom:10px; display:flex; align-items:center; gap:10px; }
   .eyebrow::before{ content:''; width:22px; height:1px; background: var(--sage); display:inline-block; }
   .axis-key{ display:flex; flex-wrap:wrap; gap:8px 18px; font-size:12px; color: var(--ink-dim); }
   .axis-key span b{ color:var(--ink); font-weight:600; }
 
-  main{ position:relative; flex:1; }
-  #canvasWrap{ position:relative; width:100%; height: min(70vh, 700px); background:transparent; touch-action:none; }
+  main{ position:relative; flex:1; background: #eef3f0; }
+  #canvasWrap{ position:relative; width:100%; height: min(70vh, 700px); background:#eef3f0; touch-action:none; }
   canvas{ display:block; width:100%; height:100%; }
   #tooltip{
     position:absolute; pointer-events:none; display:none;
-    background: rgba(15,22,18,0.94); border:1px solid rgba(180,210,196,0.35);
-    color:var(--ink); font-size:12px; line-height:1.6; padding:9px 12px; border-radius:3px;
-    max-width:240px; z-index:5; box-shadow:0 6px 18px rgba(0,0,0,0.5);
+    background: rgba(255,255,255,0.96); border:1px solid rgba(30,58,50,0.22);
+    color:var(--ink); font-size:12px; line-height:1.6; padding:9px 12px; border-radius:6px;
+    max-width:240px; z-index:5; box-shadow:0 8px 22px rgba(20,40,30,0.12);
   }
   #tooltip b{ color: var(--axis-x); }
   #hint{
-    position:absolute; bottom:10px; left:50%; transform:translateX(-50%);
-    font-size:11px; color:var(--ink-faint); background:rgba(15,22,18,0.55);
-    padding:5px 10px; border-radius:20px; pointer-events:none;
+    position:absolute; bottom:12px; right:14px; left:auto; transform:none;
+    font-size:11px; color:var(--ink-dim);
+    background:rgba(255,255,255,0.92);
+    border:1px solid rgba(30,58,50,0.16);
+    padding:6px 12px; border-radius:16px; pointer-events:none;
+    box-shadow:0 4px 14px rgba(20,40,30,0.08);
+    max-width: min(320px, 70%);
+    text-align:right;
+    z-index:4;
   }
   #emptyMsg{
     display:none; position:absolute; inset:0; align-items:center; justify-content:center;
     text-align:center; color:var(--ink-dim); font-size:14px; padding:24px; line-height:1.7;
   }
 
-  .stats-strip{ display:flex; flex-wrap:wrap; gap:0; border-top:1px solid var(--panel-line); background:transparent; }
+  .stats-strip{ display:flex; flex-wrap:wrap; gap:0; border-top:1px solid var(--panel-line); background:#ffffff; }
   .stat{ flex:1; min-width:120px; padding: 14px 20px; border-right:1px solid var(--panel-line); }
   .stat:last-child{border-right:none;}
   .stat .num{ font-family:var(--serif); font-size:20px; font-weight:700; color:var(--ink); }
   .stat .num.sage{color:var(--sage);} .stat .num.indigo{color:var(--indigo);} .stat .num.clay{color:var(--clay);}
   .stat .lbl{ font-size:10.5px; color:var(--ink-faint); letter-spacing:.05em; margin-top:2px; }
 
-  .legend-card{ margin: 14px 26px 4px; padding: 14px 16px; background: rgba(15,22,18,0.4); border: 1px solid var(--panel-line);
-    border-radius: 2px; font-size: 12px; color: var(--ink-dim); line-height: 1.8; position:relative; }
-  .legend-card::before{ content:'표본 색인'; position:absolute; top:-9px; left:14px; background: rgba(15,22,18,0.9);
+  .legend-card{ margin: 14px 26px 4px; padding: 14px 16px; background: var(--card-bg); border: 1px solid var(--panel-line);
+    border-radius: 8px; font-size: 12px; color: var(--ink-dim); line-height: 1.8; position:relative; }
+  .legend-card::before{ content:'표본 색인'; position:absolute; top:-9px; left:14px; background: #ffffff;
     padding: 0 8px; font-size:10px; letter-spacing:.14em; color:var(--sage); font-weight:600; }
   .legend-row{display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;}
   .legend-row b{color:var(--ink); font-weight:600; min-width:56px; display:inline-block;}
   .swatch{display:inline-block; width:10px;height:10px;border-radius:2px; margin-right:5px; vertical-align:middle;}
+  .ring{display:inline-block; width:10px;height:10px;border-radius:50%; margin-right:5px; vertical-align:middle; background:transparent; box-sizing:border-box;}
+  .ring.deplete{border:2px solid #dc2626;}
+  .ring.surge{border:2px solid #ea580c;}
+  .ring.mentioned{border:2px solid #2563eb;}
 
-  footer{ padding: 14px 26px 22px; color: var(--ink-faint); font-size: 11px; border-top:1px solid var(--panel-line); }
+  footer{ padding: 14px 26px 22px; color: var(--ink-faint); font-size: 11px; border-top:1px solid var(--panel-line); background:#ffffff; }
   @media (max-width: 640px){
     header{padding:20px 16px 14px;} .legend-card{margin:12px 16px 4px;}
     .stat{padding:12px 14px; min-width:44%;} footer{padding:12px 16px 18px;}
+    #hint{ max-width: min(260px, 78%); font-size:10.5px; }
   }
 </style>
 </head>
@@ -92,6 +105,11 @@
     <span><span class="swatch" style="background:#8FE0B0"></span>표준생약</span>
     <span><span class="swatch" style="background:#7AA8FF"></span>지표성분</span>
     <span><span class="swatch" style="background:#F0916A"></span>대조품</span>
+  </div>
+  <div class="legend-row"><b>AI 연동</b>
+    <span><span class="ring deplete"></span>5년 고갈 위험</span>
+    <span><span class="ring surge"></span>최근 분양 급증</span>
+    <span><span class="ring mentioned"></span>AI 리포트 언급</span>
   </div>
 </div>
 
@@ -313,11 +331,11 @@ function project(p){
 const POINT_SIZE = 2.6;
 
 const AXES = [
-  { from:{x:-1.15,y:-1,z:-1}, to:{x:1.15,y:-1,z:-1}, label:'총 변동량', axis:'x', color:'#F2C55C',
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:1.15,y:-1,z:-1}, label:'총 변동량', axis:'x', color:'#b8860b',
     ticks: RANGE_FULL.xTicks },
-  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:1.05,z:-1}, label:'잔존 예상 소진기간(년)', axis:'y', color:'#F28FB4',
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:1.05,z:-1}, label:'잔존 예상 소진기간(년)', axis:'y', color:'#c2185b',
     ticks: RANGE_FULL.yTicks },
-  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:-1,z:1.1}, label:'연평균 분양량', axis:'z', color:'#8FE3EE',
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:-1,z:1.1}, label:'연평균 분양량', axis:'z', color:'#0e7490',
     ticks: RANGE_FULL.zTicks }
 ];
 
@@ -340,7 +358,7 @@ function draw(){
   AXES.forEach(ax => {
     const a = project(rotate(ax.from));
     const b = project(rotate(ax.to));
-    ctx.strokeStyle = 'rgba(200,220,210,0.4)';
+    ctx.strokeStyle = 'rgba(45,70,58,0.35)';
     ctx.beginPath(); ctx.moveTo(a.sx,a.sy); ctx.lineTo(b.sx,b.sy); ctx.stroke();
 
     ax.ticks.forEach(tk => {
@@ -352,7 +370,7 @@ function draw(){
         z: lerp(ax.from.z, ax.to.z, t)
       };
       const sp = project(rotate(p3));
-      ctx.fillStyle = 'rgba(225,235,229,0.95)';
+      ctx.fillStyle = 'rgba(26,43,34,0.88)';
       ctx.font = '10px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText(tk.label, sp.sx, sp.sy + 12);
@@ -368,12 +386,37 @@ function draw(){
   // points
   projected.forEach(p => {
     const c = colorForCat(p.r.cat);
-    const alpha = 0.6 + (p.depth + 1) / 2 * 0.4;
-    const size = POINT_SIZE * (1 + p.depth * 0.15);
+    const alpha = 0.55 + (p.depth + 1) / 2 * 0.4;
+    let size = POINT_SIZE * (1 + p.depth * 0.15);
+    if (p.r.depleteWithin5y || p.r.recentSurge || p.r.aiMentioned){
+      size *= 1.35;
+    }
     ctx.beginPath();
     ctx.arc(p.sx, p.sy, size, 0, Math.PI*2);
     ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
     ctx.fill();
+
+    // AI 연동 강조 링 (고갈 > 급증 > 언급 우선)
+    if (p.r.depleteWithin5y){
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, size + 3.2, 0, Math.PI*2);
+      ctx.strokeStyle = 'rgba(220,38,38,0.95)';
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+    } else if (p.r.recentSurge){
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, size + 3.0, 0, Math.PI*2);
+      ctx.strokeStyle = 'rgba(234,88,12,0.95)';
+      ctx.lineWidth = 2.0;
+      ctx.stroke();
+    }
+    if (p.r.aiMentioned){
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, size + (p.r.depleteWithin5y || p.r.recentSurge ? 5.5 : 3.0), 0, Math.PI*2);
+      ctx.strokeStyle = 'rgba(37,99,235,0.9)';
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
   });
 
   window._projected = projected;
@@ -413,9 +456,17 @@ function showInfoAt(p){
   }
   if (best){
     const r = best.r;
+    const tags = [];
+    if (r.depleteWithin5y) tags.push('5년 고갈 위험');
+    if (r.recentSurge) tags.push('최근 분양 급증');
+    if (r.aiMentioned) tags.push('AI 리포트 언급');
+    const tagHtml = tags.length ? `<br><span style="color:#b91c1c">${tags.join(' · ')}</span>` : '';
+    const yearsLeft = (typeof r.yearsLeft === 'number' && isFinite(r.yearsLeft))
+      ? fmtNum(r.yearsLeft) + '년' : '-';
     tooltip.innerHTML = `<b>${r.name}</b> (${r.code})<br>` +
       `총 변동량 ${fmtNum(r.totalVariation)} · 잔존 예상 ${fmtNum(r.runway)}년<br>` +
-      `연평균 분양량 ${fmtNum(r.annualRate)} · 경과기간 ${fmtNum(r.elapsedYears)}년 (소진율 ${fmtNum(r.decreaseRate)}%)`;
+      `연평균 분양량 ${fmtNum(r.annualRate)} · 경과기간 ${fmtNum(r.elapsedYears)}년 (소진율 ${fmtNum(r.decreaseRate)}%)<br>` +
+      `분양속도 ${r.speed || '-'} · AI 예상소진 ${yearsLeft}` + tagHtml;
     let left = p.x + 14, top = p.y + 10;
     if (left + 240 > W) left = p.x - 254;
     tooltip.style.left = left + 'px';

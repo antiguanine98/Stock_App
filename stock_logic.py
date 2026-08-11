@@ -536,9 +536,58 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
     }
 
 
+def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
+    """AI 프롬프트와 동일한 기준으로 고갈·급증 품목 플래그를 산출."""
+    deplete_codes: list[str] = []
+    surge_codes: list[str] = []
+    by_code: dict[str, dict[str, Any]] = {}
+
+    for it in items_for_ai_analysis(items):
+        stats = estimate_depletion(it)
+        flag = {
+            "label": it.label,
+            "manage_no": it.manage_no,
+            "speed": stats["speed"],
+            "years_left": stats["years_left"],
+            "deplete_within_5y": bool(stats["deplete_within_5y"]),
+            "recent_surge": bool(stats["recent_surge"]),
+        }
+        if it.manage_no:
+            by_code[it.manage_no] = flag
+        if flag["deplete_within_5y"]:
+            deplete_codes.append(it.manage_no or it.label)
+        if flag["recent_surge"]:
+            surge_codes.append(it.manage_no or it.label)
+
+    return {
+        "by_code": by_code,
+        "deplete_codes": [c for c in deplete_codes if c],
+        "surge_codes": [c for c in surge_codes if c],
+        "deplete_labels": [
+            by_code[c]["label"] for c in deplete_codes if c in by_code
+        ],
+        "surge_labels": [
+            by_code[c]["label"] for c in surge_codes if c in by_code
+        ],
+    }
+
+
+def extract_mentioned_codes_from_report(report: str, known_codes: list[str]) -> list[str]:
+    """AI 리포트 본문에 등장한 관리번호를 추출 (긴 코드 우선)."""
+    if not report:
+        return []
+    ordered = sorted({c for c in known_codes if c}, key=len, reverse=True)
+    found: list[str] = []
+    for code in ordered:
+        if code in report:
+            found.append(code)
+    return found
+
+
 def build_ai_prompt(items: list[StockItem]) -> str:
     targets = items_for_ai_analysis(items)
     bulk_dates = detect_bulk_decrease_dates(items)
+    flags = collect_ai_analysis_flags(items)
 
     lines = [
         "당신은 생약표준품 재고·분양 분석 전문가입니다.",
@@ -560,28 +609,26 @@ def build_ai_prompt(items: list[StockItem]) -> str:
         "[재고 변동 핵심 데이터]",
     ]
 
-    deplete_list: list[str] = []
-    surge_list: list[str] = []
-
     for it in targets:
-        stats = estimate_depletion(it)
+        stats = flags["by_code"].get(it.manage_no) or {
+            **estimate_depletion(it),
+            "label": it.label,
+        }
         history = ", ".join(
             f"{format_date(p.change_date)}={p.quantity:g}" for p in it.corrected_points
         )
-        years_left = stats["years_left"]
+        years_left = stats.get("years_left")
         years_txt = f"{years_left:.1f}년" if years_left is not None else "산출불가/감소없음"
         lines.append(
             f"- {it.label} | 구분:{it.std_type} | 분양여부:{_cell_str(it.distributed)} | "
             f"최초:{it.first_qty:g} → 최종:{it.last_qty:g} (Δ{it.qty_delta:+g}) | "
-            f"분양속도:{stats['speed']} | 예상소진:{years_txt} | "
-            f"5년이내고갈:{'예' if stats['deplete_within_5y'] else '아니오'} | "
-            f"최근급증:{'예' if stats['recent_surge'] else '아니오'} | 추이:[{history}]"
+            f"분양속도:{stats.get('speed')} | 예상소진:{years_txt} | "
+            f"5년이내고갈:{'예' if stats.get('deplete_within_5y') else '아니오'} | "
+            f"최근급증:{'예' if stats.get('recent_surge') else '아니오'} | 추이:[{history}]"
         )
-        if stats["deplete_within_5y"]:
-            deplete_list.append(it.label)
-        if stats["recent_surge"]:
-            surge_list.append(it.label)
 
+    deplete_list = flags.get("deplete_labels") or []
+    surge_list = flags.get("surge_labels") or []
     lines.append("")
     lines.append(
         f"[사전 산출: 5년 이내 고갈 후보] {', '.join(deplete_list) if deplete_list else '없음'}"
@@ -620,7 +667,11 @@ def scatter_cat_label(std_type: str, std_type_raw: Any = None) -> str:
     return text
 
 
-def build_scatter3d_record(item: StockItem) -> Optional[dict[str, Any]]:
+def build_scatter3d_record(
+    item: StockItem,
+    ai_flags: dict[str, Any] | None = None,
+    mentioned_codes: set[str] | None = None,
+) -> Optional[dict[str, Any]]:
     """3D 산점도용 품목 레코드. 필수 이력이 없으면 None."""
     if not item.raw_points or item.registered_date is None:
         return None
@@ -642,6 +693,22 @@ def build_scatter3d_record(item: StockItem) -> Optional[dict[str, Any]]:
         decrease_rate = 0.0
     runway = balance / annual_rate if annual_rate > 0 else 9999.0
 
+    flag = (ai_flags or {}).get(item.manage_no) if ai_flags else None
+    if flag is None:
+        # 산점도용으로도 동일 기준 보조 산출
+        stats = estimate_depletion(item)
+        deplete = bool(stats.get("deplete_within_5y"))
+        surge = bool(stats.get("recent_surge"))
+        speed = stats.get("speed")
+        years_left = stats.get("years_left")
+    else:
+        deplete = bool(flag.get("deplete_within_5y"))
+        surge = bool(flag.get("recent_surge"))
+        speed = flag.get("speed")
+        years_left = flag.get("years_left")
+
+    mentioned = bool(mentioned_codes and item.manage_no in mentioned_codes)
+
     return {
         "cat": scatter_cat_label(item.std_type, item.std_type_raw),
         "code": item.manage_no,
@@ -653,14 +720,29 @@ def build_scatter3d_record(item: StockItem) -> Optional[dict[str, Any]]:
         "annualRate": round(float(annual_rate), 6),
         "runway": round(float(runway), 6),
         "elapsedYears": round(float(elapsed_years), 6),
+        "depleteWithin5y": deplete,
+        "recentSurge": surge,
+        "speed": speed or "",
+        "yearsLeft": None if years_left is None else round(float(years_left), 4),
+        "aiMentioned": mentioned,
     }
 
 
-def build_scatter3d_records(items: list[StockItem]) -> list[dict[str, Any]]:
+def build_scatter3d_records(
+    items: list[StockItem],
+    ai_flags: dict[str, Any] | None = None,
+    mentioned_codes: set[str] | list[str] | None = None,
+) -> list[dict[str, Any]]:
     """유효한 3D 산점도 레코드만 모은다."""
+    flag_map = None
+    if isinstance(ai_flags, dict) and "by_code" in ai_flags:
+        flag_map = ai_flags["by_code"]
+    elif isinstance(ai_flags, dict):
+        flag_map = ai_flags
+    mentioned = set(mentioned_codes or [])
     records: list[dict[str, Any]] = []
     for item in items:
-        rec = build_scatter3d_record(item)
+        rec = build_scatter3d_record(item, ai_flags=flag_map, mentioned_codes=mentioned)
         if rec is not None:
             records.append(rec)
     return records

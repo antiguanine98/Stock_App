@@ -1,6 +1,12 @@
-# Stock_App v1.12
+# Stock_App v1.2
 
 생약표준품 재고 엑셀을 연도별 최종 재고량 기준으로 소급 보정하고, 품목/카테고리 추이 차트·3D 시각화·Gemini AI 분석을 제공하는 데스크톱 앱입니다.
+
+## v1.2 주요 변경
+
+- **AI ↔ 3D 연동**: AI와 동일 기준으로 5년 고갈·급증 플래그 산출, 리포트에 언급된 관리번호를 3D에 표시
+- 3D 필터: 전체 / 5년 고갈 / 급증 / 고갈+급증 / AI 리포트 언급
+- 링 표시: 빨강(고갈), 주황(급증), 파랑(AI 언급)
 
 ## v1.12 주요 변경
 
@@ -47,19 +53,15 @@ Gemini API Key는 앱 상단 입력란에 입력 후 [저장]하면 `config.json
 python -m PyInstaller --noconfirm --clean main.spec
 ```
 
-생성 위치: `dist/Stock_App_v1.12.exe`
+생성 위치: `dist/Stock_App_v1.2.exe`
 
 ## 탭 기능
 
 1. **보정 데이터 표** — 행 더블클릭 시 해당 품목 차트로 이동
 2. **재고 추이 차트** — 표준품구분/품목 선택, hover로 일자·수량 확인
 3. **AI 분석 리포트** — 분양 속도·소진 예측·5년 고갈 경고
-4. **3D/통합 시각화** — 총 변동량 × 잔존 예상 소진기간(년, 로그) × 연평균 분양량
+4. **3D/통합 시각화** — 총 변동량 × 잔존 예상 소진기간(년, 로그) × 연평균 분양량 + AI 연동 필터
 
 ## 테스트
 
-```bash
-python tests/test_stock_logic.py
-set QT_QPA_PLATFORM=offscreen
-python tests/test_gui_smoke.py
-```
+Excel 파일 로드 후 각 탭에서 표·차트·AI·3D가 정상 동작하는지 확인하세요.
