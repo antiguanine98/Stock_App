@@ -46,6 +46,12 @@ def _sample_path() -> str:
 
 def main() -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtCore import Qt
+
+    try:
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+    except Exception:
+        pass
     app = QApplication.instance() or QApplication(sys.argv)
     win = MainWindow()
 
@@ -70,6 +76,10 @@ def main() -> int:
             if hasattr(w, "text")
         )
         assert win.tabs.count() == 4
+        # 3D 탭: 산점도 레코드 주입 경로
+        win.tabs.setCurrentIndex(3)
+        win._refresh_3d()
+        assert hasattr(win.chart3d, "plot_records")
         print("PASS GUI smoke")
         win.close()
         return 0

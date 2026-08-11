@@ -11,11 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
-import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -50,7 +48,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from stock_logic import build_ai_prompt, process_excel
+from stock_logic import (
+    StockItem,
+    build_ai_prompt,
+    build_scatter3d_records,
+    process_excel,
+)
 
 matplotlib.use("QtAgg")
 matplotlib.rcParams["font.family"] = "Malgun Gothic"
@@ -61,7 +64,13 @@ try:
 except ImportError:  # pragma: no cover
     mplcursors = None
 
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+except ImportError:  # pragma: no cover
+    QWebEngineView = None  # type: ignore[misc, assignment]
+
 CONFIG_PATH = Path(__file__).parent / "config.json"
+VIEWER_HTML_PATH = Path(__file__).parent / "viewer.html"
 APP_VERSION = "v1.11"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
@@ -725,178 +734,106 @@ class InventoryChart(FigureCanvas):
         self.draw()
 
 
-class Chart3D(FigureCanvas):
+class Scatter3DView(QWidget):
+    """viewer.html 기반 3D 산점도 (QWebEngineView)."""
+
     def __init__(self, parent: QWidget | None = None):
-        self.figure = Figure(figsize=(10, 6), dpi=100)
-        self.figure.set_facecolor("#ffffff")
-        super().__init__(self.figure)
-        self.setParent(parent)
-        self._ax3d = None
-        self._annot = None
-        self._hover_points: list[dict[str, Any]] = []
-        self._scatter = None
-        self._cursor = None
-        self.mpl_connect("motion_notify_event", self._on_hover)
-        self._show_placeholder("엑셀을 로드하면 품목×시간×재고량 3D 시각화가 표시됩니다.")
+        super().__init__(parent)
+        self.setObjectName("scatter3dHost")
+        self.setStyleSheet(
+            "#scatter3dHost { background-color: #0f1612; border: 1px solid #24332b; border-radius: 8px; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-    def _clear_hover(self) -> None:
-        self._ax3d = None
-        self._annot = None
-        self._hover_points = []
-        self._scatter = None
-        self._cursor = None
+        self._fallback = QLabel(
+            "엑셀을 로드하면 총 변동량 · 잔존 예상 소진기간 · 연평균 분양량 3D 산점도가 표시됩니다."
+        )
+        self._fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._fallback.setWordWrap(True)
+        self._fallback.setStyleSheet("color: #B9CCC0; font-size: 13px; padding: 24px;")
+        layout.addWidget(self._fallback)
 
-    def _show_placeholder(self, message: str) -> None:
-        self._clear_hover()
-        self.figure.clear()
-        ax = self.figure.add_subplot(111)
-        ax.text(0.5, 0.5, message, ha="center", va="center", color="#64748b", fontsize=12)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-        self.figure.tight_layout()
-        self.draw()
-
-    def _on_hover(self, event) -> None:
-        """3D 포인트를 화면 좌표로 투영해 가장 가까운 점의 정보를 표시."""
-        if self._ax3d is None or self._annot is None or not self._hover_points:
-            return
-        if event.inaxes != self._ax3d or event.x is None or event.y is None:
-            if self._annot.get_visible():
-                self._annot.set_visible(False)
-                self.draw_idle()
-            return
-
-        from mpl_toolkits.mplot3d import proj3d
-
-        best: dict[str, Any] | None = None
-        best_dist = float("inf")
-        proj = self._ax3d.get_proj()
-        for point in self._hover_points:
-            x2, y2, _ = proj3d.proj_transform(point["x"], point["y"], point["z"], proj)
-            disp = self._ax3d.transData.transform((x2, y2))
-            dist = (disp[0] - event.x) ** 2 + (disp[1] - event.y) ** 2
-            if dist < best_dist:
-                best_dist = dist
-                best = point
-
-        # ~22px 이내일 때만 표시
-        if best is not None and best_dist <= 484:
-            self._annot.set_text(best["text"])
-            self._annot.set_visible(True)
-            self.draw_idle()
-        elif self._annot.get_visible():
-            self._annot.set_visible(False)
-            self.draw_idle()
-
-    def plot_items(self, items: list[dict[str, Any]], category: str = "전체") -> None:
-        filtered = [
-            it for it in items
-            if it.get("dates") and (category == "전체" or it.get("std_type") == category)
-        ]
-        if not filtered:
-            self._show_placeholder("3D로 표시할 데이터가 없습니다.")
-            return
-
-        # 성능·가독성: 최대 40품목
-        filtered = filtered[:40]
-        self._clear_hover()
-        self.figure.clear()
-        ax = self.figure.add_subplot(111, projection="3d")
-        ax.set_facecolor("#fafbfc")
-        self._ax3d = ax
-
-        all_dates = sorted({d for it in filtered for d in it["dates"]})
-        date_to_x = {d: i for i, d in enumerate(all_dates)}
-        colors = matplotlib.cm.viridis(np.linspace(0.15, 0.9, len(filtered)))
-
-        all_xs: list[float] = []
-        all_ys: list[float] = []
-        all_zs: list[float] = []
-        all_colors: list[Any] = []
-
-        for i, item in enumerate(filtered):
-            xs, ys, zs = [], [], []
-            for d, q in zip(item["dates"], item["corrected"]):
-                if q is None:
-                    continue
-                xs.append(date_to_x[d])
-                ys.append(i)
-                zs.append(q)
-                self._hover_points.append(
-                    {
-                        "x": float(date_to_x[d]),
-                        "y": float(i),
-                        "z": float(q),
-                        "text": (
-                            f"{item['label']}\n"
-                            f"구분: {item.get('std_type') or '-'}\n"
-                            f"일자: {d}\n"
-                            f"재고량: {q:g}"
-                        ),
-                    }
+        self._web: Any = None
+        if QWebEngineView is not None:
+            try:
+                web = QWebEngineView(self)
+                web.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+                web.page().setBackgroundColor(QColor(15, 22, 18))
+                layout.addWidget(web, stretch=1)
+                self._web = web
+                self._fallback.hide()
+                self.show_message(
+                    "엑셀을 로드하면 총 변동량 · 잔존 예상 소진기간 · 연평균 분양량 3D 산점도가 표시됩니다."
                 )
-                all_xs.append(date_to_x[d])
-                all_ys.append(i)
-                all_zs.append(q)
-                all_colors.append(colors[i])
-            if xs:
-                ax.plot(xs, ys, zs, color=colors[i], linewidth=1.6, alpha=0.85)
-
-        if all_xs:
-            self._scatter = ax.scatter(
-                all_xs, all_ys, all_zs,
-                c=all_colors, s=36, depthshade=True, edgecolors="white", linewidths=0.4,
+            except Exception:
+                self._web = None
+                self._fallback.setText(
+                    "3D 웹뷰를 초기화하지 못했습니다. PyQt6-WebEngine 설치를 확인해 주세요."
+                )
+                self._fallback.show()
+        else:
+            self._fallback.setText(
+                "3D 산점도를 표시하려면 PyQt6-WebEngine이 필요합니다.\n"
+                "pip install PyQt6-WebEngine 후 다시 실행해 주세요."
             )
-            # mplcursors가 3D scatter를 지원하면 보조로 사용
-            if mplcursors is not None:
-                try:
-                    self._cursor = mplcursors.cursor(self._scatter, hover=True)
 
-                    @self._cursor.connect("add")
-                    def _on_add(sel):  # type: ignore[no-untyped-def]
-                        idx = int(sel.index) if sel.index is not None else 0
-                        if 0 <= idx < len(self._hover_points):
-                            sel.annotation.set_text(self._hover_points[idx]["text"])
-                        sel.annotation.get_bbox_patch().set(fc="#0b1f3a", alpha=0.92)
-                        sel.annotation.set_color("white")
-                except Exception:
-                    self._cursor = None
+    def _load_template(self) -> str:
+        if not VIEWER_HTML_PATH.exists():
+            raise FileNotFoundError(f"viewer.html을 찾을 수 없습니다: {VIEWER_HTML_PATH}")
+        return VIEWER_HTML_PATH.read_text(encoding="utf-8")
 
-        self._annot = ax.text2D(
-            0.02,
-            0.98,
-            "",
-            transform=ax.transAxes,
-            va="top",
-            ha="left",
-            fontsize=9,
-            color="white",
-            bbox=dict(boxstyle="round,pad=0.4", fc="#0b1f3a", ec="none", alpha=0.92),
+    def _set_html(self, html: str) -> None:
+        if self._web is None:
+            return
+        base = QUrl.fromLocalFile(str(VIEWER_HTML_PATH.resolve()))
+        self._web.setHtml(html, base)
+        self._web.show()
+        self._fallback.hide()
+
+    def show_message(self, message: str) -> None:
+        """탭 안에 안내 메시지용 최소 HTML을 표시 (크래시 없이)."""
+        if self._web is None:
+            self._fallback.setText(message)
+            self._fallback.show()
+            return
+        safe = (
+            message.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
         )
-        self._annot.set_visible(False)
+        html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+html,body{{margin:0;height:100%;background:transparent;color:#B9CCC0;
+font-family:-apple-system,'Malgun Gothic',sans-serif;}}
+.wrap{{display:flex;align-items:center;justify-content:center;height:100%;
+padding:28px;text-align:center;line-height:1.7;font-size:14px;}}
+</style></head><body><div class="wrap">{safe}</div></body></html>"""
+        self._set_html(html)
 
-        ax.set_xlabel("시간(일자 순서)")
-        ax.set_ylabel("품목")
-        ax.set_zlabel("재고량")
-        ax.set_title(f"3D 통합 시각화 — {category}", fontsize=12, fontweight="bold", color="#0b1f3a")
-
-        step = max(1, len(all_dates) // 6)
-        ax.set_xticks(list(range(0, len(all_dates), step)))
-        ax.set_xticklabels([all_dates[i] for i in range(0, len(all_dates), step)], rotation=25, ha="right", fontsize=7)
-
-        y_step = max(1, len(filtered) // 8)
-        ax.set_yticks(list(range(0, len(filtered), y_step)))
-        ax.set_yticklabels(
-            [filtered[i]["label"][:18] for i in range(0, len(filtered), y_step)],
-            fontsize=7,
-        )
+    def plot_records(self, records: list[dict[str, Any]], source_file: str = "") -> None:
+        if self._web is None:
+            self._fallback.setText(
+                f"3D 레코드 {len(records)}건 — PyQt6-WebEngine이 없어 렌더링할 수 없습니다."
+            )
+            self._fallback.show()
+            return
         try:
-            self.figure.tight_layout()
-        except Exception:
-            pass
-        self.draw()
+            template = self._load_template()
+        except Exception as exc:
+            self.show_message(f"viewer.html을 읽지 못했습니다.\n{exc}")
+            return
+
+        html = template.replace(
+            "/*__RECORDS__*/[]",
+            json.dumps(records, ensure_ascii=False),
+        ).replace(
+            '/*__SOURCE_FILE__*/""',
+            json.dumps(source_file or "", ensure_ascii=False),
+        )
+        self._set_html(html)
 
 
 # ---------------------------------------------------------------------------
@@ -1059,7 +996,7 @@ class MainWindow(QMainWindow):
         report_layout.addWidget(self.report_edit)
         self.tabs.addTab(report_wrap, "AI 분석 리포트")
 
-        # Tab 4 3D
+        # Tab 4 3D scatter (viewer.html)
         viz_wrap = QWidget()
         viz_layout = QVBoxLayout(viz_wrap)
         viz_layout.setContentsMargins(10, 10, 10, 10)
@@ -1073,10 +1010,13 @@ class MainWindow(QMainWindow):
         viz_row.addWidget(self.viz_category_combo)
         viz_row.addStretch(1)
         viz_layout.addLayout(viz_row)
-        viz_hint = QLabel("데이터 포인트에 마우스를 올리면 품목·구분·일자·재고량이 표시됩니다.")
+        viz_hint = QLabel(
+            "드래그로 회전 · 휠/핀치로 확대축소 · 호버/탭으로 품목 정보 "
+            "(X: 총 변동량 · Y: 잔존 예상 소진기간 · Z: 연평균 분양량)"
+        )
         viz_hint.setStyleSheet("color: #64748b; font-size: 12px;")
         viz_layout.addWidget(viz_hint)
-        self.chart3d = Chart3D()
+        self.chart3d = Scatter3DView()
         viz_layout.addWidget(self.chart3d, stretch=1)
         self.tabs.addTab(viz_wrap, "3D/통합 시각화")
 
@@ -1311,7 +1251,28 @@ class MainWindow(QMainWindow):
         if not self.inventory_data:
             return
         category = self.viz_category_combo.currentText() or "전체"
-        self.chart3d.plot_items(self.inventory_data["items"], category)
+        stock_items: list[StockItem] = list(self.inventory_data.get("stock_items") or [])
+        if category != "전체":
+            stock_items = [it for it in stock_items if it.std_type == category]
+        try:
+            records = build_scatter3d_records(stock_items)
+        except Exception as exc:
+            self.chart3d.show_message(
+                "3D 산점도 데이터를 준비하지 못했습니다.\n"
+                "엑셀 형식(등록일자·변경일자·재고량·잔고)을 확인해 주세요.\n\n"
+                f"{exc}"
+            )
+            return
+        if not records:
+            self.chart3d.show_message(
+                "3D 산점도로 표시할 품목이 없습니다.\n"
+                "등록일자와 변경이력(변경일자/재고량)이 있는 행이 필요합니다."
+            )
+            return
+        self.chart3d.plot_records(
+            records,
+            source_file=str(self.inventory_data.get("file_name") or ""),
+        )
 
     def _run_ai_analysis(self, data: dict[str, Any]) -> None:
         key = self.api_key_input.text().strip()
@@ -1440,6 +1401,11 @@ def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar]:
 
 
 def main() -> None:
+    # QWebEngineView 사용 시 QApplication 생성 전에 필요
+    try:
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLE)

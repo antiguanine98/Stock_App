@@ -191,6 +191,7 @@ class StockItem:
     name_ko: str = ""
     name_en: Any = None
     balance: Any = None
+    registered_date: Optional[date] = None
     distributed: Any = None
     extra_meta: dict[str, Any] = field(default_factory=dict)
     raw_points: list[StockPoint] = field(default_factory=list)
@@ -358,6 +359,7 @@ def load_stock_excel(path: str) -> tuple[pd.DataFrame, list[StockItem]]:
         )
 
     known = {"순번", "표준품구분", "관리번호", "한글명", "영문명", "재고", "잔고", "분양여부"}
+    reg_col = next((c for c in df.columns if "등록일자" in str(c)), None)
     items: list[StockItem] = []
 
     for _, row in df.iterrows():
@@ -369,6 +371,7 @@ def load_stock_excel(path: str) -> tuple[pd.DataFrame, list[StockItem]]:
         raw_points = extract_change_pairs(row, pairs)
         year_end = collapse_to_year_end(raw_points)
         corrected, corr_cnt = apply_retroactive_correction(raw_points)
+        registered = parse_date(row.get(reg_col)) if reg_col else None
 
         extra = {
             c: row.get(c)
@@ -385,6 +388,7 @@ def load_stock_excel(path: str) -> tuple[pd.DataFrame, list[StockItem]]:
                 name_ko=name_ko,
                 name_en=row.get("영문명"),
                 balance=find_balance_value(row, list(df.columns)),
+                registered_date=registered,
                 distributed=row.get("분양여부"),
                 extra_meta=extra,
                 raw_points=raw_points,
@@ -595,3 +599,68 @@ def category_counts(items: list[StockItem]) -> dict[str, int]:
     for it in items:
         counts[it.std_type or "미분류"] += 1
     return dict(counts)
+
+
+def scatter_cat_label(std_type: str, std_type_raw: Any = None) -> str:
+    """3D 범례용 표준품구분 (접두어 없이 표준생약/지표성분/대조품)."""
+    text = std_type or _cell_str(std_type_raw)
+    if not text:
+        return "미분류"
+    for key, label in (
+        ("표준생약", "표준생약"),
+        ("지표성분", "지표성분"),
+        ("대조품", "대조품"),
+        ("대조생약", "대조품"),
+    ):
+        if key in text:
+            return label
+    match = re.search(r"\(([^)]+)\)", text)
+    if match:
+        return match.group(1).strip() or text
+    return text
+
+
+def build_scatter3d_record(item: StockItem) -> Optional[dict[str, Any]]:
+    """3D 산점도용 품목 레코드. 필수 이력이 없으면 None."""
+    if not item.raw_points or item.registered_date is None:
+        return None
+
+    qtys = [p.quantity for p in item.raw_points]
+    init_qty = qtys[0]
+    balance = parse_qty(item.balance)
+    if balance is None:
+        return None
+
+    last_change = item.raw_points[-1].change_date
+    elapsed_years = max((last_change - item.registered_date).days / 365.25, 0.05)
+    total_decrease = init_qty - balance
+    total_variation = sum(abs(qtys[i + 1] - qtys[i]) for i in range(len(qtys) - 1))
+    annual_rate = total_decrease / elapsed_years
+    if abs(init_qty) > 1e-12:
+        decrease_rate = total_decrease / init_qty * 100.0
+    else:
+        decrease_rate = 0.0
+    runway = balance / annual_rate if annual_rate > 0 else 9999.0
+
+    return {
+        "cat": scatter_cat_label(item.std_type, item.std_type_raw),
+        "code": item.manage_no,
+        "name": item.name_ko,
+        "balance": round(float(balance), 6),
+        "initQty": round(float(init_qty), 6),
+        "totalVariation": round(float(total_variation), 6),
+        "decreaseRate": round(float(decrease_rate), 4),
+        "annualRate": round(float(annual_rate), 6),
+        "runway": round(float(runway), 6),
+        "elapsedYears": round(float(elapsed_years), 6),
+    }
+
+
+def build_scatter3d_records(items: list[StockItem]) -> list[dict[str, Any]]:
+    """유효한 3D 산점도 레코드만 모은다."""
+    records: list[dict[str, Any]] = []
+    for item in items:
+        rec = build_scatter3d_record(item)
+        if rec is not None:
+            records.append(rec)
+    return records

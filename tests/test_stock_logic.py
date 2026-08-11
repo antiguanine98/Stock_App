@@ -17,10 +17,13 @@ from stock_logic import (  # noqa: E402
     StockPoint,
     apply_retroactive_correction,
     build_ai_prompt,
+    build_scatter3d_record,
+    build_scatter3d_records,
     discover_timeseries_pairs,
     items_for_ai_analysis,
     load_stock_excel,
     normalize_std_type,
+    scatter_cat_label,
 )
 
 
@@ -220,6 +223,43 @@ def test_ai_targets_only_changed_items():
         os.remove(path)
 
 
+def test_scatter_cat_label():
+    assert scatter_cat_label("표준생약") == "표준생약"
+    assert scatter_cat_label("대조생약") == "대조품"
+    assert scatter_cat_label("", "생약(지표성분)") == "지표성분"
+
+
+def test_scatter3d_records_from_sample():
+    path = _make_sample_xlsx()
+    try:
+        _, items = load_stock_excel(path)
+        std001 = next(it for it in items if it.manage_no == "STD-001")
+        assert std001.registered_date == date(2020, 1, 1)
+        rec = build_scatter3d_record(std001)
+        assert rec is not None
+        assert rec["cat"] == "표준생약"
+        assert rec["code"] == "STD-001"
+        assert rec["name"] == "감초"
+        assert rec["initQty"] == 150
+        assert rec["balance"] == 120
+        assert rec["totalVariation"] == 30  # |140-150|+|120-140|
+        assert abs(rec["decreaseRate"] - 20.0) < 1e-6
+        elapsed = (date(2024, 5, 20) - date(2020, 1, 1)).days / 365.25
+        assert abs(rec["elapsedYears"] - max(elapsed, 0.05)) < 1e-6
+        assert abs(rec["annualRate"] - (30 / max(elapsed, 0.05))) < 1e-6
+        assert abs(rec["runway"] - (120 / rec["annualRate"])) < 1e-6
+
+        empty = next(it for it in items if it.manage_no == "NST-020")
+        assert build_scatter3d_record(empty) is None
+
+        records = build_scatter3d_records(items)
+        assert all("totalVariation" in r for r in records)
+        assert {r["code"] for r in records} == {"STD-001", "NST-014", "STD-002", "STD-003"}
+        assert next(r for r in records if r["code"] == "NST-014")["cat"] == "대조품"
+    finally:
+        os.remove(path)
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -230,6 +270,8 @@ if __name__ == "__main__":
         test_same_date_last_value_within_year,
         test_load_sample_excel_and_identifiers,
         test_ai_targets_only_changed_items,
+        test_scatter_cat_label,
+        test_scatter3d_records_from_sample,
     ]
     failed = 0
     for fn in tests:

@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>재고 이력의 지형도 — 표준품 3차원 구조 분석</title>
+<style>
+  :root{
+    --ink:#F3F6F2; --ink-dim:#B9CCC0; --ink-faint:#8CA296;
+    --sage:#8FE0B0; --indigo:#7AA8FF; --clay:#F0916A;
+    --axis-x:#F2C55C; --axis-y:#F28FB4; --axis-z:#8FE3EE;
+    --panel-line: rgba(180,210,196,0.22);
+    --sans: -apple-system, 'Malgun Gothic', 'Pretendard', sans-serif;
+    --serif: Georgia, 'Noto Serif KR', serif;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{
+    background: transparent;
+    color: var(--ink); font-family: var(--sans); min-height:100vh; overflow-x:hidden;
+  }
+  body{ display:flex; flex-direction:column; min-height:100vh; }
+  header{ padding: 26px 26px 16px; border-bottom: 1px solid var(--panel-line); }
+  .eyebrow{ font-size:11px; letter-spacing:.24em; text-transform:uppercase; color: var(--sage); font-weight:600;
+    margin-bottom:10px; display:flex; align-items:center; gap:10px; }
+  .eyebrow::before{ content:''; width:22px; height:1px; background: var(--sage); display:inline-block; }
+  .axis-key{ display:flex; flex-wrap:wrap; gap:8px 18px; font-size:12px; color: var(--ink-dim); }
+  .axis-key span b{ color:var(--ink); font-weight:600; }
+
+  main{ position:relative; flex:1; }
+  #canvasWrap{ position:relative; width:100%; height: min(70vh, 700px); background:transparent; touch-action:none; }
+  canvas{ display:block; width:100%; height:100%; }
+  #tooltip{
+    position:absolute; pointer-events:none; display:none;
+    background: rgba(15,22,18,0.94); border:1px solid rgba(180,210,196,0.35);
+    color:var(--ink); font-size:12px; line-height:1.6; padding:9px 12px; border-radius:3px;
+    max-width:240px; z-index:5; box-shadow:0 6px 18px rgba(0,0,0,0.5);
+  }
+  #tooltip b{ color: var(--axis-x); }
+  #hint{
+    position:absolute; bottom:10px; left:50%; transform:translateX(-50%);
+    font-size:11px; color:var(--ink-faint); background:rgba(15,22,18,0.55);
+    padding:5px 10px; border-radius:20px; pointer-events:none;
+  }
+  #emptyMsg{
+    display:none; position:absolute; inset:0; align-items:center; justify-content:center;
+    text-align:center; color:var(--ink-dim); font-size:14px; padding:24px; line-height:1.7;
+  }
+
+  .stats-strip{ display:flex; flex-wrap:wrap; gap:0; border-top:1px solid var(--panel-line); background:transparent; }
+  .stat{ flex:1; min-width:120px; padding: 14px 20px; border-right:1px solid var(--panel-line); }
+  .stat:last-child{border-right:none;}
+  .stat .num{ font-family:var(--serif); font-size:20px; font-weight:700; color:var(--ink); }
+  .stat .num.sage{color:var(--sage);} .stat .num.indigo{color:var(--indigo);} .stat .num.clay{color:var(--clay);}
+  .stat .lbl{ font-size:10.5px; color:var(--ink-faint); letter-spacing:.05em; margin-top:2px; }
+
+  .legend-card{ margin: 14px 26px 4px; padding: 14px 16px; background: rgba(15,22,18,0.4); border: 1px solid var(--panel-line);
+    border-radius: 2px; font-size: 12px; color: var(--ink-dim); line-height: 1.8; position:relative; }
+  .legend-card::before{ content:'표본 색인'; position:absolute; top:-9px; left:14px; background: rgba(15,22,18,0.9);
+    padding: 0 8px; font-size:10px; letter-spacing:.14em; color:var(--sage); font-weight:600; }
+  .legend-row{display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;}
+  .legend-row b{color:var(--ink); font-weight:600; min-width:56px; display:inline-block;}
+  .swatch{display:inline-block; width:10px;height:10px;border-radius:2px; margin-right:5px; vertical-align:middle;}
+
+  footer{ padding: 14px 26px 22px; color: var(--ink-faint); font-size: 11px; border-top:1px solid var(--panel-line); }
+  @media (max-width: 640px){
+    header{padding:20px 16px 14px;} .legend-card{margin:12px 16px 4px;}
+    .stat{padding:12px 14px; min-width:44%;} footer{padding:12px 16px 18px;}
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="eyebrow">표준품 관리대장 · 구조 분석</div>
+  <div class="axis-key">
+    <span><b style="color:var(--axis-x)">X축</b> — 총 변동량 (누적 재고 변화 폭, Σ|Δ재고|)</span>
+    <span><b style="color:var(--axis-y)">Y축</b> — 잔존 예상 소진기간 (잔고÷연평균 분양량, 년, 로그)</span>
+    <span><b style="color:var(--axis-z)">Z축</b> — 연평균 분양량 (누적 분양량÷경과기간)</span>
+  </div>
+</header>
+
+<main>
+  <div id="canvasWrap">
+    <canvas id="c"></canvas>
+    <div id="tooltip"></div>
+    <div id="hint">드래그: 회전 · 두 손가락 핀치/휠: 확대·축소 · 탭: 품목 정보</div>
+    <div id="emptyMsg">표시할 3D 산점도 데이터가 없습니다.<br>엑셀을 업로드하거나 필수 이력(등록일자·변경일자·재고량)을 확인해 주세요.</div>
+  </div>
+</main>
+
+<div class="legend-card">
+  <div class="legend-row"><b>색상</b>
+    <span><span class="swatch" style="background:#8FE0B0"></span>표준생약</span>
+    <span><span class="swatch" style="background:#7AA8FF"></span>지표성분</span>
+    <span><span class="swatch" style="background:#F0916A"></span>대조품</span>
+  </div>
+</div>
+
+<div class="stats-strip" id="statsStrip">
+  <div class="stat"><div class="num" id="statTotal">0</div><div class="lbl">전체 품목</div></div>
+  <div class="stat"><div class="num sage" id="statSage">0</div><div class="lbl">표준생약</div></div>
+  <div class="stat"><div class="num indigo" id="statIndigo">0</div><div class="lbl">지표성분</div></div>
+  <div class="stat"><div class="num clay" id="statClay">0</div><div class="lbl">대조품</div></div>
+</div>
+
+<footer id="footerText">총 변동량 / 잔존 예상 소진기간(년, 로그) / 연평균 분양량 3축 산점도 (외부 라이브러리 없이 직접 렌더링)</footer>
+
+<script>
+(function(){
+"use strict";
+
+const records = /*__RECORDS__*/[];
+const SOURCE_FILE = /*__SOURCE_FILE__*/"";
+
+const BASE_CAT_COLOR = {
+  '표준생약': [143,224,176],
+  '지표성분': [122,168,255],
+  '대조품': [240,145,106],
+  '대조생약': [240,145,106],
+  '생약(표준생약)': [143,224,176],
+  '생약(지표성분)': [122,168,255],
+  '생약(대조품)': [240,145,106]
+};
+const EXTRA_PALETTE = [
+  [186,150,255], [255,200,100], [120,220,220], [255,140,180],
+  [160,210,90], [255,170,140], [140,180,255], [220,180,120]
+];
+const catColor = Object.assign({}, BASE_CAT_COLOR);
+let extraIdx = 0;
+function colorForCat(cat){
+  if (!catColor[cat]){
+    catColor[cat] = EXTRA_PALETTE[extraIdx % EXTRA_PALETTE.length];
+    extraIdx += 1;
+  }
+  return catColor[cat];
+}
+
+function niceNum(range, round){
+  if (!(range > 0) || !isFinite(range)) return 1;
+  const exp = Math.floor(Math.log10(range));
+  const frac = range / Math.pow(10, exp);
+  let nice;
+  if (round){
+    if (frac < 1.5) nice = 1;
+    else if (frac < 3) nice = 2;
+    else if (frac < 7) nice = 5;
+    else nice = 10;
+  } else {
+    if (frac <= 1) nice = 1;
+    else if (frac <= 2) nice = 2;
+    else if (frac <= 5) nice = 5;
+    else nice = 10;
+  }
+  return nice * Math.pow(10, exp);
+}
+
+function niceLinearRange(minV, maxV, maxTicks){
+  maxTicks = maxTicks || 5;
+  if (!isFinite(minV) || !isFinite(maxV)) return { lo:0, hi:1, ticks:[0,1] };
+  if (minV === maxV){
+    const pad = Math.abs(minV) * 0.1 || 1;
+    minV -= pad; maxV += pad;
+  }
+  const span = niceNum(maxV - minV, false);
+  const step = niceNum(span / Math.max(maxTicks - 1, 1), true);
+  let lo = Math.floor(minV / step) * step;
+  let hi = Math.ceil(maxV / step) * step;
+  if (lo === hi) hi = lo + step;
+  const ticks = [];
+  const n = Math.round((hi - lo) / step);
+  for (let i = 0; i <= n; i++){
+    const v = lo + step * i;
+    const label = Math.abs(v) >= 100 || Number.isInteger(v)
+      ? String(Math.round(v))
+      : String(Number(v.toPrecision(4)));
+    ticks.push({ value: v, label: label });
+  }
+  return { lo, hi, ticks };
+}
+
+function yLogRange(runways){
+  const logs = runways.map(v => Math.log10(Math.max(v, 0) + 1));
+  let lo = Math.min.apply(null, logs);
+  let hi = Math.max.apply(null, logs);
+  if (!isFinite(lo) || !isFinite(hi)){ lo = 0; hi = 1; }
+  if (lo === hi){
+    lo = Math.max(0, lo - 0.2);
+    hi = hi + 0.2;
+  } else {
+    const pad = (hi - lo) * 0.08;
+    lo = Math.max(0, lo - pad);
+    hi = hi + pad;
+  }
+  const candidates = [0.05, 0.1, 0.3, 1, 3, 10, 30, 100, 300, 1000, 3000, 9999];
+  let ticks = candidates
+    .map(v => ({ value: Math.log10(v + 1), label: String(v) }))
+    .filter(t => t.value >= lo - 1e-9 && t.value <= hi + 1e-9);
+  if (ticks.length < 2){
+    const a = Math.pow(10, lo) - 1;
+    const b = Math.pow(10, hi) - 1;
+    ticks = [
+      { value: lo, label: String(Number(Math.max(a, 0).toPrecision(3))) },
+      { value: hi, label: String(Number(Math.max(b, 0).toPrecision(3))) }
+    ];
+  } else if (ticks.length > 5){
+    const step = Math.ceil(ticks.length / 5);
+    ticks = ticks.filter((_, i) => i % step === 0 || i === ticks.length - 1);
+  }
+  return { lo, hi, ticks };
+}
+
+function buildRange(recs){
+  if (!recs.length){
+    return {
+      x: [0, 1], y: [0, 1], z: [0, 1],
+      xTicks: [{value:0,label:'0'},{value:1,label:'1'}],
+      yTicks: [{value:0,label:'0'},{value:1,label:'1'}],
+      zTicks: [{value:0,label:'0'},{value:1,label:'1'}]
+    };
+  }
+  const xs = recs.map(r => r.totalVariation);
+  const zs = recs.map(r => r.annualRate);
+  const xR = niceLinearRange(Math.min.apply(null, xs), Math.max.apply(null, xs), 5);
+  const zR = niceLinearRange(Math.min.apply(null, zs), Math.max.apply(null, zs), 5);
+  const yR = yLogRange(recs.map(r => r.runway));
+  return {
+    x: [xR.lo, xR.hi],
+    y: [yR.lo, yR.hi],
+    z: [zR.lo, zR.hi],
+    xTicks: xR.ticks,
+    yTicks: yR.ticks,
+    zTicks: zR.ticks
+  };
+}
+
+const RANGE_FULL = buildRange(records);
+const RANGE = { x: RANGE_FULL.x, y: RANGE_FULL.y, z: RANGE_FULL.z };
+
+function updateStats(){
+  const total = records.length;
+  const sage = records.filter(r => r.cat === '표준생약' || r.cat === '생약(표준생약)').length;
+  const indigo = records.filter(r => r.cat === '지표성분' || r.cat === '생약(지표성분)').length;
+  const clay = records.filter(r => r.cat === '대조품' || r.cat === '대조생약' || r.cat === '생약(대조품)').length;
+  document.getElementById('statTotal').textContent = String(total);
+  document.getElementById('statSage').textContent = String(sage);
+  document.getElementById('statIndigo').textContent = String(indigo);
+  document.getElementById('statClay').textContent = String(clay);
+  const foot = document.getElementById('footerText');
+  const src = SOURCE_FILE ? (SOURCE_FILE + ' 기준 · ') : '';
+  foot.textContent = src + '총 변동량 / 잔존 예상 소진기간(년, 로그) / 연평균 분양량 3축 산점도 (외부 라이브러리 없이 직접 렌더링)';
+}
+
+function norm(v, lo, hi){
+  if (hi === lo) return 0;
+  return ((v - lo) / (hi - lo)) * 2 - 1;
+}
+
+const pts = records.map(r => ({
+  x: norm(r.totalVariation, RANGE.x[0], RANGE.x[1]),
+  y: norm(Math.log10(r.runway + 1), RANGE.y[0], RANGE.y[1]),
+  z: norm(r.annualRate, RANGE.z[0], RANGE.z[1]),
+  r: r
+}));
+
+const canvas = document.getElementById('c');
+const wrap = document.getElementById('canvasWrap');
+const tooltip = document.getElementById('tooltip');
+const emptyMsg = document.getElementById('emptyMsg');
+const ctx = canvas.getContext('2d');
+
+if (!records.length){
+  emptyMsg.style.display = 'flex';
+  document.getElementById('hint').style.display = 'none';
+}
+
+updateStats();
+
+let W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, 2);
+function resize(){
+  W = wrap.clientWidth; H = wrap.clientHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize', resize);
+
+let theta = 0.72, phi = -0.5;   // rotation angles
+let zoom = 1;
+let dragging = false, lastX = 0, lastY = 0;
+let idleSpin = true;
+let lastInteraction = Date.now();
+const IDLE_RESUME_MS = 60000;
+
+function rotate(p){
+  const ct = Math.cos(theta), st = Math.sin(theta);
+  const cp = Math.cos(phi), sp = Math.sin(phi);
+  const x1 = p.x*ct + p.z*st;
+  const z1 = -p.x*st + p.z*ct;
+  const y2 = p.y*cp - z1*sp;
+  const z2 = p.y*sp + z1*cp;
+  return { x: x1, y: y2, z: z2 };
+}
+
+function project(p){
+  const scale = Math.min(W, H) * 0.34 * zoom;
+  const persp = 1 + p.z * 0.18;
+  return {
+    sx: W/2 + p.x * scale * persp,
+    sy: H/2 - p.y * scale * persp,
+    depth: p.z
+  };
+}
+
+const POINT_SIZE = 2.6;
+
+const AXES = [
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:1.15,y:-1,z:-1}, label:'총 변동량', axis:'x', color:'#F2C55C',
+    ticks: RANGE_FULL.xTicks },
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:1.05,z:-1}, label:'잔존 예상 소진기간(년)', axis:'y', color:'#F28FB4',
+    ticks: RANGE_FULL.yTicks },
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:-1,z:1.1}, label:'연평균 분양량', axis:'z', color:'#8FE3EE',
+    ticks: RANGE_FULL.zTicks }
+];
+
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  if (!records.length) return;
+
+  // depth-sort points (painter's algorithm)
+  const projected = pts.map(p => {
+    const rp = rotate(p);
+    const pr = project(rp);
+    return { ...pr, r: p.r };
+  });
+  projected.sort((a,b) => a.depth - b.depth);
+
+  // axis lines
+  ctx.lineWidth = 1;
+  AXES.forEach(ax => {
+    const a = project(rotate(ax.from));
+    const b = project(rotate(ax.to));
+    ctx.strokeStyle = 'rgba(200,220,210,0.4)';
+    ctx.beginPath(); ctx.moveTo(a.sx,a.sy); ctx.lineTo(b.sx,b.sy); ctx.stroke();
+
+    ax.ticks.forEach(tk => {
+      const lo = RANGE[ax.axis][0], hi = RANGE[ax.axis][1];
+      const t = (tk.value - lo) / (hi - lo || 1);
+      const p3 = {
+        x: lerp(ax.from.x, ax.to.x, t),
+        y: lerp(ax.from.y, ax.to.y, t),
+        z: lerp(ax.from.z, ax.to.z, t)
+      };
+      const sp = project(rotate(p3));
+      ctx.fillStyle = 'rgba(225,235,229,0.95)';
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(tk.label, sp.sx, sp.sy + 12);
+    });
+
+    const lp = project(rotate(ax.to));
+    ctx.fillStyle = ax.color;
+    ctx.font = '600 11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(ax.label, lp.sx, lp.sy - 10);
+  });
+
+  // points
+  projected.forEach(p => {
+    const c = colorForCat(p.r.cat);
+    const alpha = 0.6 + (p.depth + 1) / 2 * 0.4;
+    const size = POINT_SIZE * (1 + p.depth * 0.15);
+    ctx.beginPath();
+    ctx.arc(p.sx, p.sy, size, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
+    ctx.fill();
+  });
+
+  window._projected = projected;
+}
+
+function loop(){
+  if (!idleSpin && !dragging && Date.now() - lastInteraction > IDLE_RESUME_MS) idleSpin = true;
+  if (idleSpin && !dragging && records.length) theta += 0.0022;
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// interaction: mouse = hover follows cursor; touch = drag rotates, tap shows info, pinch zooms
+const activePointers = new Map();
+let startX = 0, startY = 0, moved = false;
+let pinchStartDist = 0, pinchStartZoom = 1;
+
+function getPos(e){
+  const rect = canvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+function pointerDistance(){
+  const vals = [...activePointers.values()];
+  return Math.hypot(vals[0].x - vals[1].x, vals[0].y - vals[1].y);
+}
+function fmtNum(v){
+  if (typeof v !== 'number' || !isFinite(v)) return String(v);
+  if (Math.abs(v) >= 100) return String(Math.round(v * 100) / 100);
+  return String(Number(v.toPrecision(4)));
+}
+function showInfoAt(p){
+  const list = window._projected || [];
+  let best = null, bestD = 22;
+  for (const pt of list){
+    const d = Math.hypot(pt.sx - p.x, pt.sy - p.y);
+    if (d < bestD){ bestD = d; best = pt; }
+  }
+  if (best){
+    const r = best.r;
+    tooltip.innerHTML = `<b>${r.name}</b> (${r.code})<br>` +
+      `총 변동량 ${fmtNum(r.totalVariation)} · 잔존 예상 ${fmtNum(r.runway)}년<br>` +
+      `연평균 분양량 ${fmtNum(r.annualRate)} · 경과기간 ${fmtNum(r.elapsedYears)}년 (소진율 ${fmtNum(r.decreaseRate)}%)`;
+    let left = p.x + 14, top = p.y + 10;
+    if (left + 240 > W) left = p.x - 254;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+    tooltip.style.display = 'block';
+  } else {
+    tooltip.style.display = 'none';
+  }
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  const p = getPos(e);
+  activePointers.set(e.pointerId, p);
+  idleSpin = false;
+  lastInteraction = Date.now();
+  if (activePointers.size === 2){
+    dragging = false;
+    pinchStartDist = pointerDistance();
+    pinchStartZoom = zoom;
+    tooltip.style.display = 'none';
+  } else if (activePointers.size === 1){
+    dragging = true; moved = false;
+    startX = lastX = p.x; startY = lastY = p.y;
+  }
+});
+
+window.addEventListener('pointermove', (e) => {
+  const p = getPos(e);
+  if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, p);
+
+  if (activePointers.size === 2){
+    const dist = pointerDistance();
+    if (pinchStartDist > 0){
+      zoom = Math.max(0.4, Math.min(3.2, pinchStartZoom * (dist / pinchStartDist)));
+    }
+    lastInteraction = Date.now();
+    return;
+  }
+
+  if (dragging && activePointers.size === 1){
+    const dx = p.x - lastX, dy = p.y - lastY;
+    theta += dx * 0.006;
+    phi = Math.max(-1.4, Math.min(1.4, phi + dy * 0.006));
+    lastX = p.x; lastY = p.y;
+    lastInteraction = Date.now();
+    if (Math.hypot(p.x - startX, p.y - startY) > 6) moved = true;
+    if (e.pointerType !== 'mouse') tooltip.style.display = 'none';
+    return;
+  }
+
+  if (e.pointerType === 'mouse' && activePointers.size === 0){
+    showInfoAt(p);
+    canvas.style.cursor = tooltip.style.display === 'block' ? 'pointer' : 'grab';
+  }
+});
+
+function endPointer(e){
+  const p = getPos(e);
+  const wasSingle = activePointers.size === 1;
+  activePointers.delete(e.pointerId);
+
+  if (wasSingle && e.pointerType !== 'mouse' && !moved){
+    showInfoAt(p);
+  }
+  if (activePointers.size === 0){
+    dragging = false;
+  } else if (activePointers.size === 1){
+    const remaining = [...activePointers.values()][0];
+    lastX = remaining.x; lastY = remaining.y;
+    dragging = true; moved = true;
+  }
+}
+window.addEventListener('pointerup', endPointer);
+window.addEventListener('pointercancel', endPointer);
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoom = Math.max(0.4, Math.min(3.2, zoom * ((e.deltaY < 0) ? 1.08 : 0.92)));
+  idleSpin = false;
+  lastInteraction = Date.now();
+}, { passive:false });
+
+resize();
+loop();
+})();
+</script>
+</body>
+</html>
