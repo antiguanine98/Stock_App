@@ -648,6 +648,10 @@ def category_counts(items: list[StockItem]) -> dict[str, int]:
     return dict(counts)
 
 
+# 3D 표시용 예상 소진기간 상한 (AI 추이와 동일 산출, 초장기는 상한에 묶음)
+YEARS_LEFT_DISPLAY_CAP = 50.0
+
+
 def scatter_cat_label(std_type: str, std_type_raw: Any = None) -> str:
     """3D 범례용 표준품구분 (접두어 없이 표준생약/지표성분/대조품)."""
     text = std_type or _cell_str(std_type_raw)
@@ -672,40 +676,50 @@ def build_scatter3d_record(
     ai_flags: dict[str, Any] | None = None,
     mentioned_codes: set[str] | None = None,
 ) -> Optional[dict[str, Any]]:
-    """3D 산점도용 품목 레코드. 필수 이력이 없으면 None."""
-    if not item.raw_points or item.registered_date is None:
+    """AI 추이(estimate_depletion) 기준 3D 레코드. 감소 추이가 없으면 None."""
+    if not item.has_stock_change:
         return None
 
-    qtys = [p.quantity for p in item.raw_points]
-    init_qty = qtys[0]
-    balance = parse_qty(item.balance)
-    if balance is None:
+    pts = item.corrected_points
+    if len(pts) < 2 or item.first_qty is None or item.last_qty is None:
         return None
-
-    last_change = item.raw_points[-1].change_date
-    elapsed_years = max((last_change - item.registered_date).days / 365.25, 0.05)
-    total_decrease = init_qty - balance
-    total_variation = sum(abs(qtys[i + 1] - qtys[i]) for i in range(len(qtys) - 1))
-    annual_rate = total_decrease / elapsed_years
-    if abs(init_qty) > 1e-12:
-        decrease_rate = total_decrease / init_qty * 100.0
-    else:
-        decrease_rate = 0.0
-    runway = balance / annual_rate if annual_rate > 0 else 9999.0
 
     flag = (ai_flags or {}).get(item.manage_no) if ai_flags else None
-    if flag is None:
-        # 산점도용으로도 동일 기준 보조 산출
-        stats = estimate_depletion(item)
+    stats = estimate_depletion(item)
+    if flag is not None:
+        deplete = bool(flag.get("deplete_within_5y"))
+        surge = bool(flag.get("recent_surge"))
+        speed = flag.get("speed") or stats.get("speed")
+        years_left = flag.get("years_left")
+        if years_left is None:
+            years_left = stats.get("years_left")
+        annual_rate = stats.get("annual_rate")
+    else:
         deplete = bool(stats.get("deplete_within_5y"))
         surge = bool(stats.get("recent_surge"))
         speed = stats.get("speed")
         years_left = stats.get("years_left")
+        annual_rate = stats.get("annual_rate")
+
+    # 감소 없음/증가만 있는 품목은 천년대 runway로 왜곡되므로 제외
+    if annual_rate is None or annual_rate <= 1e-9 or years_left is None:
+        return None
+
+    years_raw = float(years_left)
+    years_plot = min(years_raw, YEARS_LEFT_DISPLAY_CAP)
+    capped = years_raw > YEARS_LEFT_DISPLAY_CAP
+
+    qtys = [p.quantity for p in pts]
+    total_variation = sum(abs(qtys[i + 1] - qtys[i]) for i in range(len(qtys) - 1))
+    net_drop = float(item.first_qty - item.last_qty)
+    init_qty = float(item.first_qty)
+    balance = float(item.last_qty)
+    days = (pts[-1].change_date - pts[0].change_date).days or 1
+    elapsed_years = max(days / 365.25, 1 / 365.25)
+    if abs(init_qty) > 1e-12:
+        decrease_rate = net_drop / init_qty * 100.0
     else:
-        deplete = bool(flag.get("deplete_within_5y"))
-        surge = bool(flag.get("recent_surge"))
-        speed = flag.get("speed")
-        years_left = flag.get("years_left")
+        decrease_rate = 0.0
 
     mentioned = bool(mentioned_codes and item.manage_no in mentioned_codes)
 
@@ -713,17 +727,20 @@ def build_scatter3d_record(
         "cat": scatter_cat_label(item.std_type, item.std_type_raw),
         "code": item.manage_no,
         "name": item.name_ko,
-        "balance": round(float(balance), 6),
-        "initQty": round(float(init_qty), 6),
+        "balance": round(balance, 6),
+        "initQty": round(init_qty, 6),
+        "netDrop": round(net_drop, 6),
         "totalVariation": round(float(total_variation), 6),
         "decreaseRate": round(float(decrease_rate), 4),
         "annualRate": round(float(annual_rate), 6),
-        "runway": round(float(runway), 6),
+        "runway": round(years_plot, 6),
         "elapsedYears": round(float(elapsed_years), 6),
         "depleteWithin5y": deplete,
         "recentSurge": surge,
         "speed": speed or "",
-        "yearsLeft": None if years_left is None else round(float(years_left), 4),
+        "yearsLeft": round(years_plot, 4),
+        "yearsLeftRaw": round(years_raw, 4),
+        "yearsCapped": capped,
         "aiMentioned": mentioned,
     }
 

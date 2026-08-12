@@ -20,6 +20,7 @@ from stock_logic import (  # noqa: E402
     build_scatter3d_record,
     build_scatter3d_records,
     discover_timeseries_pairs,
+    estimate_depletion,
     items_for_ai_analysis,
     load_stock_excel,
     normalize_std_type,
@@ -234,7 +235,6 @@ def test_scatter3d_records_from_sample():
     try:
         _, items = load_stock_excel(path)
         std001 = next(it for it in items if it.manage_no == "STD-001")
-        assert std001.registered_date == date(2020, 1, 1)
         rec = build_scatter3d_record(std001)
         assert rec is not None
         assert rec["cat"] == "표준생약"
@@ -242,19 +242,25 @@ def test_scatter3d_records_from_sample():
         assert rec["name"] == "감초"
         assert rec["initQty"] == 150
         assert rec["balance"] == 120
-        assert rec["totalVariation"] == 30  # |140-150|+|120-140|
+        assert rec["netDrop"] == 30
         assert abs(rec["decreaseRate"] - 20.0) < 1e-6
-        elapsed = (date(2024, 5, 20) - date(2020, 1, 1)).days / 365.25
-        assert abs(rec["elapsedYears"] - max(elapsed, 0.05)) < 1e-6
-        assert abs(rec["annualRate"] - (30 / max(elapsed, 0.05))) < 1e-6
-        assert abs(rec["runway"] - (120 / rec["annualRate"])) < 1e-6
+
+        stats = estimate_depletion(std001)
+        assert stats["annual_rate"] is not None and stats["years_left"] is not None
+        assert abs(rec["annualRate"] - stats["annual_rate"]) < 1e-4
+        expected_years = min(float(stats["years_left"]), 50.0)
+        assert abs(rec["yearsLeft"] - expected_years) < 1e-3
+        assert abs(rec["runway"] - expected_years) < 1e-3
+        assert rec["yearsLeft"] <= 50.0
 
         empty = next(it for it in items if it.manage_no == "NST-020")
         assert build_scatter3d_record(empty) is None
 
         records = build_scatter3d_records(items)
-        assert all("totalVariation" in r for r in records)
-        assert {r["code"] for r in records} == {"STD-001", "NST-014", "STD-002", "STD-003"}
+        assert all("annualRate" in r and "netDrop" in r for r in records)
+        assert all(r["yearsLeft"] <= 50.0 for r in records)
+        # 감소 추이 있는 품목만 포함
+        assert "NST-020" not in {r["code"] for r in records}
         assert next(r for r in records if r["code"] == "NST-014")["cat"] == "대조품"
     finally:
         os.remove(path)

@@ -85,9 +85,9 @@
 <header>
   <div class="eyebrow">표준품 관리대장 · 구조 분석</div>
   <div class="axis-key">
-    <span><b style="color:var(--axis-x)">X축</b> — 총 변동량 (누적 재고 변화 폭, Σ|Δ재고|)</span>
-    <span><b style="color:var(--axis-y)">Y축</b> — 잔존 예상 소진기간 (잔고÷연평균 분양량, 년, 로그)</span>
-    <span><b style="color:var(--axis-z)">Z축</b> — 연평균 분양량 (누적 분양량÷경과기간)</span>
+    <span><b style="color:var(--axis-x)">X축</b> — 연평균 분양량 (AI 추이: 순감소÷관찰기간)</span>
+    <span><b style="color:var(--axis-y)">Y축</b> — 예상 소진기간 (AI 추이, 최대 50년)</span>
+    <span><b style="color:var(--axis-z)">Z축</b> — 순감소량 (최초재고−현재재고)</span>
   </div>
 </header>
 
@@ -96,7 +96,7 @@
     <canvas id="c"></canvas>
     <div id="tooltip"></div>
     <div id="hint">드래그: 회전 · 두 손가락 핀치/휠: 확대·축소 · 탭: 품목 정보</div>
-    <div id="emptyMsg">표시할 3D 산점도 데이터가 없습니다.<br>엑셀을 업로드하거나 필수 이력(등록일자·변경일자·재고량)을 확인해 주세요.</div>
+    <div id="emptyMsg">표시할 3D 산점도 데이터가 없습니다.<br>엑셀을 업로드하거나, 감소 추이가 있는 품목(AI 분석 대상)이 있는지 확인해 주세요.</div>
   </div>
 </main>
 
@@ -120,7 +120,7 @@
   <div class="stat"><div class="num clay" id="statClay">0</div><div class="lbl">대조품</div></div>
 </div>
 
-<footer id="footerText">총 변동량 / 잔존 예상 소진기간(년, 로그) / 연평균 분양량 3축 산점도 (외부 라이브러리 없이 직접 렌더링)</footer>
+<footer id="footerText">AI 추이 기준: 연평균 분양량 / 예상 소진기간(최대 50년) / 순감소량 3축 산점도</footer>
 
 <script>
 (function(){
@@ -195,35 +195,13 @@ function niceLinearRange(minV, maxV, maxTicks){
   return { lo, hi, ticks };
 }
 
-function yLogRange(runways){
-  const logs = runways.map(v => Math.log10(Math.max(v, 0) + 1));
-  let lo = Math.min.apply(null, logs);
-  let hi = Math.max.apply(null, logs);
-  if (!isFinite(lo) || !isFinite(hi)){ lo = 0; hi = 1; }
-  if (lo === hi){
-    lo = Math.max(0, lo - 0.2);
-    hi = hi + 0.2;
-  } else {
-    const pad = (hi - lo) * 0.08;
-    lo = Math.max(0, lo - pad);
-    hi = hi + pad;
-  }
-  const candidates = [0.05, 0.1, 0.3, 1, 3, 10, 30, 100, 300, 1000, 3000, 9999];
-  let ticks = candidates
-    .map(v => ({ value: Math.log10(v + 1), label: String(v) }))
-    .filter(t => t.value >= lo - 1e-9 && t.value <= hi + 1e-9);
-  if (ticks.length < 2){
-    const a = Math.pow(10, lo) - 1;
-    const b = Math.pow(10, hi) - 1;
-    ticks = [
-      { value: lo, label: String(Number(Math.max(a, 0).toPrecision(3))) },
-      { value: hi, label: String(Number(Math.max(b, 0).toPrecision(3))) }
-    ];
-  } else if (ticks.length > 5){
-    const step = Math.ceil(ticks.length / 5);
-    ticks = ticks.filter((_, i) => i % step === 0 || i === ticks.length - 1);
-  }
-  return { lo, hi, ticks };
+function yYearsRange(yearsList){
+  // AI 예상 소진기간: 0~50년 선형 (상한 캡 반영)
+  let lo = 0;
+  let hi = Math.max.apply(null, yearsList.concat([5]));
+  if (!isFinite(hi) || hi <= 0) hi = 50;
+  hi = Math.min(Math.max(hi, 5), 50);
+  return niceLinearRange(lo, hi, 6);
 }
 
 function buildRange(recs){
@@ -235,11 +213,11 @@ function buildRange(recs){
       zTicks: [{value:0,label:'0'},{value:1,label:'1'}]
     };
   }
-  const xs = recs.map(r => r.totalVariation);
-  const zs = recs.map(r => r.annualRate);
+  const xs = recs.map(r => r.annualRate);
+  const zs = recs.map(r => r.netDrop);
   const xR = niceLinearRange(Math.min.apply(null, xs), Math.max.apply(null, xs), 5);
   const zR = niceLinearRange(Math.min.apply(null, zs), Math.max.apply(null, zs), 5);
-  const yR = yLogRange(recs.map(r => r.runway));
+  const yR = yYearsRange(recs.map(r => r.yearsLeft != null ? r.yearsLeft : r.runway));
   return {
     x: [xR.lo, xR.hi],
     y: [yR.lo, yR.hi],
@@ -264,7 +242,7 @@ function updateStats(){
   document.getElementById('statClay').textContent = String(clay);
   const foot = document.getElementById('footerText');
   const src = SOURCE_FILE ? (SOURCE_FILE + ' 기준 · ') : '';
-  foot.textContent = src + '총 변동량 / 잔존 예상 소진기간(년, 로그) / 연평균 분양량 3축 산점도 (외부 라이브러리 없이 직접 렌더링)';
+  foot.textContent = src + 'AI 추이 기준: 연평균 분양량 / 예상 소진기간(최대 50년) / 순감소량 3축 산점도';
 }
 
 function norm(v, lo, hi){
@@ -273,9 +251,9 @@ function norm(v, lo, hi){
 }
 
 const pts = records.map(r => ({
-  x: norm(r.totalVariation, RANGE.x[0], RANGE.x[1]),
-  y: norm(Math.log10(r.runway + 1), RANGE.y[0], RANGE.y[1]),
-  z: norm(r.annualRate, RANGE.z[0], RANGE.z[1]),
+  x: norm(r.annualRate, RANGE.x[0], RANGE.x[1]),
+  y: norm((r.yearsLeft != null ? r.yearsLeft : r.runway), RANGE.y[0], RANGE.y[1]),
+  z: norm(r.netDrop, RANGE.z[0], RANGE.z[1]),
   r: r
 }));
 
@@ -331,11 +309,11 @@ function project(p){
 const POINT_SIZE = 2.6;
 
 const AXES = [
-  { from:{x:-1.15,y:-1,z:-1}, to:{x:1.15,y:-1,z:-1}, label:'총 변동량', axis:'x', color:'#b8860b',
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:1.15,y:-1,z:-1}, label:'연평균 분양량', axis:'x', color:'#b8860b',
     ticks: RANGE_FULL.xTicks },
-  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:1.05,z:-1}, label:'잔존 예상 소진기간(년)', axis:'y', color:'#c2185b',
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:1.05,z:-1}, label:'예상 소진기간(년)', axis:'y', color:'#c2185b',
     ticks: RANGE_FULL.yTicks },
-  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:-1,z:1.1}, label:'연평균 분양량', axis:'z', color:'#0e7490',
+  { from:{x:-1.15,y:-1,z:-1}, to:{x:-1.15,y:-1,z:1.1}, label:'순감소량', axis:'z', color:'#0e7490',
     ticks: RANGE_FULL.zTicks }
 ];
 
@@ -462,11 +440,14 @@ function showInfoAt(p){
     if (r.aiMentioned) tags.push('AI 리포트 언급');
     const tagHtml = tags.length ? `<br><span style="color:#b91c1c">${tags.join(' · ')}</span>` : '';
     const yearsLeft = (typeof r.yearsLeft === 'number' && isFinite(r.yearsLeft))
-      ? fmtNum(r.yearsLeft) + '년' : '-';
+      ? (r.yearsCapped ? fmtNum(r.yearsLeft) + '년+' : fmtNum(r.yearsLeft) + '년')
+      : '-';
+    const rawYears = (typeof r.yearsLeftRaw === 'number' && isFinite(r.yearsLeftRaw) && r.yearsCapped)
+      ? ` (산출 ${fmtNum(r.yearsLeftRaw)}년)` : '';
     tooltip.innerHTML = `<b>${r.name}</b> (${r.code})<br>` +
-      `총 변동량 ${fmtNum(r.totalVariation)} · 잔존 예상 ${fmtNum(r.runway)}년<br>` +
-      `연평균 분양량 ${fmtNum(r.annualRate)} · 경과기간 ${fmtNum(r.elapsedYears)}년 (소진율 ${fmtNum(r.decreaseRate)}%)<br>` +
-      `분양속도 ${r.speed || '-'} · AI 예상소진 ${yearsLeft}` + tagHtml;
+      `연평균 분양량 ${fmtNum(r.annualRate)} · 예상 소진 ${yearsLeft}${rawYears}<br>` +
+      `순감소량 ${fmtNum(r.netDrop)} · 현재재고 ${fmtNum(r.balance)} · 관찰기간 ${fmtNum(r.elapsedYears)}년<br>` +
+      `분양속도 ${r.speed || '-'}` + tagHtml;
     let left = p.x + 14, top = p.y + 10;
     if (left + 240 > W) left = p.x - 254;
     tooltip.style.left = left + 'px';

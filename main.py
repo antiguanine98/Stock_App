@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.2
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.21
 """
 
 from __future__ import annotations
@@ -86,7 +86,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.2"
+APP_VERSION = "v1.21"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -763,7 +763,7 @@ class Scatter3DView(QWidget):
         layout.setSpacing(0)
 
         self._fallback = QLabel(
-            "엑셀을 로드하면 총 변동량 · 잔존 예상 소진기간 · 연평균 분양량 3D 산점도가 표시됩니다."
+            "엑셀을 로드하면 AI 추이 기준(연평균 분양량 · 예상 소진기간 · 순감소량) 3D 산점도가 표시됩니다."
         )
         self._fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._fallback.setWordWrap(True)
@@ -780,7 +780,7 @@ class Scatter3DView(QWidget):
                 self._web = web
                 self._fallback.hide()
                 self.show_message(
-                    "엑셀을 로드하면 총 변동량 · 잔존 예상 소진기간 · 연평균 분양량 3D 산점도가 표시됩니다."
+                    "엑셀을 로드하면 AI 추이 기준(연평균 분양량 · 예상 소진기간 · 순감소량) 3D 산점도가 표시됩니다."
                 )
             except Exception:
                 self._web = None
@@ -1300,7 +1300,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.chart3d.show_message(
                 "3D 산점도 데이터를 준비하지 못했습니다.\n"
-                "엑셀 형식(등록일자·변경일자·재고량·잔고)을 확인해 주세요.\n\n"
+                "감소 추이가 있는 품목(보정 이력)을 확인해 주세요.\n\n"
                 f"{exc}"
             )
             return
