@@ -68,10 +68,6 @@
   .legend-row{display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;}
   .legend-row b{color:var(--ink); font-weight:600; min-width:56px; display:inline-block;}
   .swatch{display:inline-block; width:10px;height:10px;border-radius:2px; margin-right:5px; vertical-align:middle;}
-  .ring{display:inline-block; width:10px;height:10px;border-radius:50%; margin-right:5px; vertical-align:middle; background:transparent; box-sizing:border-box;}
-  .ring.deplete{border:2px solid #dc2626;}
-  .ring.surge{border:2px solid #ea580c;}
-  .ring.mentioned{border:2px solid #2563eb;}
 
   footer{ padding: 14px 26px 22px; color: var(--ink-faint); font-size: 11px; border-top:1px solid var(--panel-line); background:#ffffff; }
   @media (max-width: 640px){
@@ -105,11 +101,6 @@
     <span><span class="swatch" style="background:#8FE0B0"></span>표준생약</span>
     <span><span class="swatch" style="background:#7AA8FF"></span>지표성분</span>
     <span><span class="swatch" style="background:#F0916A"></span>대조품</span>
-  </div>
-  <div class="legend-row"><b>AI 연동</b>
-    <span><span class="ring deplete"></span>5년 고갈 위험</span>
-    <span><span class="ring surge"></span>최근 분양 급증</span>
-    <span><span class="ring mentioned"></span>AI 리포트 언급</span>
   </div>
 </div>
 
@@ -365,36 +356,11 @@ function draw(){
   projected.forEach(p => {
     const c = colorForCat(p.r.cat);
     const alpha = 0.55 + (p.depth + 1) / 2 * 0.4;
-    let size = POINT_SIZE * (1 + p.depth * 0.15);
-    if (p.r.depleteWithin5y || p.r.recentSurge || p.r.aiMentioned){
-      size *= 1.35;
-    }
+    const size = POINT_SIZE * (1 + p.depth * 0.15);
     ctx.beginPath();
     ctx.arc(p.sx, p.sy, size, 0, Math.PI*2);
     ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
     ctx.fill();
-
-    // AI 연동 강조 링 (고갈 > 급증 > 언급 우선)
-    if (p.r.depleteWithin5y){
-      ctx.beginPath();
-      ctx.arc(p.sx, p.sy, size + 3.2, 0, Math.PI*2);
-      ctx.strokeStyle = 'rgba(220,38,38,0.95)';
-      ctx.lineWidth = 2.2;
-      ctx.stroke();
-    } else if (p.r.recentSurge){
-      ctx.beginPath();
-      ctx.arc(p.sx, p.sy, size + 3.0, 0, Math.PI*2);
-      ctx.strokeStyle = 'rgba(234,88,12,0.95)';
-      ctx.lineWidth = 2.0;
-      ctx.stroke();
-    }
-    if (p.r.aiMentioned){
-      ctx.beginPath();
-      ctx.arc(p.sx, p.sy, size + (p.r.depleteWithin5y || p.r.recentSurge ? 5.5 : 3.0), 0, Math.PI*2);
-      ctx.strokeStyle = 'rgba(37,99,235,0.9)';
-      ctx.lineWidth = 1.6;
-      ctx.stroke();
-    }
   });
 
   window._projected = projected;
