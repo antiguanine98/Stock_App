@@ -55,7 +55,10 @@ Gemini API Key는 앱 상단 입력란에 입력 후 [저장]하면 `config.json
 ## 실행 파일
 
 ```bash
-python -m PyInstaller --noconfirm --clean main.spec
+# Windows EXE는 Python 3.12 환경에서 빌드하세요 (3.14는 R6034 런타임 오류 가능)
+py -3.12 -m venv .venv312
+.\.venv312\Scripts\pip install -r requirements.txt pyinstaller
+.\.venv312\Scripts\python -m PyInstaller --noconfirm --clean main.spec
 ```
 
 생성 위치: `dist/Stock_App_v1.21.exe`
