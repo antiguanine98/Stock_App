@@ -280,6 +280,94 @@ def test_decrease_only_excludes_increases():
     assert stats["stock_value"] == 70 * 500
 
 
+def test_live_query_followup_uses_inventory():
+    from stock_logic import (
+        StockItem,
+        StockPoint,
+        build_followup_prompt,
+        query_live_inventory_context,
+    )
+
+    item = StockItem(
+        manage_no="STD-001",
+        name_ko="감초",
+        std_type="표준생약",
+        unit_price=1000,
+        raw_points=[
+            StockPoint(date(2022, 1, 1), 150),
+            StockPoint(date(2023, 1, 1), 140),
+            StockPoint(date(2024, 1, 1), 120),
+        ],
+        year_end_points=[
+            StockPoint(date(2022, 1, 1), 150),
+            StockPoint(date(2023, 1, 1), 140),
+            StockPoint(date(2024, 1, 1), 120),
+        ],
+        corrected_points=[
+            StockPoint(date(2022, 1, 1), 150),
+            StockPoint(date(2023, 1, 1), 140),
+            StockPoint(date(2024, 1, 1), 120),
+        ],
+    )
+    live = query_live_inventory_context([item], "감초 소진 언제야?")
+    assert "실시간 재고" in live
+    assert "STD-001" in live or "감초" in live
+    prompt = build_followup_prompt(
+        "초기 리포트 요약",
+        "감초 소진 예상 시점은?",
+        [item],
+        compendium_context="[공정서 DB]\n- 감초 | 기원=콩과",
+    )
+    assert "실시간 재고" in prompt
+    assert "공정서" in prompt
+    assert "초기 리포트보다 이 수치를 우선" in prompt or "실시간 재검토" in prompt
+
+
+def test_compendium_db_not_timeseries():
+    from stock_logic import (
+        StockItem,
+        format_compendium_context,
+        load_compendium_excel,
+        build_ai_prompt,
+    )
+
+    rows = [
+        {
+            "생약명": "감초",
+            "관리번호": "STD-001",
+            "기원": "콩과",
+            "성상": "황색",
+            "확인시험": "TLC",
+        },
+        {
+            "생약명": "당귀",
+            "관리번호": "NST-014",
+            "기원": "미나리과",
+            "성상": "갈색",
+            "확인시험": "HPLC",
+        },
+    ]
+    fd, path = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    pd.DataFrame(rows).to_excel(path, index=False)
+    try:
+        data = load_compendium_excel(path)
+        assert data["row_count"] == 2
+        assert "dataframe" in data
+        assert "변경일자" not in data["columns"]
+        items = [
+            StockItem(manage_no="STD-001", name_ko="감초", std_type="표준생약"),
+        ]
+        ctx = format_compendium_context(data["dataframe"], items, meta=data)
+        assert "공정서" in ctx
+        assert "감초" in ctx
+        assert "규격" in ctx or "참조" in ctx
+        prompt = build_ai_prompt([], compendium_context=ctx)
+        assert "공정서" in prompt
+    finally:
+        os.remove(path)
+
+
 def test_year_display_and_continuous_axis():
     from stock_logic import align_display_series, fill_continuous_years, format_year
 
@@ -402,6 +490,8 @@ if __name__ == "__main__":
         test_load_sample_excel_and_identifiers,
         test_ai_targets_only_changed_items,
         test_decrease_only_excludes_increases,
+        test_live_query_followup_uses_inventory,
+        test_compendium_db_not_timeseries,
         test_year_display_and_continuous_axis,
         test_multi_file_merge,
         test_scatter_cat_label,

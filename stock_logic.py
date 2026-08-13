@@ -1364,7 +1364,11 @@ def _format_candidate_lines(rows: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def build_ai_prompt(items: list[StockItem]) -> str:
+def build_ai_prompt(
+    items: list[StockItem],
+    *,
+    compendium_context: str | None = None,
+) -> str:
     targets = items_for_ai_analysis(items)
     bulk_dates = detect_bulk_decrease_dates(items)
     flags = collect_ai_analysis_flags(items)
@@ -1389,7 +1393,8 @@ def build_ai_prompt(items: list[StockItem]) -> str:
         "[할루시네이션(억측) 금지 — 반드시 준수]",
         "- 제공된 재고/분양 수치·사전 산출 지표에 근거하지 않은 자의적 추측·원인 단정을 하지 마세요.",
         "- 데이터로 확인되지 않은 내용은 '확실하지 않음' 또는 '추측입니다'라고 명시하세요.",
-        "- 오직 수집된 재고/분양 데이터와 아래 사전 산출 결과만으로 객관적 사실 위주로 보고하세요.",
+        "- 오직 수집된 재고/분양 데이터·사전 산출 결과·(있으면) 공정서 DB만으로 객관적 사실 위주로 보고하세요.",
+        "- 공정서 DB는 규격/기준 참조용이며 재고·분양 수치 산출에 사용하지 마세요.",
         "",
         "[출력 형식 — 필수]",
         "1. 리포트 맨 최상단에 아래 '사전 산출: 1페이지 요약 대시보드' 마크다운을 그대로 포함하고, "
@@ -1407,14 +1412,22 @@ def build_ai_prompt(items: list[StockItem]) -> str:
         "   (점수 = f(재고위험도, 최근 분양속도, 분양 가속도, 데이터 신뢰도))",
         "6. 모니터링 대상: 분양 가속도 급증 품목 + 정량 지표",
         "7. 현 재고 기준 분양금액 환산액(현재재고×가격): 전체·유형별·TOP20",
+        "8. (공정서 DB가 제공된 경우) 제조검토·모니터링 등 핵심 품목의 규격/기준 정보를 DB에서 인용",
         "",
         f"[연구과제 대량출고로 제외할 날짜] {', '.join(bulk_dates) if bulk_dates else '해당 없음'}",
         "",
+    ]
+
+    if compendium_context and compendium_context.strip():
+        lines.append(compendium_context.strip())
+        lines.append("")
+
+    lines.extend([
         "[사전 산출: 1페이지 요약 대시보드]",
         format_kpi_dashboard_markdown(dashboard),
         "",
         "[사전 산출: 소진 기간 카테고리]",
-    ]
+    ])
 
     for cat_name, labels in categories.items():
         preview = ", ".join(labels[:15])
@@ -1508,39 +1521,211 @@ def build_ai_prompt(items: list[StockItem]) -> str:
     return "\n".join(lines)
 
 
+def query_live_inventory_context(
+    items: list[StockItem],
+    question: str,
+    *,
+    table_df: pd.DataFrame | None = None,
+    max_detail_items: int = 35,
+) -> str:
+    """사용자 질문에 맞춰 재고 통합 데이터를 실시간 재계산·필터링한 컨텍스트."""
+    if not items:
+        return "[실시간 재고 조회] 업로드된 재고 데이터가 없습니다."
+
+    q = (question or "").strip()
+    q_lower = q.lower()
+    flags = collect_ai_analysis_flags(items)
+    dashboard = flags.get("dashboard") or build_kpi_dashboard(items, flags)
+
+    # 질문에서 관리번호/한글명 키워드 추출
+    codes = {it.manage_no for it in items if it.manage_no}
+    names = {it.name_ko for it in items if it.name_ko}
+    hit_codes = sorted({c for c in codes if c and c.lower() in q_lower}, key=len, reverse=True)
+    hit_names = sorted({n for n in names if n and n in q}, key=len, reverse=True)
+
+    # 카테고리/키워드 힌트
+    want_deplete = any(k in q for k in ("고갈", "소진", "제조", "우선", "5년", "2년"))
+    want_accel = any(k in q for k in ("가속", "급증", "모니터링", "속도"))
+    want_low = any(k in q for k in ("저분양", "과다", "하향"))
+    want_value = any(k in q for k in ("환산", "가격", "금액", "자산", "가치"))
+    want_reliab = any(k in q for k in ("신뢰", "데이터 부족", "등급"))
+
+    selected: list[StockItem] = []
+    seen: set[str] = set()
+
+    def _add(it: StockItem) -> None:
+        key = it.manage_no or it.label
+        if key in seen:
+            return
+        seen.add(key)
+        selected.append(it)
+
+    for it in items:
+        if it.manage_no in hit_codes or it.name_ko in hit_names:
+            _add(it)
+        elif hit_names and any(n in (it.name_ko or "") or (it.name_ko or "") in n for n in hit_names):
+            _add(it)
+
+    by_code = flags.get("by_code") or {}
+    if want_deplete or not (hit_codes or hit_names):
+        for code in (flags.get("deplete_codes") or [])[:20]:
+            it = next((x for x in items if x.manage_no == code), None)
+            if it:
+                _add(it)
+    if want_accel:
+        for row in (flags.get("monitoring_targets") or [])[:20]:
+            it = next((x for x in items if x.manage_no == row.get("manage_no")), None)
+            if it:
+                _add(it)
+    if want_low:
+        for row in (flags.get("long_term_low_items") or [])[:20]:
+            it = next((x for x in items if x.manage_no == row.get("manage_no")), None)
+            if it:
+                _add(it)
+
+    # 질문 특정 품목이 없으면 우선순위 상위·변동 품목 일부
+    if not selected:
+        scored = sorted(
+            items_for_ai_analysis(items),
+            key=lambda it: float((by_code.get(it.manage_no) or estimate_depletion(it)).get("priority_score") or 0),
+            reverse=True,
+        )
+        for it in scored[:max_detail_items]:
+            _add(it)
+
+    selected = selected[:max_detail_items]
+
+    lines = [
+        "[실시간 재고 데이터 재검토 결과 — 초기 리포트보다 이 수치를 우선하세요]",
+        f"- 기준 시각: {date.today().isoformat()}",
+        f"- 관리 품목 {len(items)}종 · 질문 매칭/선별 상세 {len(selected)}종",
+        format_kpi_dashboard_markdown(dashboard),
+        "",
+    ]
+
+    if hit_codes or hit_names:
+        lines.append(
+            f"- 질문에서 식별된 키: 관리번호={', '.join(hit_codes) or '없음'} / "
+            f"한글명={', '.join(hit_names) or '없음'}"
+        )
+
+    if want_value:
+        val = flags.get("valuation") or compute_inventory_valuation(items)
+        lines.append(f"- 환산 총액: {_fmt_money(val.get('total_value'))}")
+        for tname, tval in (val.get("by_type") or {}).items():
+            lines.append(f"  · {tname}: {_fmt_money(tval)}")
+
+    if want_reliab:
+        grade_counts: dict[str, int] = defaultdict(int)
+        for it in items:
+            g = (estimate_depletion(it).get("reliability") or {}).get("grade", "?")
+            grade_counts[str(g)] += 1
+        lines.append(
+            "- 신뢰도 등급 분포: "
+            + ", ".join(f"{g}={n}" for g, n in sorted(grade_counts.items()))
+        )
+
+    lines.append("")
+    lines.append("[선별 품목 실시간 지표]")
+    for it in selected:
+        stats = by_code.get(it.manage_no) or estimate_depletion(it)
+        if "reliability" not in stats:
+            stats = estimate_depletion(it)
+        hist = ", ".join(
+            f"{format_year(p.change_date)}={p.quantity:g}" for p in it.corrected_points
+        )
+        yl = stats.get("years_left")
+        yl_txt = f"{yl:.2f}년" if isinstance(yl, (int, float)) else "산출불가"
+        rel = stats.get("reliability") or {}
+        lines.append(
+            f"- {it.label} | {it.std_type} | 최종:{it.last_qty} | "
+            f"속도:{stats.get('speed')} | 연평균:{stats.get('annual_rate')} | "
+            f"가속도:{stats.get('acceleration')} | 소진:{yl_txt}({stats.get('deplete_ym')}) | "
+            f"구간:{stats.get('depletion_category')} | 우선순위:{stats.get('priority_score')} | "
+            f"환산:{_fmt_money(stats.get('stock_value'))} | "
+            f"신뢰도:{(rel.get('label') if isinstance(rel, dict) else rel)} | "
+            f"증가구간제외:{stats.get('increase_segments_excluded', 0)} | 추이:[{hist}]"
+        )
+
+    # 표 DataFrame 요약 (있을 때)
+    if table_df is not None and not table_df.empty and (hit_codes or hit_names):
+        lines.append("")
+        lines.append("[통합 표(DataFrame) 원본 행 요약]")
+        df = table_df
+        mask = None
+        if "관리번호" in df.columns and hit_codes:
+            mask = df["관리번호"].astype(str).isin(hit_codes)
+        if "한글명" in df.columns and hit_names:
+            name_mask = df["한글명"].astype(str).isin(hit_names)
+            mask = name_mask if mask is None else (mask | name_mask)
+        if mask is not None:
+            sub = df.loc[mask].head(12)
+            for _, row in sub.iterrows():
+                brief = []
+                for col in list(df.columns)[:14]:
+                    v = row.get(col)
+                    if _is_empty(v):
+                        continue
+                    brief.append(f"{col}={_cell_str(v)}")
+                lines.append("- " + " | ".join(brief))
+
+    text = "\n".join(lines)
+    if len(text) > 18_000:
+        text = text[:17_960] + "\n... (이하 생략)"
+    return text
+
+
 def build_followup_prompt(
     base_report: str,
     user_question: str,
     items: list[StockItem] | None = None,
+    *,
+    compendium_context: str | None = None,
+    table_df: pd.DataFrame | None = None,
 ) -> str:
-    """초기 리포트 이후 추가 질문용 프롬프트."""
+    """초기 리포트 이후 추가 질문용 — 재고/공정서 원본을 실시간 재검토."""
     lines = [
         "당신은 생약표준품 재고·분양 분석 전문가입니다.",
-        "아래는 이미 생성된 초기 분석 리포트와 사용자의 후속 질문입니다.",
+        "사용자의 후속 질문에는 초기 리포트 문구만 반복하지 말고, "
+        "아래 [실시간 재고 데이터 재검토 결과]와 공정서 DB를 우선 근거로 답하세요.",
         "",
-        "[할루시네이션 금지] 데이터·리포트에 없는 내용을 단정하지 마세요. "
+        "[할루시네이션 금지] 제공된 실시간 수치·공정서 DB에 없는 내용을 단정하지 마세요. "
         "불확실하면 '확실하지 않음' 또는 '추측입니다'라고 밝히세요.",
         "[형식] '분석 전문가의 제언' 섹션은 작성하지 마세요.",
-        "",
-        "[초기 분석 리포트]",
-        base_report.strip() or "(리포트 없음)",
+        "[공정서 DB] 규격/기준 참조에만 사용하고, 재고·분양 수치 산출에는 쓰지 마세요.",
+        "[우선순위] 초기 리포트와 실시간 수치가 다르면 실시간 재검토 수치를 사용하세요.",
         "",
     ]
+
     if items:
-        flags = collect_ai_analysis_flags(items)
-        lines.append(
-            f"[참고: 고갈후보 {len(flags.get('deplete_codes') or [])}건 / "
-            f"가속 {len(flags.get('surge_codes') or [])}건 / "
-            f"제조검토 표준생약 "
-            f"{len((flags.get('manufacture_candidates') or {}).get('표준생약') or [])}건 · "
-            f"지표성분 "
-            f"{len((flags.get('manufacture_candidates') or {}).get('지표성분') or [])}건 / "
-            f"환산총액 {_fmt_money((flags.get('valuation') or {}).get('total_value'))}]"
-        )
+        lines.append(query_live_inventory_context(items, user_question, table_df=table_df))
         lines.append("")
+    else:
+        lines.append("[실시간 재고 데이터 재검토 결과] 재고 데이터 없음")
+        lines.append("")
+
+    if compendium_context and compendium_context.strip():
+        ctx = compendium_context.strip()
+        if len(ctx) > 8000:
+            ctx = ctx[:7980] + "\n... (이하 생략)"
+        lines.append(ctx)
+        lines.append("")
+
+    # 초기 리포트는 보조 맥락으로만 짧게
+    report = (base_report or "").strip()
+    if report:
+        if len(report) > 3500:
+            report = report[:3480] + "\n... (초기 리포트 일부만 첨부)"
+        lines.append("[초기 분석 리포트 — 보조 참고]")
+        lines.append(report)
+        lines.append("")
+
     lines.append(f"[사용자 질문]\n{user_question.strip()}")
     lines.append("")
-    lines.append("질문에 대해 한국어 마크다운으로 간결하고 정확하게 답변해 주세요.")
+    lines.append(
+        "질문에 대해 한국어 마크다운으로 답하되, 필요한 경우 실시간 재검토 수치(연도·수량·소진시점·"
+        "가속도·환산액·신뢰도 등급 등)를 명시해 주세요."
+    )
     return "\n".join(lines)
 
 
@@ -1549,6 +1734,129 @@ def category_counts(items: list[StockItem]) -> dict[str, int]:
     for it in items:
         counts[it.std_type or "미분류"] += 1
     return dict(counts)
+
+
+# ---------------------------------------------------------------------------
+# 공정서(규격) 참조 DB — 재고 시계열 파싱 대상 아님, AI 프롬프트 컨텍스트 전용
+# ---------------------------------------------------------------------------
+
+COMPENDIUM_NAME_KEYS = ("한글명", "생약명", "품목명", "명칭", "표준품명", "name", "Name")
+COMPENDIUM_CODE_KEYS = ("관리번호", "품목코드", "코드", "code", "Code")
+
+
+def load_compendium_excel(path: PathLike) -> dict[str, Any]:
+    """공정서/규격 DB 엑셀을 DataFrame으로만 로드 (시계열·소급보정 없음)."""
+    path = str(path)
+    xls = pd.ExcelFile(path, engine="openpyxl")
+    frames: list[pd.DataFrame] = []
+    for sheet in xls.sheet_names:
+        part = pd.read_excel(xls, sheet_name=sheet)
+        part.columns = [str(c).strip() for c in part.columns]
+        if part.empty:
+            continue
+        part = part.copy()
+        part.insert(0, "_시트", sheet)
+        frames.append(part)
+    if not frames:
+        raise ValueError(f"공정서 DB 시트에 데이터가 없습니다: {Path(path).name}")
+
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    return {
+        "file_path": path,
+        "file_name": Path(path).name,
+        "dataframe": df,
+        "row_count": int(len(df)),
+        "columns": [str(c) for c in df.columns],
+        "sheet_count": len(frames),
+    }
+
+
+def _pick_column(columns: Sequence[str], keywords: Sequence[str]) -> Optional[str]:
+    for key in keywords:
+        for col in columns:
+            if key.lower() in str(col).lower():
+                return str(col)
+    return None
+
+
+def _row_to_brief(row: pd.Series, columns: list[str], max_cols: int = 12) -> str:
+    parts: list[str] = []
+    for col in columns[:max_cols]:
+        if str(col).startswith("_"):
+            continue
+        val = row.get(col)
+        if _is_empty(val):
+            continue
+        text = _cell_str(val)
+        if len(text) > 80:
+            text = text[:77] + "..."
+        parts.append(f"{col}={text}")
+    return " | ".join(parts)
+
+
+def format_compendium_context(
+    df: pd.DataFrame | None,
+    items: list[StockItem] | None = None,
+    *,
+    max_rows: int = 60,
+    max_chars: int = 12_000,
+    meta: dict[str, Any] | None = None,
+) -> str:
+    """AI 프롬프트용 공정서 DB 요약·매칭 행 텍스트."""
+    if df is None or df.empty:
+        return ""
+
+    columns = [str(c) for c in df.columns]
+    name_col = _pick_column(columns, COMPENDIUM_NAME_KEYS)
+    code_col = _pick_column(columns, COMPENDIUM_CODE_KEYS)
+
+    lines = [
+        "[공정서/규격 참조 DB — 재고 시계열이 아님. 규격·기준 정보 참조 전용]",
+        f"- 파일: {(meta or {}).get('file_name', '')}",
+        f"- 행 수: {len(df)} · 열: {', '.join(columns[:20])}"
+        + (" ..." if len(columns) > 20 else ""),
+        "- 사용 규칙: 재고/분양 수치 산출에 쓰지 말고, 품목 규격·기준 설명에만 인용하세요.",
+        "- DB에 없는 규격 정보는 '공정서 DB에 해당 항목 없음'으로 명시하세요.",
+    ]
+
+    keys_name = {it.name_ko.strip() for it in (items or []) if it.name_ko}
+    keys_code = {it.manage_no.strip() for it in (items or []) if it.manage_no}
+
+    def _row_matches(row: pd.Series) -> bool:
+        if name_col and not _is_empty(row.get(name_col)):
+            nm = _cell_str(row.get(name_col))
+            if nm in keys_name or any(nm and (nm in k or k in nm) for k in keys_name):
+                return True
+        if code_col and not _is_empty(row.get(code_col)):
+            cd = _cell_str(row.get(code_col))
+            if cd in keys_code:
+                return True
+        return False
+
+    matched_rows: list[pd.Series] = []
+    if keys_name or keys_code:
+        for _, row in df.iterrows():
+            if _row_matches(row):
+                matched_rows.append(row)
+
+    lines.append("")
+    if matched_rows:
+        lines.append(
+            f"[재고 품목과 매칭된 공정서 행] ({min(len(matched_rows), max_rows)}/{len(matched_rows)}건 표시)"
+        )
+        for row in matched_rows[:max_rows]:
+            lines.append(f"- {_row_to_brief(row, columns)}")
+    else:
+        lines.append("[공정서 DB 미리보기] (재고 품목과 자동 매칭된 행 없음 — 상위 행 샘플)")
+        preview_n = min(15, len(df), max_rows)
+        for _, row in df.head(preview_n).iterrows():
+            lines.append(f"- {_row_to_brief(row, columns)}")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[: max_chars - 20] + "\n... (이하 생략)"
+    return text
+
 
 # 3D 표시용 예상 소진기간 상한 (AI 추이와 동일 산출, 초장기는 상한에 묶음)
 YEARS_LEFT_DISPLAY_CAP = 50.0

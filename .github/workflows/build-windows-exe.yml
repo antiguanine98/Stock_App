@@ -31,11 +31,11 @@ jobs:
       - name: Rename artifact
         shell: pwsh
         run: |
-          $exe = "dist/Stock_App_v1.31.exe"
+          $exe = "dist/Stock_App_v1.32.exe"
           if (Test-Path $exe) {
             Write-Host "EXE ready: $exe"
-          } elseif (Test-Path "dist/Stock_App_v1.31") {
-            Move-Item "dist/Stock_App_v1.31" $exe
+          } elseif (Test-Path "dist/Stock_App_v1.32") {
+            Move-Item "dist/Stock_App_v1.32" $exe
           } else {
             Get-ChildItem dist -ErrorAction SilentlyContinue | Format-Table Name, Length
             throw "Built EXE not found"
@@ -45,22 +45,21 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Stock_App_v1.31
-          path: dist/Stock_App_v1.31.exe
+          name: Stock_App_v1.32
+          path: dist/Stock_App_v1.32.exe
 
       - name: Create GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: Stock_App v1.31
-          files: dist/Stock_App_v1.31.exe
+          name: Stock_App v1.32
+          files: dist/Stock_App_v1.32.exe
           generate_release_notes: true
           body: |
             ## Summary
-            - 신뢰도 A~D 등급(수집 횟수·관측 간격), 증가 구간 제외 분양속도
-            - 분양 가속도(급가속/증가/안정/감소), 장기 저분양 선별
-            - 현 재고×가격 분양금액 환산액(전체·유형별·TOP20)
-            - 리포트 최상단 1페이지 KPI 대시보드 + 자동 종합 의견 (전문가 제언 제외)
+            - 챗봇 후속 질문 시 재고 통합 DataFrame·지표를 실시간 재검토(Query) 후 답변
+            - 공정서 DB를 후속 질문 컨텍스트에 반영
+            - 시작 로딩창·작업 중 진행 다이얼로그 Windows 표시 수정
 
             ## Assets
-            - `Stock_App_v1.31.exe` (Windows one-file, Python 3.12)
+            - `Stock_App_v1.32.exe` (Windows one-file, Python 3.12)

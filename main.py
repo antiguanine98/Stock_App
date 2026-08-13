@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.31
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.32
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
-    QSplashScreen,
     QStatusBar,
     QTabWidget,
     QTableWidget,
@@ -55,6 +55,8 @@ from stock_logic import (
     build_scatter3d_records,
     collect_ai_analysis_flags,
     extract_mentioned_codes_from_report,
+    format_compendium_context,
+    load_compendium_excel,
     process_excel,
     process_excels,
 )
@@ -88,7 +90,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.31"
+APP_VERSION = "v1.32"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -492,6 +494,21 @@ class GeminiWorker(QThread):
             self.error.emit(detail)
 
 
+class CompendiumWorker(QThread):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, file_path: str):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(load_compendium_excel(self.file_path))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class GeminiTestWorker(QThread):
     finished = pyqtSignal(bool, str)
 
@@ -528,26 +545,35 @@ class ComboPopupFilter(QObject):
 class DropZone(QFrame):
     files_dropped = pyqtSignal(list)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        title: str = "엑셀 파일을 여기에 드래그 앤 드롭 (다중 가능)",
+        subtitle: str = ".xlsx / .xls · 2개 이상 동시/순차 업로드 시 통합 분석 · [파일 선택] 지원",
+        min_height: int = 96,
+    ):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setMinimumHeight(96)
+        self.setMinimumHeight(min_height)
         self.setObjectName("dropZone")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
-        title = QLabel("엑셀 파일을 여기에 드래그 앤 드롭 (다중 가능)")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet(
+        title_lbl = QLabel(title)
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_lbl.setWordWrap(True)
+        title_lbl.setStyleSheet(
             "color: #1e3a5f; font-size: 14px; font-weight: 700; border: none; background: transparent;"
         )
-        subtitle = QLabel(".xlsx / .xls · 2개 이상 동시/순차 업로드 시 통합 분석 · [파일 선택] 지원")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet(
+        subtitle_lbl = QLabel(subtitle)
+        subtitle_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle_lbl.setWordWrap(True)
+        subtitle_lbl.setStyleSheet(
             "color: #5b6b7c; font-size: 12px; border: none; background: transparent;"
         )
         layout.addStretch()
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        layout.addWidget(title_lbl)
+        layout.addWidget(subtitle_lbl)
         layout.addStretch()
 
     @staticmethod
@@ -913,9 +939,50 @@ class MainWindow(QMainWindow):
         self._chat_history: list[dict[str, str]] = []
         self._initial_report: str = ""
         self._chat_busy = False
+        self.compendium_df = None
+        self.compendium_meta: dict[str, Any] | None = None
+        self.compendium_worker: CompendiumWorker | None = None
+        self._busy_dialog: QProgressDialog | None = None
 
         self._build_ui()
         self._load_api_key()
+
+    def _show_busy(self, title: str, text: str) -> None:
+        """작업 중 로딩창. Windows에서 바로 보이도록 즉시 표시·최상위 유지."""
+        self._close_busy()
+        dlg = QProgressDialog(text, None, 0, 0, self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setCancelButton(None)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumWidth(380)
+        dlg.setWindowFlags(
+            dlg.windowFlags()
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self._busy_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        # 메인 스레드 블로킹 전에 반드시 한 번 페인트
+        QApplication.processEvents()
+
+    def _close_busy(self) -> None:
+        if self._busy_dialog is not None:
+            dlg = self._busy_dialog
+            self._busy_dialog = None
+            dlg.hide()
+            dlg.close()
+            dlg.deleteLater()
+            QApplication.processEvents()
+
+    def _run_after_busy_paint(self, fn) -> None:
+        """로딩창이 먼저 그려진 뒤 무거운 동기 작업/워커 시작."""
+        QTimer.singleShot(40, fn)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -934,7 +1001,7 @@ class MainWindow(QMainWindow):
         top_layout.setContentsMargins(14, 12, 14, 12)
         top_layout.setSpacing(10)
 
-        file_label = QLabel("엑셀 업로드")
+        file_label = QLabel("재고 엑셀 업로드")
         file_label.setObjectName("sectionLabel")
         top_layout.addWidget(file_label)
 
@@ -956,6 +1023,35 @@ class MainWindow(QMainWindow):
         btn_col.addWidget(btn_clear)
         file_row.addLayout(btn_col)
         top_layout.addLayout(file_row)
+
+        comp_label = QLabel("공정서 DB 업로드 (규격 참조 · 재고 분석 제외)")
+        comp_label.setObjectName("sectionLabel")
+        top_layout.addWidget(comp_label)
+
+        comp_row = QHBoxLayout()
+        self.compendium_dropzone = DropZone(
+            title="공정서 DB 엑셀을 드래그 앤 드롭",
+            subtitle=".xlsx / .xls · 재고 시계열로 파싱하지 않음 · AI 규격/기준 참조 전용",
+            min_height=72,
+        )
+        self.compendium_dropzone.files_dropped.connect(self._on_compendium_dropped)
+        comp_row.addWidget(self.compendium_dropzone, stretch=1)
+        comp_btn_col = QVBoxLayout()
+        btn_comp_select = QPushButton("공정서 선택")
+        btn_comp_select.setObjectName("secondaryBtn")
+        btn_comp_select.setMinimumWidth(110)
+        btn_comp_select.clicked.connect(self._browse_compendium)
+        btn_comp_clear = QPushButton("공정서 해제")
+        btn_comp_clear.setObjectName("secondaryBtn")
+        btn_comp_clear.setMinimumWidth(110)
+        btn_comp_clear.clicked.connect(self._clear_compendium)
+        comp_btn_col.addWidget(btn_comp_select)
+        comp_btn_col.addWidget(btn_comp_clear)
+        comp_row.addLayout(comp_btn_col)
+        top_layout.addLayout(comp_row)
+        self.compendium_status = QLabel("공정서 DB: 미등록")
+        self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
+        top_layout.addWidget(self.compendium_status)
 
         api_label = QLabel("Gemini API Key")
         api_label.setObjectName("sectionLabel")
@@ -1058,7 +1154,8 @@ class MainWindow(QMainWindow):
         report_layout.setContentsMargins(8, 8, 8, 8)
         report_layout.setSpacing(8)
         chat_hint = QLabel(
-            "초기 분석 리포트 생성 후, 하단에 추가 질문·세부 분석을 입력해 대화할 수 있습니다."
+            "초기 분석 리포트 생성 후 추가 질문을 입력하세요. "
+            "후속 질문은 재고 통합 데이터·공정서 DB를 실시간 재검토하여 답변합니다."
         )
         chat_hint.setStyleSheet("color: #64748b; font-size: 12px;")
         report_layout.addWidget(chat_hint)
@@ -1187,6 +1284,87 @@ class MainWindow(QMainWindow):
         self.btn_test.setText("연결 테스트")
         self._set_api_status(ok, message)
 
+    def _browse_compendium(self) -> None:
+        from PyQt6.QtWidgets import QFileDialog
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "공정서 DB 엑셀 선택", "", "Excel Files (*.xlsx *.xls)"
+        )
+        if path:
+            self._load_compendium(path)
+
+    def _on_compendium_dropped(self, paths: list[str]) -> None:
+        if paths:
+            self._load_compendium(paths[0])
+
+    def _clear_compendium(self) -> None:
+        self.compendium_df = None
+        self.compendium_meta = None
+        self.compendium_status.setText("공정서 DB: 미등록")
+        self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
+        self.compendium_status.setToolTip("")
+
+    def _load_compendium(self, file_path: str) -> None:
+        self.compendium_status.setText(f"공정서 DB: 로딩 중... ({Path(file_path).name})")
+        self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
+        self._show_busy("공정서 DB", f"공정서 DB를 불러오는 중...\n{Path(file_path).name}")
+
+        def _start() -> None:
+            self.compendium_worker = CompendiumWorker(file_path)
+            self.compendium_worker.finished.connect(self._on_compendium_loaded)
+            self.compendium_worker.error.connect(self._on_compendium_error)
+            self.compendium_worker.start()
+
+        self._run_after_busy_paint(_start)
+
+    def _on_compendium_loaded(self, data: dict[str, Any]) -> None:
+        self._close_busy()
+        self.compendium_df = data.get("dataframe")
+        self.compendium_meta = {
+            "file_path": data.get("file_path"),
+            "file_name": data.get("file_name"),
+            "row_count": data.get("row_count"),
+            "columns": data.get("columns"),
+            "sheet_count": data.get("sheet_count"),
+        }
+        name = data.get("file_name", "")
+        rows = data.get("row_count", 0)
+        sheets = data.get("sheet_count", 1)
+        self.compendium_status.setText(
+            f"공정서 DB: {name} ({rows:,}행 · 시트 {sheets})"
+        )
+        self.compendium_status.setStyleSheet("color: #15803d; font-size: 12px; font-weight: 600;")
+        self.compendium_status.setToolTip(
+            f"{name}\n열: {', '.join((data.get('columns') or [])[:30])}"
+        )
+        # 이미 재고가 로드된 상태면 다음 AI 질문부터 반영 (초기 리포트는 재실행하지 않음)
+        if self._initial_report:
+            QMessageBox.information(
+                self,
+                "공정서 DB 등록",
+                "공정서 DB가 등록되었습니다.\n"
+                "이후 챗봇 답변과, 재고 파일을 다시 불러와 생성하는 초기 리포트에 규격 참조로 사용됩니다.",
+            )
+
+    def _on_compendium_error(self, message: str) -> None:
+        self._close_busy()
+        self.compendium_status.setText("공정서 DB: 오류")
+        self.compendium_status.setStyleSheet("color: #b91c1c; font-size: 12px; font-weight: 600;")
+        QMessageBox.critical(self, "공정서 DB 오류", message)
+
+    def _compendium_prompt_context(self, stock_items: list | None = None) -> str | None:
+        if self.compendium_df is None:
+            return None
+        items = stock_items
+        if items is None and self.inventory_data:
+            items = self.inventory_data.get("stock_items")
+        text = format_compendium_context(
+            self.compendium_df,
+            items or [],
+            meta=self.compendium_meta,
+        )
+        return text or None
+
     def _browse_file(self) -> None:
         from PyQt6.QtWidgets import QFileDialog
 
@@ -1197,6 +1375,7 @@ class MainWindow(QMainWindow):
             self._load_excels(list(paths))
 
     def _clear_loaded_files(self) -> None:
+        self._close_busy()
         self._loaded_paths = []
         self.inventory_data = None
         self._chat_history.clear()
@@ -1223,16 +1402,23 @@ class MainWindow(QMainWindow):
         names = [Path(p).name for p in combined]
         label = names[0] if len(names) == 1 else f"{len(names)}개 파일"
         self.status_excel.setText(f"파일: 처리 중... ({label})")
-        self.excel_worker = ExcelWorker(combined)
-        self.excel_worker.finished.connect(self._on_excel_loaded)
-        self.excel_worker.error.connect(self._on_excel_error)
-        self.excel_worker.start()
+        self._show_busy("재고 엑셀 처리", f"재고 데이터를 통합·보정하는 중...\n{label}")
+
+        def _start() -> None:
+            self.excel_worker = ExcelWorker(combined)
+            self.excel_worker.finished.connect(self._on_excel_loaded)
+            self.excel_worker.error.connect(self._on_excel_error)
+            self.excel_worker.start()
+
+        self._run_after_busy_paint(_start)
 
     def _on_excel_error(self, message: str) -> None:
+        self._close_busy()
         self.status_excel.setText("파일: 오류")
         QMessageBox.critical(self, "파일 처리 오류", message)
 
     def _on_excel_loaded(self, data: dict[str, Any]) -> None:
+        self._close_busy()
         stock_items = list(data.get("stock_items") or [])
         data["ai_flags"] = collect_ai_analysis_flags(stock_items)
         data["ai_mentioned_codes"] = []
@@ -1508,13 +1694,22 @@ class MainWindow(QMainWindow):
             }
         )
         self._render_chat_view()
-        prompt = build_ai_prompt(stock_items)
-        self.gemini_worker = GeminiWorker(key, prompt, followup=False)
-        self.gemini_worker.finished.connect(self._on_report_ready)
-        self.gemini_worker.error.connect(self._on_report_error)
-        self.gemini_worker.start()
+        self._show_busy("AI 분석", "초기 분석 리포트를 생성하는 중...\n잠시만 기다려 주세요.")
+
+        def _start() -> None:
+            prompt = build_ai_prompt(
+                stock_items,
+                compendium_context=self._compendium_prompt_context(stock_items),
+            )
+            self.gemini_worker = GeminiWorker(key, prompt, followup=False)
+            self.gemini_worker.finished.connect(self._on_report_ready)
+            self.gemini_worker.error.connect(self._on_report_error)
+            self.gemini_worker.start()
+
+        self._run_after_busy_paint(_start)
 
     def _on_report_ready(self, text: str) -> None:
+        self._close_busy()
         self._chat_busy = False
         # 진행 안내 system 메시지 제거
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
@@ -1534,6 +1729,7 @@ class MainWindow(QMainWindow):
             self._refresh_3d()
 
     def _on_report_error(self, message: str) -> None:
+        self._close_busy()
         self._chat_busy = False
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
         self._chat_history.append(
@@ -1559,35 +1755,50 @@ class MainWindow(QMainWindow):
 
         self.chat_input.clear()
         self._chat_history.append({"role": "user", "text": question})
-        self._chat_history.append({"role": "system", "text": "답변 생성 중..."})
+        self._chat_history.append(
+            {"role": "system", "text": "재고·공정서 데이터를 실시간 재검토하여 답변 생성 중..."}
+        )
         self._chat_busy = True
         self._set_chat_enabled(False)
         self._render_chat_view()
+        self._show_busy("AI 답변", "재고 통합 데이터·공정서 DB를 재조회하는 중...")
 
-        stock_items = None
-        if self.inventory_data:
-            stock_items = self.inventory_data.get("stock_items")
-        prompt = build_followup_prompt(self._initial_report, question, stock_items)
-        # 최근 대화 맥락을 짧게 첨부
-        prior_qas = [
-            m for m in self._chat_history
-            if m.get("role") in ("user", "assistant") and m.get("text") != self._initial_report
-        ]
-        if len(prior_qas) > 2:
-            tail = prior_qas[-6:-1]  # 직전 질문 제외한 최근 맥락
-            if tail:
-                ctx = "\n\n".join(
-                    ("사용자: " if m["role"] == "user" else "AI: ") + m["text"][:800]
-                    for m in tail
-                )
-                prompt = prompt + "\n\n[최근 대화 맥락]\n" + ctx
+        def _start() -> None:
+            stock_items = None
+            table_df = None
+            if self.inventory_data:
+                stock_items = self.inventory_data.get("stock_items")
+                table_df = self.inventory_data.get("table_df")
+            prompt = build_followup_prompt(
+                self._initial_report,
+                question,
+                stock_items,
+                compendium_context=self._compendium_prompt_context(stock_items),
+                table_df=table_df,
+            )
+            # 최근 대화 맥락을 짧게 첨부
+            prior_qas = [
+                m for m in self._chat_history
+                if m.get("role") in ("user", "assistant") and m.get("text") != self._initial_report
+            ]
+            if len(prior_qas) > 2:
+                tail = prior_qas[-6:-1]  # 직전 질문 제외한 최근 맥락
+                if tail:
+                    ctx = "\n\n".join(
+                        ("사용자: " if m["role"] == "user" else "AI: ") + m["text"][:800]
+                        for m in tail
+                    )
+                    prompt = prompt + "\n\n[최근 대화 맥락]\n" + ctx
 
-        self.gemini_worker = GeminiWorker(key, prompt, followup=True)
-        self.gemini_worker.finished.connect(self._on_chat_reply)
-        self.gemini_worker.error.connect(self._on_chat_error)
-        self.gemini_worker.start()
+            self.gemini_worker = GeminiWorker(key, prompt, followup=True)
+            self.gemini_worker.finished.connect(self._on_chat_reply)
+            self.gemini_worker.error.connect(self._on_chat_error)
+            self.gemini_worker.start()
+
+        self._run_after_busy_paint(_start)
 
     def _on_chat_reply(self, text: str) -> None:
+        self._close_busy()
         self._chat_busy = False
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
         self._chat_history.append({"role": "assistant", "text": text})
@@ -1607,6 +1818,7 @@ class MainWindow(QMainWindow):
             self._refresh_3d()
 
     def _on_chat_error(self, message: str) -> None:
+        self._close_busy()
         self._chat_busy = False
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
         self._chat_history.append(
@@ -1617,11 +1829,15 @@ class MainWindow(QMainWindow):
         self._set_api_status(False, message)
 
 
-def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar, QLabel]:
-    """반투명 패널 + 아웃라인 테두리 스플래시."""
+def create_splash(app: QApplication) -> tuple[QWidget, QProgressBar, QLabel]:
+    """시작 로딩창.
+
+    QSplashScreen + 반투명 배경은 Windows에서 안 보이거나 즉시 사라지는 경우가 많아
+    불투명 프레임리스 QWidget을 사용한다.
+    """
     w, h = 540, 320
     pix = QPixmap(w, h)
-    pix.fill(Qt.GlobalColor.transparent)
+    pix.fill(QColor("#e8eef6"))
 
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1630,20 +1846,15 @@ def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar, QLabe
     panel = QPainterPath()
     panel.addRoundedRect(14, 14, w - 28, h - 28, 18, 18)
 
-    # 반투명 유리창 느낌의 배경
-    fill = QColor("#f4f7fb")
-    fill.setAlpha(210)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QBrush(fill))
+    painter.setBrush(QBrush(QColor("#f4f7fb")))
     painter.drawPath(panel)
 
-    # 은은한 상단 하이라이트 (반투명)
     highlight = QColor("#ffffff")
-    highlight.setAlpha(70)
+    highlight.setAlpha(120)
     painter.setBrush(QBrush(highlight))
     painter.drawRoundedRect(18, 18, w - 36, (h - 36) // 2, 16, 16)
 
-    # 바깥 프레임 테두리
     outer = QPen(QColor("#1e3a5f"))
     outer.setWidth(2)
     outer.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -1651,13 +1862,11 @@ def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar, QLabe
     painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
     painter.drawPath(panel)
 
-    # 안쪽 얇은 이중 테두리
     inner = QPen(QColor("#6b87a8"))
     inner.setWidth(1)
     painter.setPen(inner)
     painter.drawRoundedRect(26, 26, w - 52, h - 52, 14, 14)
 
-    # 상단 로고 마크: 마름모+원 아웃라인
     cx, cy = w // 2, 78
     logo_pen = QPen(QColor("#1e3a5f"))
     logo_pen.setWidth(2)
@@ -1672,7 +1881,6 @@ def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar, QLabe
     painter.drawPath(diamond)
     painter.drawEllipse(cx - 10, cy - 10, 20, 20)
 
-    # 타이틀 / 버전
     painter.setPen(QColor("#0b1f3a"))
     painter.setFont(QFont("Malgun Gothic", 16, QFont.Weight.Bold))
     painter.drawText(40, 130, w - 80, 36, Qt.AlignmentFlag.AlignHCenter, "생약표준품 재고 분석 시스템")
@@ -1681,12 +1889,17 @@ def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar, QLabe
     painter.drawText(40, 168, w - 80, 28, Qt.AlignmentFlag.AlignHCenter, f"{APP_VERSION} 초기화 중...")
     painter.end()
 
-    splash = QSplashScreen(pix)
-    splash.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-    splash.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-    splash.show()
+    splash = QWidget(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+    splash.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    splash.setFixedSize(w, h)
+    splash.setWindowTitle(f"생약표준품 재고 분석 시스템 {APP_VERSION}")
+    splash.setStyleSheet("background-color: #e8eef6;")
 
-    # 상태 멘트: 하단 테두리에 잘리지 않도록 프로그레스바 위쪽에 배치
+    bg = QLabel(splash)
+    bg.setPixmap(pix)
+    bg.setGeometry(0, 0, w, h)
+    bg.lower()
+
     status = QLabel(splash)
     status.setGeometry(40, 214, w - 80, 24)
     status.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
@@ -1694,28 +1907,36 @@ def create_splash(app: QApplication) -> tuple[QSplashScreen, QProgressBar, QLabe
         "color: #3d5a80; font-size: 12px; font-family: 'Malgun Gothic'; background: transparent;"
     )
     status.setText("모듈 로드 중...")
-    status.show()
 
     bar = QProgressBar(splash)
     bar.setGeometry(70, 246, w - 140, 16)
     bar.setRange(0, 100)
-    bar.setValue(0)
+    bar.setValue(8)
     bar.setTextVisible(False)
     bar.setStyleSheet(
         """
         QProgressBar {
-            background: rgba(255, 255, 255, 120);
+            background: #ffffff;
             border: 1px solid #1e3a5f;
             border-radius: 8px;
         }
         QProgressBar::chunk {
-            background-color: rgba(30, 58, 95, 210);
+            background-color: #1e3a5f;
             border-radius: 7px;
             margin: 2px;
         }
         """
     )
-    bar.show()
+
+    # 화면 중앙 배치
+    screen = app.primaryScreen()
+    if screen is not None:
+        geo = screen.availableGeometry()
+        splash.move(geo.center().x() - w // 2, geo.center().y() - h // 2)
+
+    splash.show()
+    splash.raise_()
+    splash.activateWindow()
     app.processEvents()
     return splash, bar, status
 
@@ -1731,8 +1952,10 @@ def main() -> None:
     app.setStyleSheet(APP_STYLE)
 
     splash, bar, status_label = create_splash(app)
-    window = MainWindow()
+    app.processEvents()
 
+    # 스플래시가 먼저 보이도록 메인 윈도우 생성은 약간 지연
+    state = {"i": 0, "window": None}
     steps = [15, 35, 55, 75, 90, 100]
     labels = [
         "모듈 로드 중...",
@@ -1743,21 +1966,32 @@ def main() -> None:
         f"생약표준품 재고 분석 시스템 {APP_VERSION} 초기화 중...",
     ]
 
-    state = {"i": 0}
-
     def tick() -> None:
         i = state["i"]
+        if i == 1 and state["window"] is None:
+            status_label.setText(labels[1])
+            bar.setValue(steps[1])
+            splash.raise_()
+            app.processEvents()
+            state["window"] = MainWindow()
+            state["i"] = 2
+            QTimer.singleShot(280, tick)
+            return
         if i < len(steps):
             bar.setValue(steps[i])
             status_label.setText(labels[i])
-            state["i"] += 1
+            splash.raise_()
             app.processEvents()
+            state["i"] += 1
             QTimer.singleShot(320, tick)
         else:
-            splash.finish(window)
+            window = state["window"] or MainWindow()
             window.show()
+            window.raise_()
+            window.activateWindow()
+            splash.close()
 
-    QTimer.singleShot(200, tick)
+    QTimer.singleShot(120, tick)
     sys.exit(app.exec())
 
 

@@ -78,6 +78,8 @@ def main() -> int:
         assert win.tabs.count() == 4
         assert hasattr(win, "chat_input")
         assert hasattr(win, "btn_chat_send")
+        assert hasattr(win, "compendium_dropzone")
+        assert hasattr(win, "compendium_status")
         # 연도 컬럼 헤더
         headers = [
             win.table.horizontalHeaderItem(i).text() for i in range(win.table.columnCount())
