@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.32
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.33
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QSizePolicy,
     QStatusBar,
     QTabWidget,
     QTableWidget,
@@ -90,7 +91,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.32"
+APP_VERSION = "v1.33"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -121,6 +122,23 @@ QLabel#sectionLabel {
     color: #1e3a5f;
     font-size: 12px;
     font-weight: 700;
+}
+QLabel#settingsHeaderLabel {
+    color: #0b1f3a;
+    font-size: 13px;
+    font-weight: 700;
+}
+QPushButton#collapseToggleBtn {
+    background-color: #eef3f9;
+    color: #1e3a5f;
+    border: 1px solid #c5d0de;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-weight: 600;
+}
+QPushButton#collapseToggleBtn:hover {
+    background-color: #dce6f2;
+    border-color: #1e3a5f;
 }
 QFrame#card {
     background-color: #ffffff;
@@ -988,17 +1006,43 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setSpacing(12)
-        root.setContentsMargins(18, 16, 18, 8)
+        root.setSpacing(10)
+        root.setContentsMargins(18, 12, 18, 8)
 
         title = QLabel(f"생약표준품 재고 분석 시스템 {APP_VERSION}")
         title.setObjectName("titleLabel")
-        root.addWidget(title)
+        title.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        root.addWidget(title, stretch=0)
 
-        top_card = QFrame()
-        top_card.setObjectName("card")
-        top_layout = QVBoxLayout(top_card)
-        top_layout.setContentsMargins(14, 12, 14, 12)
+        # --- 접이식 상단: 엑셀 / 공정서 / API Key ---
+        self._settings_collapsed = False
+        settings_card = QFrame()
+        settings_card.setObjectName("card")
+        settings_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self._settings_card = settings_card
+        settings_outer = QVBoxLayout(settings_card)
+        settings_outer.setContentsMargins(14, 10, 14, 10)
+        settings_outer.setSpacing(8)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+        self._settings_header_label = QLabel("설정 및 파일 업로드")
+        self._settings_header_label.setObjectName("settingsHeaderLabel")
+        header_row.addWidget(self._settings_header_label, stretch=1)
+        self.btn_toggle_settings = QPushButton("▲ 설정 및 파일 업로드 영역 접기")
+        self.btn_toggle_settings.setObjectName("collapseToggleBtn")
+        self.btn_toggle_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_settings.setMinimumHeight(34)
+        self.btn_toggle_settings.clicked.connect(self._toggle_settings_panel)
+        header_row.addWidget(self.btn_toggle_settings, stretch=0)
+        settings_outer.addLayout(header_row)
+
+        self._settings_body = QWidget()
+        self._settings_body.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
+        top_layout = QVBoxLayout(self._settings_body)
+        top_layout.setContentsMargins(0, 2, 0, 0)
         top_layout.setSpacing(10)
 
         file_label = QLabel("재고 엑셀 업로드")
@@ -1006,7 +1050,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(file_label)
 
         file_row = QHBoxLayout()
-        self.dropzone = DropZone()
+        self.dropzone = DropZone(min_height=78)
         self.dropzone.files_dropped.connect(self._load_excels)
         file_row.addWidget(self.dropzone, stretch=1)
         btn_col = QVBoxLayout()
@@ -1032,7 +1076,7 @@ class MainWindow(QMainWindow):
         self.compendium_dropzone = DropZone(
             title="공정서 DB 엑셀을 드래그 앤 드롭",
             subtitle=".xlsx / .xls · 재고 시계열로 파싱하지 않음 · AI 규격/기준 참조 전용",
-            min_height=72,
+            min_height=64,
         )
         self.compendium_dropzone.files_dropped.connect(self._on_compendium_dropped)
         comp_row.addWidget(self.compendium_dropzone, stretch=1)
@@ -1070,9 +1114,13 @@ class MainWindow(QMainWindow):
         self.btn_test.clicked.connect(self._test_api_connection)
         api_row.addWidget(self.btn_test)
         top_layout.addLayout(api_row)
-        root.addWidget(top_card)
+
+        settings_outer.addWidget(self._settings_body)
+        root.addWidget(settings_card, stretch=0)
 
         self.tabs = QTabWidget()
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.tabs.setMinimumHeight(280)
 
         # Tab 1
         table_wrap = QWidget()
@@ -1086,6 +1134,7 @@ class MainWindow(QMainWindow):
         table_layout.addWidget(hint)
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
+        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1093,7 +1142,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
         self.table.cellDoubleClicked.connect(self._on_table_double_clicked)
-        table_layout.addWidget(self.table)
+        table_layout.addWidget(self.table, stretch=1)
         self.tabs.addTab(table_wrap, "보정 데이터 표")
 
         # Tab 2 chart
@@ -1161,6 +1210,9 @@ class MainWindow(QMainWindow):
         report_layout.addWidget(chat_hint)
         self.report_edit = QTextEdit()
         self.report_edit.setReadOnly(True)
+        self.report_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.report_edit.setPlaceholderText(
             "엑셀 업로드 후 생약표준품 분양·소진 예측 AI 리포트가 생성됩니다.\n"
             "이후 하단 입력창으로 추가 질문을 보낼 수 있습니다."
@@ -1240,6 +1292,35 @@ class MainWindow(QMainWindow):
         line.setFrameShape(QFrame.Shape.VLine)
         line.setFixedWidth(1)
         return line
+
+    def _toggle_settings_panel(self) -> None:
+        self._set_settings_collapsed(not self._settings_collapsed)
+
+    def _set_settings_collapsed(self, collapsed: bool) -> None:
+        self._settings_collapsed = collapsed
+        self._settings_body.setVisible(not collapsed)
+        if collapsed:
+            self.btn_toggle_settings.setText("▼ 설정 및 파일 업로드 영역 펼치기")
+            self._settings_header_label.setText("설정 및 파일 업로드 (접힘)")
+            # 접힌 뒤에는 헤더 한 줄만 남기고 탭이 세로 공간을 전부 가져감
+            self._settings_card.setMaximumHeight(70)
+            self._settings_card.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            )
+        else:
+            self.btn_toggle_settings.setText("▲ 설정 및 파일 업로드 영역 접기")
+            self._settings_header_label.setText("설정 및 파일 업로드")
+            self._settings_card.setMaximumHeight(16777215)  # QWIDGETSIZE_MAX
+            self._settings_card.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+            )
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._settings_card.updateGeometry()
+        self.tabs.updateGeometry()
+        central = self.centralWidget()
+        if central is not None and central.layout() is not None:
+            central.layout().activate()
+        self.update()
 
     def _load_api_key(self) -> None:
         key = load_config().get("gemini_api_key", "")
@@ -1389,6 +1470,7 @@ class MainWindow(QMainWindow):
         self.status_correction.setText("소급 보정: 0건")
         self.chart._show_placeholder("품목 또는 표준품구분을 선택하면 재고 추이 차트가 표시됩니다.")
         self.chart3d.show_message("엑셀을 다시 업로드해 주세요.")
+        self._set_settings_collapsed(False)
 
     def _load_excel(self, file_path: str) -> None:
         self._load_excels([file_path])
@@ -1448,6 +1530,8 @@ class MainWindow(QMainWindow):
         self._refresh_3d()
         self._run_ai_analysis(data)
         self.tabs.setCurrentIndex(0)
+        # 로드 완료 후 상단을 접어 탭/챗봇 영역을 넓힘
+        self._set_settings_collapsed(True)
 
     def _populate_table(self, data: dict[str, Any]) -> None:
         meta_cols = data["meta_cols"]

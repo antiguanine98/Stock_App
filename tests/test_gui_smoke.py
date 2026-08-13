@@ -78,6 +78,12 @@ def main() -> int:
         assert win.tabs.count() == 4
         assert hasattr(win, "chat_input")
         assert hasattr(win, "btn_chat_send")
+        assert hasattr(win, "btn_toggle_settings")
+        assert hasattr(win, "_settings_body")
+        win._set_settings_collapsed(True)
+        assert not win._settings_body.isVisible()
+        win._set_settings_collapsed(False)
+        assert win._settings_body.isVisible()
         assert hasattr(win, "compendium_dropzone")
         assert hasattr(win, "compendium_status")
         # 연도 컬럼 헤더
