@@ -31,22 +31,36 @@ jobs:
       - name: Rename artifact
         shell: pwsh
         run: |
-          if (Test-Path dist/Stock_App_v1.22.exe) {
-            Write-Host "EXE ready: dist/Stock_App_v1.22.exe"
-          } elseif (Test-Path dist/Stock_App_v1.22) {
-            Move-Item dist/Stock_App_v1.22 dist/Stock_App_v1.22.exe
+          $exe = "dist/Stock_App_v1.3.exe"
+          if (Test-Path $exe) {
+            Write-Host "EXE ready: $exe"
+          } elseif (Test-Path "dist/Stock_App_v1.3") {
+            Move-Item "dist/Stock_App_v1.3" $exe
+          } else {
+            Get-ChildItem dist -ErrorAction SilentlyContinue | Format-Table Name, Length
+            throw "Built EXE not found"
           }
           Get-ChildItem dist | Format-Table Name, Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Stock_App_v1.22
-          path: dist/Stock_App_v1.22.exe
+          name: Stock_App_v1.3
+          path: dist/Stock_App_v1.3.exe
 
       - name: Create GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Stock_App_v1.22.exe
+          name: Stock_App v1.3
+          files: dist/Stock_App_v1.3.exe
           generate_release_notes: true
+          body: |
+            ## Summary
+            - 다중 엑셀 업로드(동시/순차) 및 관리번호 기준 통합 분석
+            - 표·차트 날짜를 연도(YYYY) 중심으로 표기, 빈 연도 보간
+            - AI 분석 리포트 대화형 챗봇 UI
+            - AI 고도화: 할루시네이션 금지, 소진기간 구간화, 데이터 신뢰도, 제조우선순위·모니터링 선별
+
+            ## Assets
+            - `Stock_App_v1.3.exe` (Windows one-file, Python 3.12)

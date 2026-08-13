@@ -76,6 +76,19 @@ def main() -> int:
             if hasattr(w, "text")
         )
         assert win.tabs.count() == 4
+        assert hasattr(win, "chat_input")
+        assert hasattr(win, "btn_chat_send")
+        # 연도 컬럼 헤더
+        headers = [
+            win.table.horizontalHeaderItem(i).text() for i in range(win.table.columnCount())
+        ]
+        assert any(h.startswith("연도") for h in headers)
+        # 연속 연도 (2022~2024 fill)
+        assert "2023" in [
+            win.table.item(0, c).text()
+            for c in range(win.table.columnCount())
+            if win.table.item(0, c) is not None
+        ]
         # 3D 탭: 산점도 레코드 주입 경로
         win.tabs.setCurrentIndex(3)
         win._refresh_3d()

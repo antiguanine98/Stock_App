@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.22
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.3
 """
 
 from __future__ import annotations
@@ -51,10 +51,12 @@ from PyQt6.QtWidgets import (
 from stock_logic import (
     StockItem,
     build_ai_prompt,
+    build_followup_prompt,
     build_scatter3d_records,
     collect_ai_analysis_flags,
     extract_mentioned_codes_from_report,
     process_excel,
+    process_excels,
 )
 
 matplotlib.use("QtAgg")
@@ -86,7 +88,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.22"
+APP_VERSION = "v1.3"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -453,13 +455,19 @@ class ExcelWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_paths: list[str] | str):
         super().__init__()
-        self.file_path = file_path
+        if isinstance(file_paths, str):
+            self.file_paths = [file_paths]
+        else:
+            self.file_paths = list(file_paths)
 
     def run(self) -> None:
         try:
-            self.finished.emit(process_excel(self.file_path))
+            if len(self.file_paths) == 1:
+                self.finished.emit(process_excel(self.file_paths[0]))
+            else:
+                self.finished.emit(process_excels(self.file_paths))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -468,17 +476,19 @@ class GeminiWorker(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, api_key: str, prompt: str):
+    def __init__(self, api_key: str, prompt: str, *, followup: bool = False):
         super().__init__()
         self.api_key = api_key
         self.prompt = prompt
+        self.followup = followup
 
     def run(self) -> None:
         try:
             self.finished.emit(generate_gemini_report(self.api_key, self.prompt))
         except Exception as e:
             detail = format_gemini_error(e)
-            log_gemini("ERROR", f"AI 분석 실패: {detail}", e)
+            kind = "후속 질문" if self.followup else "AI 분석"
+            log_gemini("ERROR", f"{kind} 실패: {detail}", e)
             self.error.emit(detail)
 
 
@@ -516,7 +526,7 @@ class ComboPopupFilter(QObject):
 
 
 class DropZone(QFrame):
-    file_dropped = pyqtSignal(str)
+    files_dropped = pyqtSignal(list)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -525,12 +535,12 @@ class DropZone(QFrame):
         self.setObjectName("dropZone")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
-        title = QLabel("엑셀 파일을 여기에 드래그 앤 드롭")
+        title = QLabel("엑셀 파일을 여기에 드래그 앤 드롭 (다중 가능)")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
             "color: #1e3a5f; font-size: 14px; font-weight: 700; border: none; background: transparent;"
         )
-        subtitle = QLabel(".xlsx / .xls 지원 · 또는 오른쪽 [파일 선택] 버튼 사용")
+        subtitle = QLabel(".xlsx / .xls · 2개 이상 동시/순차 업로드 시 통합 분석 · [파일 선택] 지원")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet(
             "color: #5b6b7c; font-size: 12px; border: none; background: transparent;"
@@ -540,18 +550,25 @@ class DropZone(QFrame):
         layout.addWidget(subtitle)
         layout.addStretch()
 
+    @staticmethod
+    def _excel_paths_from_urls(urls) -> list[str]:
+        paths: list[str] = []
+        for url in urls:
+            path = url.toLocalFile()
+            if path.lower().endswith((".xlsx", ".xls")):
+                paths.append(path)
+        return paths
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            url = event.mimeData().urls()[0]
-            if url.toLocalFile().lower().endswith((".xlsx", ".xls")):
-                event.acceptProposedAction()
-                return
+        if event.mimeData().hasUrls() and self._excel_paths_from_urls(event.mimeData().urls()):
+            event.acceptProposedAction()
+            return
         event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        path = event.mimeData().urls()[0].toLocalFile()
-        if path.lower().endswith((".xlsx", ".xls")):
-            self.file_dropped.emit(path)
+        paths = self._excel_paths_from_urls(event.mimeData().urls())
+        if paths:
+            self.files_dropped.emit(paths)
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -631,8 +648,14 @@ class InventoryChart(FigureCanvas):
             self._points,
             key=lambda p: (p[0] - event.xdata) ** 2 + (p[1] - event.ydata) ** 2,
         )
-        dist = ((nearest[0] - event.xdata) ** 2 + (nearest[1] - event.ydata) ** 2) ** 0.5
-        if dist < 0.35:
+        xs = [p[0] for p in self._points]
+        ys = [p[1] for p in self._points if p[1] == p[1]]
+        x_span = max(1.0, max(xs) - min(xs))
+        y_span = max(1.0, (max(ys) - min(ys)) if ys else 1.0)
+        nd = ((nearest[0] - event.xdata) / x_span) ** 2 + (
+            (nearest[1] - event.ydata) / y_span
+        ) ** 2
+        if nd < 0.04:
             self._annot.xy = (nearest[0], nearest[1])
             self._annot.set_text(nearest[2])
             self._annot.set_visible(True)
@@ -657,26 +680,36 @@ class InventoryChart(FigureCanvas):
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         ax.set_facecolor("#fafbfc")
-        x = list(range(len(dates)))
+
+        def _years(vals: list[str]) -> list[int]:
+            out: list[int] = []
+            for d in vals:
+                try:
+                    out.append(int(str(d)[:4]))
+                except (TypeError, ValueError):
+                    out.append(len(out))
+            return out
+
+        years = _years(dates)
         y_corr = [v if v is not None else float("nan") for v in corrected]
 
         if original is not None and original_dates is not None and original_dates == dates:
             y_orig = [v if v is not None else float("nan") for v in original]
-            ax.plot(x, y_orig, "o--", label="연도말 원본", color="#c0392b", linewidth=1.5, markersize=5, alpha=0.7)
+            ax.plot(years, y_orig, "o--", label="연도말 원본", color="#c0392b", linewidth=1.5, markersize=5, alpha=0.7)
 
         (line,) = ax.plot(
-            x, y_corr, "s-", label="연도말 소급 보정",
+            years, y_corr, "s-", label="연도말 소급 보정",
             color="#1e3a5f", linewidth=2.2, markersize=7,
         )
         labels = [
-            f"{label}\n일자: {d}\n재고량: {y:g}" if y == y else f"{label}\n일자: {d}"
-            for d, y in zip(dates, y_corr)
+            f"{label}\n연도: {y}\n재고량: {q:g}" if q == q else f"{label}\n연도: {y}"
+            for y, q in zip(years, y_corr)
         ]
         self._attach_hover(ax, line, labels)
 
-        ax.set_xticks(x)
-        ax.set_xticklabels(dates, rotation=35, ha="right", fontsize=8)
-        ax.set_xlabel("변경일자 (연도별 최종)")
+        ax.set_xticks(years)
+        ax.set_xticklabels([str(y) for y in years], rotation=0, ha="center", fontsize=9)
+        ax.set_xlabel("연도 (YYYY)")
         ax.set_ylabel("재고량")
         ax.set_title(f"재고 추이 — {label}", fontsize=12, fontweight="bold", color="#0b1f3a", pad=12)
         ax.legend(loc="best", frameon=False)
@@ -699,27 +732,30 @@ class InventoryChart(FigureCanvas):
         palette = ["#1e3a5f", "#2563eb", "#0f766e", "#b45309", "#be123c", "#7c3aed", "#0369a1"]
         hover_labels: list[str] = []
         lines = []
+        all_years: set[int] = set()
 
-        # 비교를 위해 최대 12개만 표시
         for i, item in enumerate(valid[:12]):
             dates = item["dates"]
+            try:
+                years = [int(str(d)[:4]) for d in dates]
+            except (TypeError, ValueError):
+                years = list(range(len(dates)))
+            all_years.update(years)
             y = [v if v is not None else float("nan") for v in item["corrected"]]
-            x = list(range(len(dates)))
             (line,) = ax.plot(
-                x, y, "o-",
+                years, y, "o-",
                 label=item["label"][:28],
                 color=palette[i % len(palette)],
                 linewidth=1.8,
                 markersize=5,
             )
             lines.append(line)
-            for d, q in zip(dates, y):
+            for yr, q in zip(years, y):
                 hover_labels.append(
-                    f"{item['label']}\n일자: {d}\n재고량: {q:g}" if q == q else f"{item['label']}\n일자: {d}"
+                    f"{item['label']}\n연도: {yr}\n재고량: {q:g}" if q == q else f"{item['label']}\n연도: {yr}"
                 )
 
         if lines:
-            # 대표 라인에 hover (mplcursors는 복수 아티스트 지원)
             if mplcursors is not None:
                 self._cursor = mplcursors.cursor(lines, hover=True)
 
@@ -733,14 +769,18 @@ class InventoryChart(FigureCanvas):
                         q = item["corrected"][di]
                         qtxt = f"{q:g}" if q is not None else "-"
                         sel.annotation.set_text(
-                            f"{item['label']}\n일자: {item['dates'][di]}\n재고량: {qtxt}"
+                            f"{item['label']}\n연도: {item['dates'][di]}\n재고량: {qtxt}"
                         )
                     sel.annotation.get_bbox_patch().set(fc="#0b1f3a", alpha=0.92)
                     sel.annotation.set_color("white")
             else:
                 self._attach_hover(ax, lines[0], hover_labels)
 
-        ax.set_xlabel("시점 인덱스 (품목별 연도말 순서)")
+        if all_years:
+            ticks = sorted(all_years)
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([str(y) for y in ticks], fontsize=8)
+        ax.set_xlabel("연도 (YYYY)")
         ax.set_ylabel("재고량")
         ax.set_title(f"카테고리 비교 — {category}", fontsize=12, fontweight="bold", color="#0b1f3a")
         ax.legend(loc="best", fontsize=8, frameon=False)
@@ -869,6 +909,10 @@ class MainWindow(QMainWindow):
         self.test_worker: GeminiTestWorker | None = None
         self._item_by_label: dict[str, dict[str, Any]] = {}
         self._updating_combo = False
+        self._loaded_paths: list[str] = []
+        self._chat_history: list[dict[str, str]] = []
+        self._initial_report: str = ""
+        self._chat_busy = False
 
         self._build_ui()
         self._load_api_key()
@@ -896,14 +940,21 @@ class MainWindow(QMainWindow):
 
         file_row = QHBoxLayout()
         self.dropzone = DropZone()
-        self.dropzone.file_dropped.connect(self._load_excel)
+        self.dropzone.files_dropped.connect(self._load_excels)
         file_row.addWidget(self.dropzone, stretch=1)
+        btn_col = QVBoxLayout()
         btn_select = QPushButton("파일 선택")
         btn_select.setObjectName("secondaryBtn")
         btn_select.setMinimumWidth(110)
         btn_select.setMinimumHeight(42)
         btn_select.clicked.connect(self._browse_file)
-        file_row.addWidget(btn_select, alignment=Qt.AlignmentFlag.AlignVCenter)
+        btn_clear = QPushButton("목록 초기화")
+        btn_clear.setObjectName("secondaryBtn")
+        btn_clear.setMinimumWidth(110)
+        btn_clear.clicked.connect(self._clear_loaded_files)
+        btn_col.addWidget(btn_select)
+        btn_col.addWidget(btn_clear)
+        file_row.addLayout(btn_col)
         top_layout.addLayout(file_row)
 
         api_label = QLabel("Gemini API Key")
@@ -931,7 +982,10 @@ class MainWindow(QMainWindow):
         table_wrap = QWidget()
         table_layout = QVBoxLayout(table_wrap)
         table_layout.setContentsMargins(8, 8, 8, 8)
-        hint = QLabel("행을 더블클릭하면 해당 품목의 재고 추이 차트로 이동합니다. (등록일자 제외 · 잔고→재고 표기)")
+        hint = QLabel(
+            "행을 더블클릭하면 해당 품목의 재고 추이 차트로 이동합니다. "
+            "(등록일자 제외 · 잔고→재고 · 변경일자는 연도 YYYY)"
+        )
         hint.setStyleSheet("color: #64748b; font-size: 12px;")
         table_layout.addWidget(hint)
         self.table = QTableWidget()
@@ -990,7 +1044,7 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(btn_open_list)
         chart_layout.addLayout(filter_row)
 
-        hover_hint = QLabel("그래프 포인트에 마우스를 올리면 일자·재고량이 표시됩니다.")
+        hover_hint = QLabel("그래프 포인트에 마우스를 올리면 연도·재고량이 표시됩니다. (X축: 연도 YYYY, 빈 연도 보간)")
         hover_hint.setStyleSheet("color: #64748b; font-size: 12px;")
         chart_layout.addWidget(hover_hint)
 
@@ -998,17 +1052,35 @@ class MainWindow(QMainWindow):
         chart_layout.addWidget(self.chart, stretch=1)
         self.tabs.addTab(chart_widget, "재고 추이 차트")
 
-        # Tab 3 AI
+        # Tab 3 AI chatbot
         report_wrap = QWidget()
         report_layout = QVBoxLayout(report_wrap)
         report_layout.setContentsMargins(8, 8, 8, 8)
+        report_layout.setSpacing(8)
+        chat_hint = QLabel(
+            "초기 분석 리포트 생성 후, 하단에 추가 질문·세부 분석을 입력해 대화할 수 있습니다."
+        )
+        chat_hint.setStyleSheet("color: #64748b; font-size: 12px;")
+        report_layout.addWidget(chat_hint)
         self.report_edit = QTextEdit()
         self.report_edit.setReadOnly(True)
         self.report_edit.setPlaceholderText(
-            "엑셀 업로드 후 생약표준품 분양·소진 예측 AI 리포트가 생성됩니다."
+            "엑셀 업로드 후 생약표준품 분양·소진 예측 AI 리포트가 생성됩니다.\n"
+            "이후 하단 입력창으로 추가 질문을 보낼 수 있습니다."
         )
         self.report_edit.setFont(QFont("Malgun Gothic", 10))
-        report_layout.addWidget(self.report_edit)
+        report_layout.addWidget(self.report_edit, stretch=1)
+
+        chat_row = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("추가 질문 또는 세부 분석 요청을 입력하세요…")
+        self.chat_input.returnPressed.connect(self._send_chat_message)
+        chat_row.addWidget(self.chat_input, stretch=1)
+        self.btn_chat_send = QPushButton("전송")
+        self.btn_chat_send.setEnabled(False)
+        self.btn_chat_send.clicked.connect(self._send_chat_message)
+        chat_row.addWidget(self.btn_chat_send)
+        report_layout.addLayout(chat_row)
         self.tabs.addTab(report_wrap, "AI 분석 리포트")
 
         # Tab 4 3D scatter (viewer.html)
@@ -1118,13 +1190,40 @@ class MainWindow(QMainWindow):
     def _browse_file(self) -> None:
         from PyQt6.QtWidgets import QFileDialog
 
-        path, _ = QFileDialog.getOpenFileName(self, "엑셀 파일 선택", "", "Excel Files (*.xlsx *.xls)")
-        if path:
-            self._load_excel(path)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "엑셀 파일 선택 (다중 가능)", "", "Excel Files (*.xlsx *.xls)"
+        )
+        if paths:
+            self._load_excels(list(paths))
+
+    def _clear_loaded_files(self) -> None:
+        self._loaded_paths = []
+        self.inventory_data = None
+        self._chat_history.clear()
+        self._initial_report = ""
+        self._set_chat_enabled(False)
+        self.report_edit.clear()
+        self.table.clear()
+        self.table.setRowCount(0)
+        self.table.setColumnCount(0)
+        self.status_excel.setText("파일: 미업로드")
+        self.status_correction.setText("소급 보정: 0건")
+        self.chart._show_placeholder("품목 또는 표준품구분을 선택하면 재고 추이 차트가 표시됩니다.")
+        self.chart3d.show_message("엑셀을 다시 업로드해 주세요.")
 
     def _load_excel(self, file_path: str) -> None:
-        self.status_excel.setText(f"파일: 처리 중... ({Path(file_path).name})")
-        self.excel_worker = ExcelWorker(file_path)
+        self._load_excels([file_path])
+
+    def _load_excels(self, file_paths: list[str]) -> None:
+        if not file_paths:
+            return
+        # 순차 업로드: 기존 목록에 합치고 중복 제거
+        combined = list(dict.fromkeys(self._loaded_paths + list(file_paths)))
+        self._loaded_paths = combined
+        names = [Path(p).name for p in combined]
+        label = names[0] if len(names) == 1 else f"{len(names)}개 파일"
+        self.status_excel.setText(f"파일: 처리 중... ({label})")
+        self.excel_worker = ExcelWorker(combined)
         self.excel_worker.finished.connect(self._on_excel_loaded)
         self.excel_worker.error.connect(self._on_excel_error)
         self.excel_worker.start()
@@ -1138,10 +1237,19 @@ class MainWindow(QMainWindow):
         data["ai_flags"] = collect_ai_analysis_flags(stock_items)
         data["ai_mentioned_codes"] = []
         self.inventory_data = data
+        self._chat_history.clear()
+        self._initial_report = ""
+        self._set_chat_enabled(False)
         changed = sum(1 for it in data["items"] if it["has_change"])
         deplete_n = len(data["ai_flags"].get("deplete_codes") or [])
         surge_n = len(data["ai_flags"].get("surge_codes") or [])
-        self.status_excel.setText(f"파일: {data['file_name']} ({data['row_count']}품목)")
+        names = data.get("file_names") or [data.get("file_name", "")]
+        if len(names) <= 2:
+            file_label = ", ".join(names)
+        else:
+            file_label = f"{names[0]} 외 {len(names) - 1}개"
+        self.status_excel.setText(f"파일: {file_label} ({data['row_count']}품목)")
+        self.status_excel.setToolTip("\n".join(names))
         self.status_correction.setText(
             f"소급 보정: {data['correction_count']:,}건 · 변동 {changed}건 · "
             f"고갈후보 {deplete_n} · 급증 {surge_n}"
@@ -1157,7 +1265,7 @@ class MainWindow(QMainWindow):
         max_pairs = data["max_pair_count"]
         headers = list(meta_cols)
         for i in range(1, max_pairs + 1):
-            headers += [f"변경일자{i}", f"재고량{i}(연도말원본)", f"재고량{i}(보정)"]
+            headers += [f"연도{i}", f"재고량{i}(연도말원본)", f"재고량{i}(보정)"]
 
         self.table.clear()
         self.table.setColumnCount(len(headers))
@@ -1172,7 +1280,7 @@ class MainWindow(QMainWindow):
                 col += 1
             for i in range(max_pairs):
                 if i < len(item["dates"]):
-                    date_text = item["dates"][i]
+                    date_text = str(item["dates"][i])
                     orig = item["original"][i] if i < len(item["original"]) else None
                     corr = item["corrected"][i]
                     orig_text = "" if orig is None else f"{orig:g}"
@@ -1331,38 +1439,85 @@ class MainWindow(QMainWindow):
             source_file=str(self.inventory_data.get("file_name") or ""),
         )
 
+    def _set_chat_enabled(self, enabled: bool) -> None:
+        self.btn_chat_send.setEnabled(enabled and not self._chat_busy)
+        self.chat_input.setEnabled(enabled and not self._chat_busy)
+
+    def _render_chat_view(self) -> None:
+        parts: list[str] = []
+        for msg in self._chat_history:
+            role = msg.get("role", "assistant")
+            text = msg.get("text", "")
+            if role == "user":
+                parts.append(f"### 🙋 질문\n\n{text}")
+            elif role == "system":
+                parts.append(f"*{text}*")
+            else:
+                parts.append(f"### 🤖 AI\n\n{text}")
+        self.report_edit.setMarkdown("\n\n---\n\n".join(parts) if parts else "")
+
     def _run_ai_analysis(self, data: dict[str, Any]) -> None:
         key = self.api_key_input.text().strip()
         stock_items = data.get("stock_items") or []
         changed = [it for it in stock_items if it.has_stock_change]
         if "ai_flags" not in data:
             data["ai_flags"] = collect_ai_analysis_flags(stock_items)
+        self._chat_history.clear()
+        self._initial_report = ""
+        self._set_chat_enabled(False)
         if not changed:
-            self.report_edit.setPlainText(
-                "분석 대상 없음\n\n수량 변화가 있는 품목이 없어 AI 분석을 건너뛰었습니다."
+            self._chat_history.append(
+                {
+                    "role": "assistant",
+                    "text": "분석 대상 없음\n\n수량 변화가 있는 품목이 없어 AI 분석을 건너뛰었습니다.",
+                }
             )
+            self._render_chat_view()
             return
         if not key:
-            self.report_edit.setPlainText(
-                "API Key가 설정되지 않았습니다.\n상단에서 Gemini API Key를 입력하고 [저장]을 눌러 주세요.\n\n"
-                f"(변동 품목 {len(changed)}건 대기 중)"
+            self._chat_history.append(
+                {
+                    "role": "assistant",
+                    "text": (
+                        "API Key가 설정되지 않았습니다.\n"
+                        "상단에서 Gemini API Key를 입력하고 [저장]을 눌러 주세요.\n\n"
+                        f"(변동 품목 {len(changed)}건 대기 중)"
+                    ),
+                }
             )
+            self._render_chat_view()
             return
         flags = data.get("ai_flags") or {}
         deplete_n = len(flags.get("deplete_codes") or [])
         surge_n = len(flags.get("surge_codes") or [])
-        self.report_edit.setPlainText(
-            f"AI 분석 리포트 생성 중... (변동 {len(changed)}건 · "
-            f"고갈후보 {deplete_n} · 급증 {surge_n})\n잠시만 기다려 주세요."
+        mfg = flags.get("manufacture_candidates") or {}
+        mfg_n = len(mfg.get("표준생약") or []) + len(mfg.get("지표성분") or [])
+        self._chat_busy = True
+        self._set_chat_enabled(False)
+        self._chat_history.append(
+            {
+                "role": "system",
+                "text": (
+                    f"AI 분석 리포트 생성 중... (변동 {len(changed)}건 · "
+                    f"고갈후보 {deplete_n} · 급증 {surge_n} · 제조검토후보 {mfg_n})"
+                ),
+            }
         )
+        self._render_chat_view()
         prompt = build_ai_prompt(stock_items)
-        self.gemini_worker = GeminiWorker(key, prompt)
+        self.gemini_worker = GeminiWorker(key, prompt, followup=False)
         self.gemini_worker.finished.connect(self._on_report_ready)
         self.gemini_worker.error.connect(self._on_report_error)
         self.gemini_worker.start()
 
     def _on_report_ready(self, text: str) -> None:
-        self.report_edit.setMarkdown(text)
+        self._chat_busy = False
+        # 진행 안내 system 메시지 제거
+        self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
+        self._initial_report = text
+        self._chat_history.append({"role": "assistant", "text": text})
+        self._render_chat_view()
+        self._set_chat_enabled(True)
         self._set_api_status(True, f"연결됨 ({get_active_gemini_model()})")
         if self.inventory_data is not None:
             codes = [
@@ -1372,11 +1527,89 @@ class MainWindow(QMainWindow):
             ]
             mentioned = extract_mentioned_codes_from_report(text, codes)
             self.inventory_data["ai_mentioned_codes"] = mentioned
-            # AI 언급 품목을 3D에 즉시 반영
             self._refresh_3d()
 
     def _on_report_error(self, message: str) -> None:
-        self.report_edit.setPlainText(f"AI 분석 생성 실패:\n\n{message}")
+        self._chat_busy = False
+        self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
+        self._chat_history.append(
+            {"role": "assistant", "text": f"AI 분석 생성 실패:\n\n{message}"}
+        )
+        self._render_chat_view()
+        self._set_chat_enabled(bool(self._initial_report))
+        self._set_api_status(False, message)
+
+    def _send_chat_message(self) -> None:
+        if self._chat_busy:
+            return
+        question = self.chat_input.text().strip()
+        if not question:
+            return
+        if not self._initial_report:
+            QMessageBox.information(self, "안내", "초기 AI 리포트가 생성된 뒤 질문할 수 있습니다.")
+            return
+        key = self.api_key_input.text().strip()
+        if not key:
+            QMessageBox.warning(self, "경고", "API Key를 입력해 주세요.")
+            return
+
+        self.chat_input.clear()
+        self._chat_history.append({"role": "user", "text": question})
+        self._chat_history.append({"role": "system", "text": "답변 생성 중..."})
+        self._chat_busy = True
+        self._set_chat_enabled(False)
+        self._render_chat_view()
+
+        stock_items = None
+        if self.inventory_data:
+            stock_items = self.inventory_data.get("stock_items")
+        prompt = build_followup_prompt(self._initial_report, question, stock_items)
+        # 최근 대화 맥락을 짧게 첨부
+        prior_qas = [
+            m for m in self._chat_history
+            if m.get("role") in ("user", "assistant") and m.get("text") != self._initial_report
+        ]
+        if len(prior_qas) > 2:
+            tail = prior_qas[-6:-1]  # 직전 질문 제외한 최근 맥락
+            if tail:
+                ctx = "\n\n".join(
+                    ("사용자: " if m["role"] == "user" else "AI: ") + m["text"][:800]
+                    for m in tail
+                )
+                prompt = prompt + "\n\n[최근 대화 맥락]\n" + ctx
+
+        self.gemini_worker = GeminiWorker(key, prompt, followup=True)
+        self.gemini_worker.finished.connect(self._on_chat_reply)
+        self.gemini_worker.error.connect(self._on_chat_error)
+        self.gemini_worker.start()
+
+    def _on_chat_reply(self, text: str) -> None:
+        self._chat_busy = False
+        self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
+        self._chat_history.append({"role": "assistant", "text": text})
+        self._render_chat_view()
+        self._set_chat_enabled(True)
+        self._set_api_status(True, f"연결됨 ({get_active_gemini_model()})")
+        if self.inventory_data is not None:
+            codes = [
+                it.manage_no
+                for it in (self.inventory_data.get("stock_items") or [])
+                if getattr(it, "manage_no", None)
+            ]
+            # 후속 답변에서 언급된 코드도 누적
+            prev = set(self.inventory_data.get("ai_mentioned_codes") or [])
+            prev.update(extract_mentioned_codes_from_report(text, codes))
+            self.inventory_data["ai_mentioned_codes"] = list(prev)
+            self._refresh_3d()
+
+    def _on_chat_error(self, message: str) -> None:
+        self._chat_busy = False
+        self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
+        self._chat_history.append(
+            {"role": "assistant", "text": f"답변 생성 실패:\n\n{message}"}
+        )
+        self._render_chat_view()
+        self._set_chat_enabled(True)
         self._set_api_status(False, message)
 
 

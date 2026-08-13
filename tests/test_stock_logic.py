@@ -218,10 +218,86 @@ def test_ai_targets_only_changed_items():
         prompt = build_ai_prompt(targets)
         assert "민간 분양" in prompt or "생약표준품" in prompt
         assert "추가 생산" in prompt
+        assert "할루시네이션" in prompt or "억측" in prompt
+        assert "신뢰도" in prompt
         assert "STD-001" in prompt
         assert "NST-020" not in prompt
+        stats = estimate_depletion(next(it for it in items if it.manage_no == "STD-001"))
+        assert "depletion_category" in stats
+        assert "reliability" in stats
+        assert "priority_score" in stats
+        assert stats["deplete_ym"] is None or "년" in str(stats["deplete_ym"])
     finally:
         os.remove(path)
+
+
+def test_year_display_and_continuous_axis():
+    from stock_logic import align_display_series, fill_continuous_years, format_year
+
+    points = [
+        StockPoint(date(2022, 5, 1), 100),
+        StockPoint(date(2024, 8, 1), 80),
+    ]
+    filled = fill_continuous_years(points)
+    assert [p.change_date.year for p in filled] == [2022, 2023, 2024]
+    assert filled[1].quantity == 100  # 빈 연도 forward-fill
+    assert format_year(date(2023, 1, 1)) == "2023"
+
+    years, corr, orig = align_display_series(points, points)
+    assert years == ["2022", "2023", "2024"]
+    assert corr == [100, 100, 80]
+
+
+def test_multi_file_merge():
+    from stock_logic import process_excels
+
+    path_a = _make_sample_xlsx()
+    # 두 번째 파일: 동일 관리번호 추가 연도 + 신규 품목
+    rows = [
+        {
+            "순번": 1,
+            "표준품구분": "생약(표준생약)",
+            "관리번호": "STD-001",
+            "한글명": "감초",
+            "영문명": "Glycyrrhizae",
+            "잔고": 100,
+            "등록일자": "2020-01-01",
+            "분양여부": "Y",
+            "변경일자1": date(2025, 1, 1),
+            "재고량1": 100,
+        },
+        {
+            "순번": 2,
+            "표준품구분": "생약(지표성분)",
+            "관리번호": "IDX-009",
+            "한글명": "신규",
+            "영문명": "New",
+            "잔고": 30,
+            "등록일자": "2020-01-01",
+            "분양여부": "Y",
+            "변경일자1": date(2023, 1, 1),
+            "재고량1": 50,
+            "변경일자2": date(2024, 1, 1),
+            "재고량2": 30,
+        },
+    ]
+    fd, path_b = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    pd.DataFrame(rows).to_excel(path_b, index=False)
+    try:
+        data = process_excels([path_a, path_b])
+        codes = {it.manage_no for it in data["stock_items"]}
+        assert "STD-001" in codes
+        assert "IDX-009" in codes
+        std001 = next(it for it in data["stock_items"] if it.manage_no == "STD-001")
+        assert 2025 in {p.change_date.year for p in std001.corrected_points}
+        # UI 날짜는 연도 문자열
+        ui = next(it for it in data["items"] if it["mgmt_no"] == "STD-001")
+        assert all(len(str(d)) == 4 and str(d).isdigit() for d in ui["dates"])
+        assert data["file_name"].endswith("개 파일") or len(data["file_names"]) == 2
+    finally:
+        os.remove(path_a)
+        os.remove(path_b)
 
 
 def test_scatter_cat_label():
@@ -276,6 +352,8 @@ if __name__ == "__main__":
         test_same_date_last_value_within_year,
         test_load_sample_excel_and_identifiers,
         test_ai_targets_only_changed_items,
+        test_year_display_and_continuous_axis,
+        test_multi_file_merge,
         test_scatter_cat_label,
         test_scatter3d_records_from_sample,
     ]
