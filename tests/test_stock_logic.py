@@ -217,18 +217,67 @@ def test_ai_targets_only_changed_items():
         assert "NST-020" not in codes
         prompt = build_ai_prompt(targets)
         assert "민간 분양" in prompt or "생약표준품" in prompt
-        assert "추가 생산" in prompt
+        assert "추가 생산" in prompt or "제조검토" in prompt
         assert "할루시네이션" in prompt or "억측" in prompt
         assert "신뢰도" in prompt
+        assert "1페이지 요약 대시보드" in prompt or "핵심 KPI" in prompt
+        assert "분석 전문가의 제언" in prompt  # 금지 지시문에 포함
+        assert "제언' 섹션은 작성하지 마세요" in prompt or "제언 섹션은" in prompt
         assert "STD-001" in prompt
         assert "NST-020" not in prompt
         stats = estimate_depletion(next(it for it in items if it.manage_no == "STD-001"))
         assert "depletion_category" in stats
         assert "reliability" in stats
+        assert stats["reliability"].get("grade") in ("A", "B", "C", "D")
         assert "priority_score" in stats
+        assert "acceleration" in stats
         assert stats["deplete_ym"] is None or "년" in str(stats["deplete_ym"])
+        # 가격 환산
+        assert stats.get("unit_price") == 1000
+        assert stats.get("stock_value") == 120 * 1000
+        from stock_logic import collect_ai_analysis_flags, compute_inventory_valuation
+
+        flags = collect_ai_analysis_flags(items)
+        assert "dashboard" in flags
+        assert "valuation" in flags
+        assert flags["valuation"]["total_value"] > 0
+        assert len(flags["dashboard"]["kpis"]) >= 8
+        assert len(flags["dashboard"]["summary_lines"]) >= 4
+        val = compute_inventory_valuation(items)
+        assert any(r["manage_no"] == "STD-001" for r in val["top20"])
     finally:
         os.remove(path)
+
+
+def test_decrease_only_excludes_increases():
+    from stock_logic import StockItem, StockPoint, decrease_only_rate_stats, estimate_depletion
+
+    # 감소 후 증가(전수조사) 후 감소
+    points = [
+        StockPoint(date(2020, 1, 1), 100),
+        StockPoint(date(2021, 1, 1), 80),   # -20
+        StockPoint(date(2022, 1, 1), 100),  # +20 증가 → 제외
+        StockPoint(date(2023, 1, 1), 70),   # -30
+    ]
+    dec = decrease_only_rate_stats(points)
+    assert dec["increase_segments"] == 1
+    assert dec["decrease_segments"] == 2
+    assert dec["annual_rate"] is not None
+    assert abs(dec["total_drop"] - 50) < 1e-6
+
+    item = StockItem(
+        manage_no="T-1",
+        name_ko="테스트",
+        std_type="표준생약",
+        unit_price=500,
+        raw_points=list(points),
+        year_end_points=list(points),
+        corrected_points=list(points),
+    )
+    stats = estimate_depletion(item)
+    assert stats["increase_segments_excluded"] >= 1
+    assert stats["acceleration"] in ("급가속", "증가", "안정", "감소")
+    assert stats["stock_value"] == 70 * 500
 
 
 def test_year_display_and_continuous_axis():
@@ -352,6 +401,7 @@ if __name__ == "__main__":
         test_same_date_last_value_within_year,
         test_load_sample_excel_and_identifiers,
         test_ai_targets_only_changed_items,
+        test_decrease_only_excludes_increases,
         test_year_display_and_continuous_axis,
         test_multi_file_merge,
         test_scatter_cat_label,

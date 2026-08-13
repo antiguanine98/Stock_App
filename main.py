@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.3
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.31
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.3"
+APP_VERSION = "v1.31"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -1243,6 +1243,9 @@ class MainWindow(QMainWindow):
         changed = sum(1 for it in data["items"] if it["has_change"])
         deplete_n = len(data["ai_flags"].get("deplete_codes") or [])
         surge_n = len(data["ai_flags"].get("surge_codes") or [])
+        dash = (data["ai_flags"].get("dashboard") or {}).get("kpis") or []
+        val_kpi = next((k for k in dash if k.get("key") == "total_value"), None)
+        val_txt = f" · 환산 {val_kpi['display']}" if val_kpi else ""
         names = data.get("file_names") or [data.get("file_name", "")]
         if len(names) <= 2:
             file_label = ", ".join(names)
@@ -1252,7 +1255,7 @@ class MainWindow(QMainWindow):
         self.status_excel.setToolTip("\n".join(names))
         self.status_correction.setText(
             f"소급 보정: {data['correction_count']:,}건 · 변동 {changed}건 · "
-            f"고갈후보 {deplete_n} · 급증 {surge_n}"
+            f"고갈후보 {deplete_n} · 가속 {surge_n}{val_txt}"
         )
         self._populate_table(data)
         self._populate_filters(data)
@@ -1499,7 +1502,8 @@ class MainWindow(QMainWindow):
                 "role": "system",
                 "text": (
                     f"AI 분석 리포트 생성 중... (변동 {len(changed)}건 · "
-                    f"고갈후보 {deplete_n} · 급증 {surge_n} · 제조검토후보 {mfg_n})"
+                    f"고갈후보 {deplete_n} · 가속 {surge_n} · 제조검토후보 {mfg_n})\n"
+                    "최상단 KPI 대시보드·환산액·가속도 지표를 포함합니다."
                 ),
             }
         )

@@ -31,11 +31,11 @@ jobs:
       - name: Rename artifact
         shell: pwsh
         run: |
-          $exe = "dist/Stock_App_v1.3.exe"
+          $exe = "dist/Stock_App_v1.31.exe"
           if (Test-Path $exe) {
             Write-Host "EXE ready: $exe"
-          } elseif (Test-Path "dist/Stock_App_v1.3") {
-            Move-Item "dist/Stock_App_v1.3" $exe
+          } elseif (Test-Path "dist/Stock_App_v1.31") {
+            Move-Item "dist/Stock_App_v1.31" $exe
           } else {
             Get-ChildItem dist -ErrorAction SilentlyContinue | Format-Table Name, Length
             throw "Built EXE not found"
@@ -45,22 +45,22 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Stock_App_v1.3
-          path: dist/Stock_App_v1.3.exe
+          name: Stock_App_v1.31
+          path: dist/Stock_App_v1.31.exe
 
       - name: Create GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: Stock_App v1.3
-          files: dist/Stock_App_v1.3.exe
+          name: Stock_App v1.31
+          files: dist/Stock_App_v1.31.exe
           generate_release_notes: true
           body: |
             ## Summary
-            - 다중 엑셀 업로드(동시/순차) 및 관리번호 기준 통합 분석
-            - 표·차트 날짜를 연도(YYYY) 중심으로 표기, 빈 연도 보간
-            - AI 분석 리포트 대화형 챗봇 UI
-            - AI 고도화: 할루시네이션 금지, 소진기간 구간화, 데이터 신뢰도, 제조우선순위·모니터링 선별
+            - 신뢰도 A~D 등급(수집 횟수·관측 간격), 증가 구간 제외 분양속도
+            - 분양 가속도(급가속/증가/안정/감소), 장기 저분양 선별
+            - 현 재고×가격 분양금액 환산액(전체·유형별·TOP20)
+            - 리포트 최상단 1페이지 KPI 대시보드 + 자동 종합 의견 (전문가 제언 제외)
 
             ## Assets
-            - `Stock_App_v1.3.exe` (Windows one-file, Python 3.12)
+            - `Stock_App_v1.31.exe` (Windows one-file, Python 3.12)
