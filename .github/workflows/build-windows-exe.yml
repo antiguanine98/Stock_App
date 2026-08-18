@@ -31,11 +31,11 @@ jobs:
       - name: Rename artifact
         shell: pwsh
         run: |
-          $exe = "dist/Stock_App_v1.33.exe"
+          $exe = "dist/Stock_App_v1.34.exe"
           if (Test-Path $exe) {
             Write-Host "EXE ready: $exe"
-          } elseif (Test-Path "dist/Stock_App_v1.33") {
-            Move-Item "dist/Stock_App_v1.33" $exe
+          } elseif (Test-Path "dist/Stock_App_v1.34") {
+            Move-Item "dist/Stock_App_v1.34" $exe
           } else {
             Get-ChildItem dist -ErrorAction SilentlyContinue | Format-Table Name, Length
             throw "Built EXE not found"
@@ -45,20 +45,20 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Stock_App_v1.33
-          path: dist/Stock_App_v1.33.exe
+          name: Stock_App_v1.34
+          path: dist/Stock_App_v1.34.exe
 
       - name: Create GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: Stock_App v1.33
-          files: dist/Stock_App_v1.33.exe
+          name: Stock_App v1.34
+          files: dist/Stock_App_v1.34.exe
           generate_release_notes: true
           body: |
             ## Summary
-            - 상단 엑셀/공정서/API Key 영역을 접이식 패널로 통합
-            - 토글 및 파일 로드 완료 시 접어 하단 탭·챗봇 영역을 확대
+            - 공정서 DB 구조화 매칭·미보유 선별, AI 좌우 분할, 3D 클릭→차트
+            - KPI/리포트 정제, 소진∩급증 교집합, 제조검토 각 10종
 
             ## Assets
-            - `Stock_App_v1.33.exe` (Windows one-file, Python 3.12)
+            - `Stock_App_v1.34.exe` (Windows one-file, Python 3.12)

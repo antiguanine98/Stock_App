@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.33
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.34
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ import sys
 import traceback
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import matplotlib
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -39,7 +40,9 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QSplitter,
     QStatusBar,
     QTabWidget,
     QTableWidget,
@@ -57,7 +60,10 @@ from stock_logic import (
     collect_ai_analysis_flags,
     extract_mentioned_codes_from_report,
     format_compendium_context,
+    format_compendium_match_report,
     load_compendium_excel,
+    lookup_pharmacopoeia_tag,
+    match_compendium_inventory,
     process_excel,
     process_excels,
 )
@@ -91,7 +97,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.33"
+APP_VERSION = "v1.34"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -715,6 +721,8 @@ class InventoryChart(FigureCanvas):
         corrected: list[float | None],
         original: list[float | None] | None = None,
         original_dates: list[str] | None = None,
+        pharmacopoeia_tag: str = "",
+        subtitle: str = "",
     ) -> None:
         if not dates:
             self._show_placeholder(f"{label}\n표시할 변동기록이 없습니다.")
@@ -755,7 +763,11 @@ class InventoryChart(FigureCanvas):
         ax.set_xticklabels([str(y) for y in years], rotation=0, ha="center", fontsize=9)
         ax.set_xlabel("연도 (YYYY)")
         ax.set_ylabel("재고량")
-        ax.set_title(f"재고 추이 — {label}", fontsize=12, fontweight="bold", color="#0b1f3a", pad=12)
+        tag = (pharmacopoeia_tag or subtitle or "").strip()
+        title = f"재고 추이 — {label}"
+        if tag:
+            title = f"{title}  {tag}"
+        ax.set_title(title, fontsize=12, fontweight="bold", color="#0b1f3a", pad=12)
         ax.legend(loc="best", frameon=False)
         ax.grid(True, axis="y", alpha=0.28, linestyle="--")
         ax.spines["top"].set_visible(False)
@@ -836,6 +848,8 @@ class InventoryChart(FigureCanvas):
 class Scatter3DView(QWidget):
     """viewer.html 기반 3D 산점도 (QWebEngineView)."""
 
+    point_picked = pyqtSignal(str, str)  # code, name
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("scatter3dHost")
@@ -845,6 +859,7 @@ class Scatter3DView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        self._clearing_hash = False
 
         self._fallback = QLabel(
             "엑셀을 로드하면 AI 추이 기준(연평균 분양량 · 예상 소진기간 · 순감소량) 3D 산점도가 표시됩니다."
@@ -860,6 +875,7 @@ class Scatter3DView(QWidget):
                 web = QWebEngineView(self)
                 web.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
                 web.page().setBackgroundColor(QColor(247, 250, 248))
+                web.urlChanged.connect(self._on_url_changed)
                 layout.addWidget(web, stretch=1)
                 self._web = web
                 self._fallback.hide()
@@ -877,6 +893,31 @@ class Scatter3DView(QWidget):
                 "3D 산점도를 표시하려면 PyQt6-WebEngine이 필요합니다.\n"
                 "pip install PyQt6-WebEngine 후 다시 실행해 주세요."
             )
+
+    def _on_url_changed(self, url: QUrl) -> None:
+        if self._clearing_hash:
+            return
+        frag = (url.fragment() or "").strip()
+        if not frag.startswith("pick:"):
+            return
+        payload = frag[5:]
+        parts = payload.split("|", 1)
+        if len(parts) != 2:
+            return
+        code = unquote(parts[0])
+        name = unquote(parts[1])
+        self._clearing_hash = True
+        try:
+            if self._web is not None:
+                self._web.page().runJavaScript(
+                    "try{history.replaceState(null,'',location.pathname+location.search);}catch(e){}"
+                )
+        finally:
+            QTimer.singleShot(0, self._reset_clearing_hash)
+        self.point_picked.emit(code, name)
+
+    def _reset_clearing_hash(self) -> None:
+        self._clearing_hash = False
 
     def _load_template(self) -> str:
         if not VIEWER_HTML_PATH.exists():
@@ -1152,14 +1193,12 @@ class MainWindow(QMainWindow):
         chart_layout.setSpacing(8)
 
         filter_row = QHBoxLayout()
-        cat_label = QLabel("표준품구분")
-        cat_label.setObjectName("sectionLabel")
-        filter_row.addWidget(cat_label)
+        # category_combo는 표 더블클릭/_populate_filters/_refill_item_combo용으로 유지 (차트 UI에는 미표시)
         self.category_combo = QComboBox()
         self.category_combo.addItem("전체")
         self.category_combo.setMinimumWidth(160)
         self.category_combo.currentIndexChanged.connect(self._on_category_changed)
-        filter_row.addWidget(self.category_combo)
+        self.category_combo.hide()
 
         item_label = QLabel("품목 선택")
         item_label.setObjectName("sectionLabel")
@@ -1197,7 +1236,7 @@ class MainWindow(QMainWindow):
         chart_layout.addWidget(self.chart, stretch=1)
         self.tabs.addTab(chart_widget, "재고 추이 차트")
 
-        # Tab 3 AI chatbot
+        # Tab 3 AI chatbot — left: fixed report / right: interactive chat
         report_wrap = QWidget()
         report_layout = QVBoxLayout(report_wrap)
         report_layout.setContentsMargins(8, 8, 8, 8)
@@ -1208,17 +1247,52 @@ class MainWindow(QMainWindow):
         )
         chat_hint.setStyleSheet("color: #64748b; font-size: 12px;")
         report_layout.addWidget(chat_hint)
-        self.report_edit = QTextEdit()
-        self.report_edit.setReadOnly(True)
-        self.report_edit.setSizePolicy(
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left_pane = QWidget()
+        left_layout = QVBoxLayout(left_pane)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.setSpacing(6)
+        left_title = QLabel("표준 분석 리포트")
+        left_title.setObjectName("sectionLabel")
+        left_layout.addWidget(left_title)
+        self.report_fixed = QTextEdit()
+        self.report_fixed.setReadOnly(True)
+        self.report_fixed.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        self.report_edit.setPlaceholderText(
-            "엑셀 업로드 후 생약표준품 분양·소진 예측 AI 리포트가 생성됩니다.\n"
-            "이후 하단 입력창으로 추가 질문을 보낼 수 있습니다."
+        self.report_fixed.setPlaceholderText(
+            "엑셀 업로드 후 생약표준품 분양·소진 예측 AI 리포트가 여기에 표시됩니다."
         )
-        self.report_edit.setFont(QFont("Malgun Gothic", 10))
-        report_layout.addWidget(self.report_edit, stretch=1)
+        self.report_fixed.setFont(QFont("Malgun Gothic", 10))
+        self.report_fixed.setStyleSheet(
+            "QTextEdit { padding: 12px; line-height: 1.65; font-family: 'Malgun Gothic'; font-size: 10.5pt; }"
+        )
+        left_layout.addWidget(self.report_fixed, stretch=1)
+        splitter.addWidget(left_pane)
+
+        right_pane = QWidget()
+        right_layout = QVBoxLayout(right_pane)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.setSpacing(6)
+        right_title = QLabel("대화형 챗봇")
+        right_title.setObjectName("sectionLabel")
+        right_layout.addWidget(right_title)
+        self.chat_view = QTextEdit()
+        self.chat_view.setReadOnly(True)
+        self.chat_view.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.chat_view.setPlaceholderText(
+            "추가 질문과 AI 답변이 여기에 표시됩니다."
+        )
+        self.chat_view.setFont(QFont("Malgun Gothic", 10))
+        self.chat_view.setStyleSheet(
+            "QTextEdit { padding: 12px; line-height: 1.65; font-family: 'Malgun Gothic'; font-size: 10.5pt; }"
+        )
+        right_layout.addWidget(self.chat_view, stretch=1)
 
         chat_row = QHBoxLayout()
         self.chat_input = QLineEdit()
@@ -1229,7 +1303,15 @@ class MainWindow(QMainWindow):
         self.btn_chat_send.setEnabled(False)
         self.btn_chat_send.clicked.connect(self._send_chat_message)
         chat_row.addWidget(self.btn_chat_send)
-        report_layout.addLayout(chat_row)
+        right_layout.addLayout(chat_row)
+        splitter.addWidget(right_pane)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([560, 560])
+        left_pane.setMinimumWidth(280)
+        right_pane.setMinimumWidth(280)
+        report_layout.addWidget(splitter, stretch=1)
         self.tabs.addTab(report_wrap, "AI 분석 리포트")
 
         # Tab 4 3D scatter (viewer.html)
@@ -1250,22 +1332,22 @@ class MainWindow(QMainWindow):
         viz_row.addWidget(ai_label)
         self.viz_ai_filter = QComboBox()
         self.viz_ai_filter.addItem("전체 표시", "all")
-        self.viz_ai_filter.addItem("5년 고갈 위험", "deplete")
+        self.viz_ai_filter.addItem("5년 소진 위험", "deplete")
         self.viz_ai_filter.addItem("최근 분양 급증", "surge")
-        self.viz_ai_filter.addItem("고갈+급증", "deplete_surge")
+        self.viz_ai_filter.addItem("소진∩급증 (핵심 위험)", "deplete_surge")
         self.viz_ai_filter.addItem("AI 리포트 언급", "mentioned")
-        self.viz_ai_filter.setMinimumWidth(150)
+        self.viz_ai_filter.setMinimumWidth(180)
         self.viz_ai_filter.currentIndexChanged.connect(self._refresh_3d)
         viz_row.addWidget(self.viz_ai_filter)
         viz_row.addStretch(1)
         viz_layout.addLayout(viz_row)
         viz_hint = QLabel(
-            "AI 고갈(빨강 링) · 급증(주황 링) · 리포트 언급(파랑 링) 표시 · "
-            "드래그 회전 · 휠/핀치 확대 · 호버/탭 정보"
+            "클릭 시 재고 추이 차트로 이동 · 드래그 회전 · 휠 확대"
         )
         viz_hint.setStyleSheet("color: #64748b; font-size: 12px;")
         viz_layout.addWidget(viz_hint)
         self.chart3d = Scatter3DView()
+        self.chart3d.point_picked.connect(self._on_3d_point_picked)
         viz_layout.addWidget(self.chart3d, stretch=1)
         self.tabs.addTab(viz_wrap, "3D/통합 시각화")
 
@@ -1384,6 +1466,9 @@ class MainWindow(QMainWindow):
         self.compendium_status.setText("공정서 DB: 미등록")
         self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
         self.compendium_status.setToolTip("")
+        if self.inventory_data is not None:
+            self.inventory_data["compendium_match"] = {}
+            self.inventory_data["compendium_match_report"] = ""
 
     def _load_compendium(self, file_path: str) -> None:
         self.compendium_status.setText(f"공정서 DB: 로딩 중... ({Path(file_path).name})")
@@ -1407,13 +1492,19 @@ class MainWindow(QMainWindow):
             "row_count": data.get("row_count"),
             "columns": data.get("columns"),
             "sheet_count": data.get("sheet_count"),
+            "entries": data.get("entries") or [],
+            "parsed_count": data.get("parsed_count"),
         }
         name = data.get("file_name", "")
         rows = data.get("row_count", 0)
         sheets = data.get("sheet_count", 1)
-        self.compendium_status.setText(
-            f"공정서 DB: {name} ({rows:,}행 · 시트 {sheets})"
-        )
+        parsed = data.get("parsed_count") or len(data.get("entries") or [])
+        match_info = self._refresh_compendium_match()
+        match_n = (match_info or {}).get("correction_count", 0)
+        status = f"공정서 DB: {name} ({rows:,}행 · 시트 {sheets} · 파싱 {parsed})"
+        if match_info is not None:
+            status += f" · 매칭 {match_n}건"
+        self.compendium_status.setText(status)
         self.compendium_status.setStyleSheet("color: #15803d; font-size: 12px; font-weight: 600;")
         self.compendium_status.setToolTip(
             f"{name}\n열: {', '.join((data.get('columns') or [])[:30])}"
@@ -1426,6 +1517,47 @@ class MainWindow(QMainWindow):
                 "공정서 DB가 등록되었습니다.\n"
                 "이후 챗봇 답변과, 재고 파일을 다시 불러와 생성하는 초기 리포트에 규격 참조로 사용됩니다.",
             )
+
+    def _refresh_compendium_match(self) -> dict[str, Any] | None:
+        """재고·공정서 모두 있을 때 매칭 결과를 inventory_data에 저장."""
+        if not self.inventory_data:
+            return None
+        entries = []
+        if self.compendium_meta:
+            entries = list(self.compendium_meta.get("entries") or [])
+        stock_items = list(self.inventory_data.get("stock_items") or [])
+        if not entries or not stock_items:
+            self.inventory_data["compendium_match"] = {}
+            self.inventory_data["compendium_match_report"] = ""
+            return None
+        match = match_compendium_inventory(entries, stock_items)
+        self.inventory_data["compendium_match"] = match
+        self.inventory_data["compendium_match_report"] = format_compendium_match_report(match)
+        return match
+
+    def _pharmacopoeia_tag_for_item(self, item: dict[str, Any] | StockItem | str) -> str:
+        match = (self.inventory_data or {}).get("compendium_match") or {}
+        if not match:
+            return ""
+        if isinstance(item, StockItem):
+            return lookup_pharmacopoeia_tag(item, match)
+        if isinstance(item, str):
+            label = item
+            mgmt = ""
+        else:
+            label = str(item.get("label") or "")
+            mgmt = str(item.get("mgmt_no") or item.get("manage_no") or "")
+        by_label = match.get("by_label") or {}
+        if label in by_label:
+            return by_label[label]
+        for it in (self.inventory_data or {}).get("stock_items") or []:
+            if not isinstance(it, StockItem):
+                continue
+            if (mgmt and it.manage_no == mgmt) or (label and it.label == label):
+                return lookup_pharmacopoeia_tag(it, match)
+            if label and (it.label in label or label.startswith(it.label)):
+                return lookup_pharmacopoeia_tag(it, match)
+        return ""
 
     def _on_compendium_error(self, message: str) -> None:
         self._close_busy()
@@ -1462,7 +1594,8 @@ class MainWindow(QMainWindow):
         self._chat_history.clear()
         self._initial_report = ""
         self._set_chat_enabled(False)
-        self.report_edit.clear()
+        self.report_fixed.clear()
+        self.chat_view.clear()
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
@@ -1505,9 +1638,12 @@ class MainWindow(QMainWindow):
         data["ai_flags"] = collect_ai_analysis_flags(stock_items)
         data["ai_mentioned_codes"] = []
         self.inventory_data = data
+        self._refresh_compendium_match()
         self._chat_history.clear()
         self._initial_report = ""
         self._set_chat_enabled(False)
+        self.report_fixed.clear()
+        self.chat_view.clear()
         changed = sum(1 for it in data["items"] if it["has_change"])
         deplete_n = len(data["ai_flags"].get("deplete_codes") or [])
         surge_n = len(data["ai_flags"].get("surge_codes") or [])
@@ -1519,11 +1655,14 @@ class MainWindow(QMainWindow):
             file_label = ", ".join(names)
         else:
             file_label = f"{names[0]} 외 {len(names) - 1}개"
+        match = data.get("compendium_match") or {}
+        match_n = match.get("correction_count")
+        match_txt = f" · 공정서매칭 {match_n}건" if match_n is not None and match else ""
         self.status_excel.setText(f"파일: {file_label} ({data['row_count']}품목)")
         self.status_excel.setToolTip("\n".join(names))
         self.status_correction.setText(
             f"소급 보정: {data['correction_count']:,}건 · 변동 {changed}건 · "
-            f"고갈후보 {deplete_n} · 가속 {surge_n}{val_txt}"
+            f"소진후보 {deplete_n} · 가속 {surge_n}{val_txt}{match_txt}"
         )
         self._populate_table(data)
         self._populate_filters(data)
@@ -1623,12 +1762,14 @@ class MainWindow(QMainWindow):
             return
         item = self._item_by_label.get(self.item_combo.currentText().strip())
         if item:
+            tag = self._pharmacopoeia_tag_for_item(item)
             self.chart.plot_item(
                 item["label"],
                 item["dates"],
                 item["corrected"],
                 item.get("original"),
                 item.get("original_dates"),
+                pharmacopoeia_tag=tag,
             )
 
     def _select_item_by_label(self, label: str) -> bool:
@@ -1662,6 +1803,37 @@ class MainWindow(QMainWindow):
         if label:
             self._select_item_by_label(str(label))
 
+    def _on_3d_point_picked(self, code: str, name: str) -> None:
+        if not self.inventory_data:
+            return
+        items = list(self.inventory_data.get("items") or [])
+        target = None
+        code = (code or "").strip()
+        name = (name or "").strip()
+        if code:
+            for it in items:
+                mgmt = str(it.get("mgmt_no") or it.get("manage_no") or "")
+                label = str(it.get("label") or "")
+                if mgmt == code or label.startswith(f"{code}(") or code in label:
+                    target = it
+                    break
+        if target is None and name:
+            for it in items:
+                label = str(it.get("label") or "")
+                if name in label or label.endswith(f"({name})"):
+                    target = it
+                    break
+        self.tabs.setCurrentIndex(1)
+        if target is None:
+            return
+        # 품목 목록이 전체 기준으로 보이도록 카테고리 리셋
+        if self.category_combo.currentIndex() != 0:
+            self._updating_combo = True
+            self.category_combo.setCurrentIndex(0)
+            self._refill_item_combo("전체")
+            self._updating_combo = False
+        self._select_item_by_label(str(target["label"]))
+
     def _refresh_3d(self, _index: int = 0) -> None:
         if not self.inventory_data:
             return
@@ -1691,7 +1863,10 @@ class MainWindow(QMainWindow):
         elif ai_mode == "surge":
             records = [r for r in records if r.get("recentSurge")]
         elif ai_mode == "deplete_surge":
-            records = [r for r in records if r.get("depleteWithin5y") or r.get("recentSurge")]
+            records = [
+                r for r in records
+                if r.get("depleteWithin5y") and r.get("recentSurge")
+            ]
         elif ai_mode == "mentioned":
             records = [r for r in records if r.get("aiMentioned")]
 
@@ -1727,7 +1902,7 @@ class MainWindow(QMainWindow):
                 parts.append(f"*{text}*")
             else:
                 parts.append(f"### 🤖 AI\n\n{text}")
-        self.report_edit.setMarkdown("\n\n---\n\n".join(parts) if parts else "")
+        self.chat_view.setMarkdown("\n\n---\n\n".join(parts) if parts else "")
 
     def _run_ai_analysis(self, data: dict[str, Any]) -> None:
         key = self.api_key_input.text().strip()
@@ -1737,28 +1912,19 @@ class MainWindow(QMainWindow):
             data["ai_flags"] = collect_ai_analysis_flags(stock_items)
         self._chat_history.clear()
         self._initial_report = ""
+        self.report_fixed.clear()
         self._set_chat_enabled(False)
         if not changed:
-            self._chat_history.append(
-                {
-                    "role": "assistant",
-                    "text": "분석 대상 없음\n\n수량 변화가 있는 품목이 없어 AI 분석을 건너뛰었습니다.",
-                }
+            self.chat_view.setMarkdown(
+                "분석 대상 없음\n\n수량 변화가 있는 품목이 없어 AI 분석을 건너뛰었습니다."
             )
-            self._render_chat_view()
             return
         if not key:
-            self._chat_history.append(
-                {
-                    "role": "assistant",
-                    "text": (
-                        "API Key가 설정되지 않았습니다.\n"
-                        "상단에서 Gemini API Key를 입력하고 [저장]을 눌러 주세요.\n\n"
-                        f"(변동 품목 {len(changed)}건 대기 중)"
-                    ),
-                }
+            self.chat_view.setMarkdown(
+                "API Key가 설정되지 않았습니다.\n"
+                "상단에서 Gemini API Key를 입력하고 [저장]을 눌러 주세요.\n\n"
+                        f"(대상 품목 중 변동 {len(changed)}건 대기 중)"
             )
-            self._render_chat_view()
             return
         flags = data.get("ai_flags") or {}
         deplete_n = len(flags.get("deplete_codes") or [])
@@ -1772,7 +1938,7 @@ class MainWindow(QMainWindow):
                 "role": "system",
                 "text": (
                     f"AI 분석 리포트 생성 중... (변동 {len(changed)}건 · "
-                    f"고갈후보 {deplete_n} · 가속 {surge_n} · 제조검토후보 {mfg_n})\n"
+                    f"소진후보 {deplete_n} · 가속 {surge_n} · 제조검토후보 {mfg_n})\n"
                     "최상단 KPI 대시보드·환산액·가속도 지표를 포함합니다."
                 ),
             }
@@ -1784,6 +1950,7 @@ class MainWindow(QMainWindow):
             prompt = build_ai_prompt(
                 stock_items,
                 compendium_context=self._compendium_prompt_context(stock_items),
+                compendium_match_report=data.get("compendium_match_report") or None,
             )
             self.gemini_worker = GeminiWorker(key, prompt, followup=False)
             self.gemini_worker.finished.connect(self._on_report_ready)
@@ -1795,11 +1962,12 @@ class MainWindow(QMainWindow):
     def _on_report_ready(self, text: str) -> None:
         self._close_busy()
         self._chat_busy = False
-        # 진행 안내 system 메시지 제거
-        self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
+        self._chat_history.clear()
         self._initial_report = text
-        self._chat_history.append({"role": "assistant", "text": text})
-        self._render_chat_view()
+        self.report_fixed.setMarkdown(text)
+        self.chat_view.setMarkdown(
+            "*표준 분석 리포트가 왼쪽에 준비되었습니다. 추가 질문을 입력해 주세요.*"
+        )
         self._set_chat_enabled(True)
         self._set_api_status(True, f"연결됨 ({get_active_gemini_model()})")
         if self.inventory_data is not None:
@@ -1860,10 +2028,10 @@ class MainWindow(QMainWindow):
                 compendium_context=self._compendium_prompt_context(stock_items),
                 table_df=table_df,
             )
-            # 최근 대화 맥락을 짧게 첨부
+            # 최근 대화 맥락을 짧게 첨부 (초기 리포트는 chat_history에 없음)
             prior_qas = [
                 m for m in self._chat_history
-                if m.get("role") in ("user", "assistant") and m.get("text") != self._initial_report
+                if m.get("role") in ("user", "assistant")
             ]
             if len(prior_qas) > 2:
                 tail = prior_qas[-6:-1]  # 직전 질문 제외한 최근 맥락

@@ -81,11 +81,14 @@ def main() -> int:
         assert hasattr(win, "btn_toggle_settings")
         assert hasattr(win, "_settings_body")
         win._set_settings_collapsed(True)
-        assert not win._settings_body.isVisible()
+        assert win._settings_body.isHidden()
         win._set_settings_collapsed(False)
-        assert win._settings_body.isVisible()
+        assert not win._settings_body.isHidden()
         assert hasattr(win, "compendium_dropzone")
         assert hasattr(win, "compendium_status")
+        assert hasattr(win, "report_fixed")
+        assert hasattr(win, "chat_view")
+        assert hasattr(win.chart3d, "point_picked")
         # 연도 컬럼 헤더
         headers = [
             win.table.horizontalHeaderItem(i).text() for i in range(win.table.columnCount())

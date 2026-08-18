@@ -18,18 +18,17 @@
   *{box-sizing:border-box; margin:0; padding:0;}
   html,body{
     background: var(--panel-bg);
-    color: var(--ink); font-family: var(--sans); min-height:100vh; overflow-x:hidden;
+    color: var(--ink); font-family: var(--sans); height:100%; overflow:hidden;
   }
-  body{ display:flex; flex-direction:column; min-height:100vh; }
-  header{ padding: 26px 26px 16px; border-bottom: 1px solid var(--panel-line); background: #ffffff; }
-  .eyebrow{ font-size:11px; letter-spacing:.24em; text-transform:uppercase; color: var(--sage); font-weight:600;
-    margin-bottom:10px; display:flex; align-items:center; gap:10px; }
-  .eyebrow::before{ content:''; width:22px; height:1px; background: var(--sage); display:inline-block; }
-  .axis-key{ display:flex; flex-wrap:wrap; gap:8px 18px; font-size:12px; color: var(--ink-dim); }
+  body{ display:flex; flex-direction:column; min-height:100vh; height:100vh; }
+  .axis-key{
+    display:flex; flex-wrap:wrap; gap:6px 14px; font-size:11px; color: var(--ink-dim);
+    padding: 8px 14px; background:#ffffff; border-bottom:1px solid var(--panel-line); flex-shrink:0;
+  }
   .axis-key span b{ color:var(--ink); font-weight:600; }
 
-  main{ position:relative; flex:1; background: #eef3f0; }
-  #canvasWrap{ position:relative; width:100%; height: min(70vh, 700px); background:#eef3f0; touch-action:none; }
+  main{ position:relative; flex:1; min-height:0; background: #eef3f0; display:flex; flex-direction:column; }
+  #canvasWrap{ position:relative; width:100%; flex:1; min-height:75vh; height:100%; background:#eef3f0; touch-action:none; }
   canvas{ display:block; width:100%; height:100%; }
   #tooltip{
     position:absolute; pointer-events:none; display:none;
@@ -45,7 +44,7 @@
     border:1px solid rgba(30,58,50,0.16);
     padding:6px 12px; border-radius:16px; pointer-events:none;
     box-shadow:0 4px 14px rgba(20,40,30,0.08);
-    max-width: min(320px, 70%);
+    max-width: min(360px, 78%);
     text-align:right;
     z-index:4;
   }
@@ -54,44 +53,32 @@
     text-align:center; color:var(--ink-dim); font-size:14px; padding:24px; line-height:1.7;
   }
 
-  .stats-strip{ display:flex; flex-wrap:wrap; gap:0; border-top:1px solid var(--panel-line); background:#ffffff; }
-  .stat{ flex:1; min-width:120px; padding: 14px 20px; border-right:1px solid var(--panel-line); }
-  .stat:last-child{border-right:none;}
-  .stat .num{ font-family:var(--serif); font-size:20px; font-weight:700; color:var(--ink); }
-  .stat .num.sage{color:var(--sage);} .stat .num.indigo{color:var(--indigo);} .stat .num.clay{color:var(--clay);}
-  .stat .lbl{ font-size:10.5px; color:var(--ink-faint); letter-spacing:.05em; margin-top:2px; }
-
-  .legend-card{ margin: 14px 26px 4px; padding: 14px 16px; background: var(--card-bg); border: 1px solid var(--panel-line);
-    border-radius: 8px; font-size: 12px; color: var(--ink-dim); line-height: 1.8; position:relative; }
+  .legend-card{ margin: 8px 14px 10px; padding: 10px 14px; background: var(--card-bg); border: 1px solid var(--panel-line);
+    border-radius: 8px; font-size: 12px; color: var(--ink-dim); line-height: 1.8; position:relative; flex-shrink:0; }
   .legend-card::before{ content:'표본 색인'; position:absolute; top:-9px; left:14px; background: #ffffff;
     padding: 0 8px; font-size:10px; letter-spacing:.14em; color:var(--sage); font-weight:600; }
   .legend-row{display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;}
   .legend-row b{color:var(--ink); font-weight:600; min-width:56px; display:inline-block;}
   .swatch{display:inline-block; width:10px;height:10px;border-radius:2px; margin-right:5px; vertical-align:middle;}
 
-  footer{ padding: 14px 26px 22px; color: var(--ink-faint); font-size: 11px; border-top:1px solid var(--panel-line); background:#ffffff; }
   @media (max-width: 640px){
-    header{padding:20px 16px 14px;} .legend-card{margin:12px 16px 4px;}
-    .stat{padding:12px 14px; min-width:44%;} footer{padding:12px 16px 18px;}
-    #hint{ max-width: min(260px, 78%); font-size:10.5px; }
+    .axis-key{padding:8px 12px; font-size:10.5px;} .legend-card{margin:8px 12px 10px;}
+    #hint{ max-width: min(280px, 82%); font-size:10.5px; }
   }
 </style>
 </head>
 <body>
-<header>
-  <div class="eyebrow">표준품 관리대장 · 구조 분석</div>
-  <div class="axis-key">
-    <span><b style="color:var(--axis-x)">X축</b> — 연평균 분양량 (AI 추이: 순감소÷관찰기간)</span>
-    <span><b style="color:var(--axis-y)">Y축</b> — 예상 소진기간 (AI 추이, 최대 50년)</span>
-    <span><b style="color:var(--axis-z)">Z축</b> — 순감소량 (최초재고−현재재고)</span>
-  </div>
-</header>
+<div class="axis-key">
+  <span><b style="color:var(--axis-x)">X</b> 연평균 분양량</span>
+  <span><b style="color:var(--axis-y)">Y</b> 예상 소진기간</span>
+  <span><b style="color:var(--axis-z)">Z</b> 순감소량</span>
+</div>
 
 <main>
   <div id="canvasWrap">
     <canvas id="c"></canvas>
     <div id="tooltip"></div>
-    <div id="hint">드래그: 회전 · 두 손가락 핀치/휠: 확대·축소 · 탭: 품목 정보</div>
+    <div id="hint">클릭: 추이 차트 이동 · 드래그: 회전 · 휠: 확대</div>
     <div id="emptyMsg">표시할 3D 산점도 데이터가 없습니다.<br>엑셀을 업로드하거나, 감소 추이가 있는 품목(AI 분석 대상)이 있는지 확인해 주세요.</div>
   </div>
 </main>
@@ -103,15 +90,6 @@
     <span><span class="swatch" style="background:#F0916A"></span>대조품</span>
   </div>
 </div>
-
-<div class="stats-strip" id="statsStrip">
-  <div class="stat"><div class="num" id="statTotal">0</div><div class="lbl">전체 품목</div></div>
-  <div class="stat"><div class="num sage" id="statSage">0</div><div class="lbl">표준생약</div></div>
-  <div class="stat"><div class="num indigo" id="statIndigo">0</div><div class="lbl">지표성분</div></div>
-  <div class="stat"><div class="num clay" id="statClay">0</div><div class="lbl">대조품</div></div>
-</div>
-
-<footer id="footerText">AI 추이 기준: 연평균 분양량 / 예상 소진기간(최대 50년) / 순감소량 3축 산점도</footer>
 
 <script>
 (function(){
@@ -222,20 +200,6 @@ function buildRange(recs){
 const RANGE_FULL = buildRange(records);
 const RANGE = { x: RANGE_FULL.x, y: RANGE_FULL.y, z: RANGE_FULL.z };
 
-function updateStats(){
-  const total = records.length;
-  const sage = records.filter(r => r.cat === '표준생약' || r.cat === '생약(표준생약)').length;
-  const indigo = records.filter(r => r.cat === '지표성분' || r.cat === '생약(지표성분)').length;
-  const clay = records.filter(r => r.cat === '대조품' || r.cat === '대조생약' || r.cat === '생약(대조품)').length;
-  document.getElementById('statTotal').textContent = String(total);
-  document.getElementById('statSage').textContent = String(sage);
-  document.getElementById('statIndigo').textContent = String(indigo);
-  document.getElementById('statClay').textContent = String(clay);
-  const foot = document.getElementById('footerText');
-  const src = SOURCE_FILE ? (SOURCE_FILE + ' 기준 · ') : '';
-  foot.textContent = src + 'AI 추이 기준: 연평균 분양량 / 예상 소진기간(최대 50년) / 순감소량 3축 산점도';
-}
-
 function norm(v, lo, hi){
   if (hi === lo) return 0;
   return ((v - lo) / (hi - lo)) * 2 - 1;
@@ -258,8 +222,6 @@ if (!records.length){
   emptyMsg.style.display = 'flex';
   document.getElementById('hint').style.display = 'none';
 }
-
-updateStats();
 
 let W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, 2);
 function resize(){
@@ -391,17 +353,26 @@ function fmtNum(v){
   if (Math.abs(v) >= 100) return String(Math.round(v * 100) / 100);
   return String(Number(v.toPrecision(4)));
 }
-function showInfoAt(p){
+function findRecordAt(p){
   const list = window._projected || [];
   let best = null, bestD = 22;
   for (const pt of list){
     const d = Math.hypot(pt.sx - p.x, pt.sy - p.y);
     if (d < bestD){ bestD = d; best = pt; }
   }
-  if (best){
-    const r = best.r;
+  return best ? best.r : null;
+}
+function pickPoint(r){
+  if(!r) return;
+  const code = r.code || '';
+  const name = r.name || '';
+  location.hash = 'pick:' + encodeURIComponent(code) + '|' + encodeURIComponent(name);
+}
+function showInfoAt(p){
+  const r = findRecordAt(p);
+  if (r){
     const tags = [];
-    if (r.depleteWithin5y) tags.push('5년 고갈 위험');
+    if (r.depleteWithin5y) tags.push('5년 소진 위험');
     if (r.recentSurge) tags.push('최근 분양 급증');
     if (r.aiMentioned) tags.push('AI 리포트 언급');
     const tagHtml = tags.length ? `<br><span style="color:#b91c1c">${tags.join(' · ')}</span>` : '';
@@ -476,8 +447,9 @@ function endPointer(e){
   const wasSingle = activePointers.size === 1;
   activePointers.delete(e.pointerId);
 
-  if (wasSingle && e.pointerType !== 'mouse' && !moved){
+  if (wasSingle && !moved){
     showInfoAt(p);
+    pickPoint(findRecordAt(p));
   }
   if (activePointers.size === 0){
     dragging = false;
