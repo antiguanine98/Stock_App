@@ -1079,8 +1079,49 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
     }
 
 
+def _catalog_item_row(it: StockItem, stats: dict[str, Any]) -> dict[str, Any]:
+    """챗봇 전수 목록용 품목 행(한글명·관리번호·세부 수치)."""
+    rel = stats.get("reliability") or {}
+    grade = rel.get("grade") if isinstance(rel, dict) else None
+    years_left = stats.get("years_left")
+    return {
+        "label": it.label,
+        "name_ko": it.name_ko,
+        "manage_no": it.manage_no,
+        "std_type": it.std_type,
+        "last_qty": it.last_qty,
+        "annual_rate": stats.get("annual_rate"),
+        "years_left": years_left,
+        "deplete_ym": stats.get("deplete_ym"),
+        "depletion_category": stats.get("depletion_category"),
+        "risk_grade": risk_grade_from_years(years_left),
+        "acceleration": stats.get("acceleration"),
+        "acceleration_ratio": stats.get("acceleration_ratio"),
+        "priority_score": stats.get("priority_score"),
+        "stock_risk": stats.get("stock_risk"),
+        "reliability_grade": grade,
+        "reliability": rel.get("label") if isinstance(rel, dict) else rel,
+        "stock_value": stats.get("stock_value"),
+        "deplete_within_2y": bool(stats.get("deplete_within_2y")),
+        "deplete_within_5y": bool(stats.get("deplete_within_5y")),
+    }
+
+
+def risk_grade_from_years(years_left: Optional[float]) -> str:
+    """소진 잔여년수 기반 위험등급: 위험/경계/주의/안정."""
+    if years_left is None:
+        return "안정"
+    if years_left <= 2:
+        return "위험"
+    if years_left <= 5:
+        return "경계"
+    if years_left <= 10:
+        return "주의"
+    return "안정"
+
+
 def group_by_depletion_category(items: list[StockItem]) -> dict[str, list[str]]:
-    """소진 기간 카테고리별 품목 라벨 목록."""
+    """소진 기간 카테고리별 품목 라벨 목록(리포트 요약용)."""
     order = [
         "1년 이내",
         "1~3년 이내",
@@ -1099,6 +1140,50 @@ def group_by_depletion_category(items: list[StockItem]) -> dict[str, list[str]]:
         if key not in buckets:
             buckets[key] = []
         buckets[key].append(f"{it.label} [{cat}]")
+    return buckets
+
+
+def group_by_depletion_category_items(
+    items: list[StockItem],
+) -> dict[str, list[dict[str, Any]]]:
+    """소진 예상 구간별 전수 품목 리스트(챗봇 컨텍스트용)."""
+    order = [
+        "1년 이내",
+        "1~3년 이내",
+        "3~5년 이내",
+        "5~10년 이내",
+        "10~15년 이내",
+        "15년 이상/안정",
+    ]
+    buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in order}
+    for it in items_for_ai_analysis(items):
+        stats = estimate_depletion(it)
+        cat = stats["depletion_category"]
+        key = cat
+        if isinstance(cat, str) and cat.startswith("1년 이내"):
+            key = "1년 이내"
+        if key not in buckets:
+            buckets[key] = []
+        buckets[key].append(_catalog_item_row(it, stats))
+    return buckets
+
+
+def group_by_risk_grade(items: list[StockItem]) -> dict[str, list[dict[str, Any]]]:
+    """위험등급(위험/경계/주의/안정)별 전수 품목 리스트."""
+    order = ["위험", "경계", "주의", "안정"]
+    buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in order}
+    for it in items_for_ai_analysis(items):
+        stats = estimate_depletion(it)
+        row = _catalog_item_row(it, stats)
+        grade = row["risk_grade"]
+        buckets.setdefault(grade, []).append(row)
+    for g in order:
+        buckets[g].sort(
+            key=lambda r: (
+                float(r["years_left"]) if isinstance(r.get("years_left"), (int, float)) else 999.0,
+                -float(r["priority_score"] or 0),
+            )
+        )
     return buckets
 
 
@@ -1174,16 +1259,23 @@ def select_monitoring_targets(items: list[StockItem], limit: int = 30) -> list[d
             continue
         row = {
             "label": it.label,
+            "name_ko": it.name_ko,
             "manage_no": it.manage_no,
             "std_type": it.std_type,
+            "last_qty": it.last_qty,
             "acceleration": stats["acceleration"],
             "acceleration_ratio": stats["acceleration_ratio"],
             "rate_change_ratio": stats["rate_change_ratio"],
             "annual_rate": stats["annual_rate"],
             "years_left": stats["years_left"],
             "deplete_ym": stats["deplete_ym"],
+            "depletion_category": stats["depletion_category"],
+            "risk_grade": risk_grade_from_years(stats.get("years_left")),
             "reliability": stats["reliability"]["label"],
+            "reliability_grade": stats["reliability"].get("grade"),
             "priority_score": stats["priority_score"],
+            "stock_risk": stats.get("stock_risk"),
+            "stock_value": stats.get("stock_value"),
             "indicators": (
                 f"가속도={stats['acceleration']}"
                 + (
@@ -1392,12 +1484,15 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
     monitoring = select_monitoring_targets(items)
     long_term_low = select_long_term_low_items(items)
     categories = group_by_depletion_category(items)
+    category_items = group_by_depletion_category_items(items)
+    risk_grade_items = group_by_risk_grade(items)
     valuation = compute_inventory_valuation(items)
 
     for it in items_for_ai_analysis(items):
         stats = estimate_depletion(it)
         flag = {
             "label": it.label,
+            "name_ko": it.name_ko,
             "manage_no": it.manage_no,
             "speed": stats["speed"],
             "years_left": stats["years_left"],
@@ -1406,6 +1501,7 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
             "recent_surge": bool(stats["recent_surge"]),
             "deplete_ym": stats["deplete_ym"],
             "depletion_category": stats["depletion_category"],
+            "risk_grade": risk_grade_from_years(stats.get("years_left")),
             "reliability": stats["reliability"],
             "priority_score": stats["priority_score"],
             "annual_rate": stats["annual_rate"],
@@ -1438,6 +1534,8 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
         "monitoring_targets": monitoring,
         "long_term_low_items": long_term_low,
         "depletion_categories": categories,
+        "depletion_category_items": category_items,
+        "risk_grade_items": risk_grade_items,
         "valuation": valuation,
     }
     flags["dashboard"] = build_kpi_dashboard(items, flags)
@@ -1456,9 +1554,46 @@ def extract_mentioned_codes_from_report(report: str, known_codes: list[str]) -> 
     return found
 
 
-def _format_candidate_lines(rows: list[dict[str, Any]]) -> str:
+def _format_catalog_row_line(i: int, r: dict[str, Any]) -> str:
+    """전수 목록 한 줄(번호·한글명·관리번호·세부 수치)."""
+    name = r.get("name_ko") or r.get("label") or "-"
+    code = r.get("manage_no") or "-"
+    yl = r.get("years_left")
+    yl_txt = f"{yl:.2f}" if isinstance(yl, (int, float)) else "-"
+    ar = r.get("annual_rate")
+    ar_txt = f"{ar:.2f}" if isinstance(ar, (int, float)) else "-"
+    ratio = r.get("acceleration_ratio")
+    ratio_txt = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "-"
+    score = r.get("priority_score")
+    score_txt = f"{score:.3f}" if isinstance(score, (int, float)) else str(score or "-")
+    rel = r.get("reliability_grade") or r.get("reliability") or "-"
+    return (
+        f"{i}. {name} | 관리번호:{code} | 유형:{r.get('std_type') or '-'} | "
+        f"재고:{r.get('last_qty', '-')} | 연평균:{ar_txt} | "
+        f"가속도:{r.get('acceleration') or '-'}/{ratio_txt} | "
+        f"소진년:{yl_txt} | 소진월:{r.get('deplete_ym') or '-'} | "
+        f"소진구간:{r.get('depletion_category') or '-'} | "
+        f"위험등급:{r.get('risk_grade') or '-'} | "
+        f"우선:{score_txt} | 신뢰:{rel}"
+    )
+
+
+def _format_full_catalog_block(title: str, rows: list[dict[str, Any]]) -> list[str]:
+    """카테고리 전수 목록 블록(생략 없음)."""
+    lines = [f"{title} — 전수 {len(rows)}건 (생략 없음, 1~{len(rows)} 번호)"]
+    if not rows:
+        lines.append("(해당 없음)")
+        return lines
+    for i, r in enumerate(rows, 1):
+        lines.append(_format_catalog_row_line(i, r))
+    return lines
+
+
+def _format_candidate_lines(rows: list[dict[str, Any]], *, full: bool = False) -> str:
     if not rows:
         return "없음"
+    if full:
+        return "\n".join(_format_catalog_row_line(i, r) for i, r in enumerate(rows, 1))
     parts = []
     for i, r in enumerate(rows, 1):
         score = r.get("priority_score")
@@ -1486,6 +1621,57 @@ def _format_candidate_lines(rows: list[dict[str, Any]]) -> str:
                 f"가속도:{r.get('acceleration') or '-'}"
             )
     return "\n".join(parts)
+
+
+_FULL_LIST_HINTS = (
+    "전체",
+    "모두",
+    "전부",
+    "전수",
+    "전량",
+    "다 보여",
+    "다보여",
+    "다 알려",
+    "다알려",
+    "리스트",
+    "목록",
+    "빠짐",
+    "누락",
+    "전부 알려",
+    "다 출력",
+)
+_FULL_LIST_COUNT_RE = re.compile(r"\d+\s*건")
+
+
+def detect_full_list_intent(question: str) -> dict[str, Any]:
+    """전수 목록 요청 감지 — 카테고리별 플래그."""
+    q = (question or "").strip()
+    wants_full = any(h in q for h in _FULL_LIST_HINTS) or bool(_FULL_LIST_COUNT_RE.search(q))
+    want_monitoring = any(k in q for k in ("모니터링", "급가속", "가속", "급증"))
+    want_depletion = any(
+        k in q for k in ("소진", "고갈", "1년", "3년", "5년", "10년", "15년", "구간")
+    )
+    want_manufacture = any(k in q for k in ("제조", "후보", "우선검토", "우선 검토"))
+    want_risk = (
+        "위험등급" in q
+        or any(k in q for k in ("위험군", "경계군", "주의군", "안정군"))
+        or (
+            any(k in q for k in ("위험", "경계", "주의"))
+            and any(k in q for k in ("등급", "군", "품목", "목록", "전체", "모두"))
+        )
+    )
+
+    any_category = want_monitoring or want_depletion or want_manufacture or want_risk
+    # 카테고리 없이 "전체/모두"만 있으면 주요 카탈로그 전부 제공
+    dump_all = wants_full and not any_category
+    return {
+        "wants_full": wants_full,
+        "monitoring": wants_full and (want_monitoring or dump_all),
+        "depletion": wants_full and (want_depletion or dump_all),
+        "manufacture": wants_full and (want_manufacture or dump_all),
+        "risk": wants_full and (want_risk or dump_all),
+        "dump_all": dump_all,
+    }
 
 
 def build_ai_prompt(
@@ -1725,7 +1911,7 @@ def find_items_by_partial_query(
 
 
 def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
-    """챗봇용 사전 산출 스냅샷 직렬화 — 표준 리포트와 동일 수치."""
+    """챗봇용 사전 산출 스냅샷 — 카테고리 전수 목록 포함(표준 리포트와 동일 수치)."""
     if not flags:
         return "[사전 산출 스냅샷] 없음 (플래그 미제공)"
 
@@ -1733,15 +1919,23 @@ def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
     dashboard = flags.get("dashboard") or {}
     valuation = flags.get("valuation") or {}
     categories = flags.get("depletion_categories") or {}
+    category_items = flags.get("depletion_category_items") or {}
+    risk_grade_items = flags.get("risk_grade_items") or {}
     manufacture = flags.get("manufacture_candidates") or {}
     monitoring = flags.get("monitoring_targets") or []
     long_term_low = flags.get("long_term_low_items") or []
+    surge_only = [r for r in monitoring if r.get("acceleration") == "급가속"]
+    increase_only = [r for r in monitoring if r.get("acceleration") == "증가"]
 
     lines = [
         "[사전 산출 스냅샷 — 표준 분석 리포트와 동일 수치. 이 스냅샷·실시간 조회 수치만 사용하세요]",
+        "[전수 목록 규칙] 아래 '전수 N건' 섹션은 요약·생략 없이 전부 수록되어 있습니다. "
+        "사용자가 전체/모두/전수/N건 목록을 요청하면 해당 섹션을 1~N번까지 그대로 출력하세요. "
+        "'등 N건'·일부만 나열·임의 생략·환각 추가를 금지합니다.",
         f"- by_code 품목 수: {len(by_code)}",
         f"- 5년 이내 소진 후보: {len(flags.get('deplete_codes') or [])}건",
         f"- 가속(급가속/증가) 후보: {len(flags.get('surge_codes') or [])}건",
+        f"- 모니터링 대상 전수: {len(monitoring)}건 (급가속 {len(surge_only)} + 증가 {len(increase_only)})",
         format_kpi_dashboard_markdown(dashboard) if dashboard else "- KPI 대시보드: 없음",
         "",
         f"- 환산 총액: {_fmt_money(valuation.get('total_value'))}",
@@ -1750,55 +1944,92 @@ def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
         lines.append(f"  · {tname}: {_fmt_money(tval)}")
 
     lines.append("")
-    lines.append("[스냅샷: 소진 기간 카테고리]")
+    lines.append("[스냅샷: 소진 기간 카테고리 — 건수 요약]")
     for cat_name, labels in categories.items():
-        if labels:
-            preview = ", ".join(labels[:12])
-            more = f" 외 {len(labels) - 12}건" if len(labels) > 12 else ""
-            lines.append(f"- {cat_name} ({len(labels)}건): {preview}{more}")
-        else:
-            lines.append(f"- {cat_name}: 없음")
+        detail = category_items.get(cat_name) or []
+        n = len(detail) if detail else len(labels or [])
+        lines.append(f"- {cat_name}: {n}건")
 
     lines.append("")
-    lines.append("[스냅샷: 차년도 제조검토 — 표준생약]")
-    lines.append(_format_candidate_lines(manufacture.get("표준생약") or []))
-    lines.append("[스냅샷: 차년도 제조검토 — 지표성분]")
-    lines.append(_format_candidate_lines(manufacture.get("지표성분") or []))
+    if category_items:
+        for cat_name, rows in category_items.items():
+            lines.extend(
+                _format_full_catalog_block(f"[스냅샷: 소진구간 {cat_name}]", rows)
+            )
+            lines.append("")
+    else:
+        lines.append("[스냅샷: 소진구간 전수] 미제공")
+        lines.append("")
 
     lines.append("")
-    lines.append(f"[스냅샷: 모니터링 대상] {len(monitoring)}건")
-    for i, r in enumerate(monitoring[:15], 1):
-        lines.append(
-            f"{i}. {r.get('label')} | {r.get('acceleration')} | "
-            f"소진:{r.get('deplete_ym') or '-'} | 우선:{r.get('priority_score')}"
-        )
+    if risk_grade_items:
+        for grade in ("위험", "경계", "주의", "안정"):
+            rows = risk_grade_items.get(grade) or []
+            lines.extend(
+                _format_full_catalog_block(f"[스냅샷: 위험등급 {grade}]", rows)
+            )
+            lines.append("")
+    else:
+        lines.append("[스냅샷: 위험등급 전수] 미제공")
+        lines.append("")
+
+    lines.append("[스냅샷: 차년도 제조검토 — 표준생약] (전수)")
+    lines.append(_format_candidate_lines(manufacture.get("표준생약") or [], full=True))
+    lines.append("[스냅샷: 차년도 제조검토 — 지표성분] (전수)")
+    lines.append(_format_candidate_lines(manufacture.get("지표성분") or [], full=True))
+    lines.append("")
+
+    lines.extend(
+        _format_full_catalog_block("[스냅샷: 모니터링 대상 전체]", list(monitoring))
+    )
+    lines.append("")
+    lines.extend(_format_full_catalog_block("[스냅샷: 모니터링 — 급가속만]", surge_only))
+    lines.append("")
+    lines.extend(_format_full_catalog_block("[스냅샷: 모니터링 — 증가만]", increase_only))
 
     if long_term_low:
         lines.append("")
-        lines.append(f"[스냅샷: 장기 저분양] {len(long_term_low)}건")
-        for i, r in enumerate(long_term_low[:10], 1):
-            lines.append(f"{i}. {r.get('label')} | 연평균:{r.get('annual_rate')}")
+        lines.extend(
+            _format_full_catalog_block(
+                "[스냅샷: 장기 저분양]",
+                [
+                    {
+                        "name_ko": r.get("label"),
+                        "label": r.get("label"),
+                        "manage_no": r.get("manage_no"),
+                        "std_type": r.get("std_type"),
+                        "annual_rate": r.get("annual_rate"),
+                        "years_left": r.get("years_left"),
+                        "reliability": r.get("reliability"),
+                        "stock_value": r.get("stock_value"),
+                    }
+                    for r in long_term_low
+                ],
+            )
+        )
 
     lines.append("")
-    lines.append("[스냅샷: 품목별 핵심 지표]")
+    lines.append("[스냅샷: 품목별 핵심 지표 — by_code 요약(참고)]")
     for i, (code, st) in enumerate(by_code.items()):
-        if i >= 80:
-            lines.append(f"... (이하 {len(by_code) - 80}종 생략, by_code에 존재)")
+        if i >= 120:
+            lines.append(f"... (이하 {len(by_code) - 120}종은 by_code에 존재, 전수 목록 섹션 우선)")
             break
         yl = st.get("years_left")
         yl_txt = f"{yl:.2f}" if isinstance(yl, (int, float)) else "-"
         rel = st.get("reliability") or {}
         rel_g = rel.get("grade") if isinstance(rel, dict) else None
         lines.append(
-            f"- {code} | {st.get('label')} | 속도:{st.get('speed')} | "
+            f"- {code} | {st.get('name_ko') or st.get('label')} | 속도:{st.get('speed')} | "
             f"가속:{st.get('acceleration')} | 소진년:{yl_txt} | "
-            f"소진월:{st.get('deplete_ym')} | f:{st.get('priority_score')} | "
-            f"환산:{_fmt_money(st.get('stock_value'))} | 신뢰:{rel_g}"
+            f"소진월:{st.get('deplete_ym')} | 위험:{st.get('risk_grade')} | "
+            f"f:{st.get('priority_score')} | 환산:{_fmt_money(st.get('stock_value'))} | "
+            f"신뢰:{rel_g}"
         )
 
     text = "\n".join(lines)
-    if len(text) > 28_000:
-        text = text[:27_960] + "\n... (스냅샷 이하 생략)"
+    # 전수 목록이 잘리면 안 되므로 상한을 넉넉히 둠
+    if len(text) > 120_000:
+        text = text[:119_960] + "\n... (스냅샷 용량 상한 — 전수 목록 앞부분이 우선)"
     return text
 
 
@@ -1839,6 +2070,7 @@ def query_live_inventory_context(
     dashboard = flags.get("dashboard") or build_kpi_dashboard(items, flags)
     valuation = flags.get("valuation") or compute_inventory_valuation(items)
     by_code = flags.get("by_code") or {}
+    full_intent = detect_full_list_intent(q)
 
     matched_items = find_items_by_partial_query(items, q)
     hit_codes = sorted(
@@ -1887,21 +2119,34 @@ def query_live_inventory_context(
     matched_items = list(selected)
 
     if not specific_hits:
-        if want_deplete:
-            for code in (flags.get("deplete_codes") or [])[:20]:
+        if want_deplete or full_intent.get("depletion"):
+            for code in flags.get("deplete_codes") or []:
                 it = next((x for x in items if x.manage_no == code), None)
                 if it:
                     _add(it)
-        if want_accel:
-            for row in (flags.get("monitoring_targets") or [])[:20]:
+        if want_accel or full_intent.get("monitoring"):
+            for row in flags.get("monitoring_targets") or []:
                 it = next((x for x in items if x.manage_no == row.get("manage_no")), None)
                 if it:
                     _add(it)
         if want_low:
-            for row in (flags.get("long_term_low_items") or [])[:20]:
+            for row in flags.get("long_term_low_items") or []:
                 it = next((x for x in items if x.manage_no == row.get("manage_no")), None)
                 if it:
                     _add(it)
+        if full_intent.get("risk"):
+            for rows in (flags.get("risk_grade_items") or {}).values():
+                for row in rows:
+                    it = next((x for x in items if x.manage_no == row.get("manage_no")), None)
+                    if it:
+                        _add(it)
+        if full_intent.get("manufacture"):
+            mfg = flags.get("manufacture_candidates") or {}
+            for rows in (mfg.get("표준생약") or [], mfg.get("지표성분") or []):
+                for row in rows:
+                    it = next((x for x in items if x.manage_no == row.get("manage_no")), None)
+                    if it:
+                        _add(it)
 
     if not selected:
         def _score(it: StockItem) -> float:
@@ -1915,7 +2160,15 @@ def query_live_inventory_context(
         for it in scored[:max_detail_items]:
             _add(it)
 
-    if specific_hits and matched_items:
+    # 전수 목록 요청 시 상세 절단하지 않음
+    if full_intent.get("wants_full") and (
+        full_intent.get("monitoring")
+        or full_intent.get("depletion")
+        or full_intent.get("manufacture")
+        or full_intent.get("risk")
+    ):
+        pass  # keep full selected
+    elif specific_hits and matched_items:
         extras = [it for it in selected if it not in matched_items]
         selected = matched_items + extras[: max(0, max_detail_items - len(matched_items))]
     else:
@@ -1931,9 +2184,50 @@ def query_live_inventory_context(
         ),
         f"- 기준 시각: {date.today().isoformat()}",
         f"- 대상 품목 {len(items)}종 · 질문 매칭/선별 상세 {len(selected)}종",
+        f"- 전수 목록 요청 감지: {full_intent}",
         format_kpi_dashboard_markdown(dashboard),
         "",
     ]
+
+    if full_intent.get("wants_full"):
+        lines.append(
+            "[전수 목록 출력 지시] 사용자가 전체/모두/전수/N건을 요청했습니다. "
+            "아래 첨부 전수 목록을 번호 매김(1~N) 또는 마크다운 표로 빠짐없이 출력하고, "
+            "'등 N건' 요약·임의 생략·없는 품목 추가를 금지하세요. "
+            "출력 건수는 스냅샷 건수와 일치해야 합니다."
+        )
+        lines.append("")
+        monitoring = flags.get("monitoring_targets") or []
+        if full_intent.get("monitoring"):
+            surge_only = [r for r in monitoring if r.get("acceleration") == "급가속"]
+            lines.extend(
+                _format_full_catalog_block("[실시간 전수: 모니터링 대상 전체]", list(monitoring))
+            )
+            lines.append("")
+            lines.extend(
+                _format_full_catalog_block("[실시간 전수: 급가속만]", surge_only)
+            )
+            lines.append("")
+        if full_intent.get("depletion"):
+            for cat_name, rows in (flags.get("depletion_category_items") or {}).items():
+                lines.extend(
+                    _format_full_catalog_block(f"[실시간 전수: 소진구간 {cat_name}]", rows)
+                )
+                lines.append("")
+        if full_intent.get("risk"):
+            for grade in ("위험", "경계", "주의", "안정"):
+                rows = (flags.get("risk_grade_items") or {}).get(grade) or []
+                lines.extend(
+                    _format_full_catalog_block(f"[실시간 전수: 위험등급 {grade}]", rows)
+                )
+                lines.append("")
+        if full_intent.get("manufacture"):
+            mfg = flags.get("manufacture_candidates") or {}
+            lines.append("[실시간 전수: 차년도 제조검토 — 표준생약]")
+            lines.append(_format_candidate_lines(mfg.get("표준생약") or [], full=True))
+            lines.append("[실시간 전수: 차년도 제조검토 — 지표성분]")
+            lines.append(_format_candidate_lines(mfg.get("지표성분") or [], full=True))
+            lines.append("")
 
     if hit_codes or hit_names:
         lines.append(
@@ -1981,6 +2275,7 @@ def query_live_inventory_context(
                 f"acceleration_ratio={stats.get('acceleration_ratio')} | "
                 f"years_left={yl_txt} | deplete_ym={stats.get('deplete_ym')} | "
                 f"depletion_category={stats.get('depletion_category')} | "
+                f"risk_grade={stats.get('risk_grade') or risk_grade_from_years(stats.get('years_left'))} | "
                 f"deplete_within_2y={stats.get('deplete_within_2y')} | "
                 f"deplete_within_5y={stats.get('deplete_within_5y')} | "
                 f"priority_score={stats.get('priority_score')} | "
@@ -2052,7 +2347,10 @@ def query_live_inventory_context(
                 lines.append("- " + " | ".join(brief))
 
     text = "\n".join(lines)
-    if len(text) > 24_000 and not matched_items:
+    if full_intent.get("wants_full"):
+        if len(text) > 120_000:
+            text = text[:119_960] + "\n... (전수 목록 용량 상한)"
+    elif len(text) > 24_000 and not matched_items:
         text = text[:23_960] + "\n... (이하 생략)"
     elif len(text) > 40_000:
         text = text[:39_960] + "\n... (이하 생략)"
@@ -2069,6 +2367,7 @@ def build_followup_prompt(
     flags: dict[str, Any] | None = None,
 ) -> str:
     """초기 리포트 이후 추가 질문용 — 사전 산출 스냅샷과 실시간 조회를 주입."""
+    full_intent = detect_full_list_intent(user_question or "")
     lines = [
         "당신은 생약표준품 재고·분양 분석 전문가입니다.",
         "사용자의 후속 질문에는 초기 리포트 문구만 반복하지 말고, "
@@ -2082,6 +2381,15 @@ def build_followup_prompt(
         "임의로 다시 계산·추정하지 마세요.",
         "[우선순위] 초기 리포트 문구와 스냅샷/실시간 수치가 다르면 스냅샷·실시간 수치를 사용하세요.",
         "아래는 코드로 계산된 정량 팩트만입니다. 이 수치 외 추론하지 마세요.",
+        "",
+        "[전수 목록 요청 대응 — 필수]",
+        "- 사용자가 '전체/모두/전수/전량/리스트/목록/N건 모두' 등을 요청하면, "
+        "초기 리포트의 '가스트로디게닌, 백출 … 등 N건' 요약만 반복하지 마세요.",
+        "- 스냅샷·실시간 전수 목록 섹션에 있는 품목을 1부터 N까지 번호 매김 또는 "
+        "마크다운 표/불릿으로 빠짐없이 한 번에 출력하세요.",
+        "- '등 N건', '일부만', '대표 예시'로 줄이지 말고, 없는 품목을 지어내지 마세요.",
+        "- 출력 건수는 해당 섹션의 '전수 N건'과 반드시 일치해야 합니다.",
+        f"- 이번 질문 전수 요청 감지: {full_intent}",
         "",
     ]
 
@@ -2112,19 +2420,28 @@ def build_followup_prompt(
 
     report = (base_report or "").strip()
     if report:
-        if len(report) > 3500:
-            report = report[:3480] + "\n... (초기 리포트 일부만 첨부)"
-        lines.append("[초기 분석 리포트 — 보조 참고]")
+        # 전수 요청 시 초기 리포트(요약본) 비중을 줄여 환각·요약 반복을 막음
+        limit = 1500 if full_intent.get("wants_full") else 3500
+        if len(report) > limit:
+            report = report[: limit - 20] + "\n... (초기 리포트 일부만 첨부 — 전수 목록은 스냅샷 우선)"
+        lines.append("[초기 분석 리포트 — 보조 참고(요약일 수 있음. 전수 목록은 스냅샷·실시간 전수 섹션 우선)]")
         lines.append(report)
         lines.append("")
 
     lines.append(f"[사용자 질문]\n{user_question.strip()}")
     lines.append("")
-    lines.append(
-        "질문에 대해 한국어 마크다운으로 답하되, 필요한 경우 스냅샷·실시간 수치(연도·수량·소진시점·"
-        "가속도·환산액·신뢰도 등급·우선순위점수 등)를 명시해 주세요. "
-        "스냅샷에 있는 수치 외 추론·재계산은 하지 마세요."
-    )
+    if full_intent.get("wants_full"):
+        lines.append(
+            "지금 질문은 전수 목록 요청입니다. 한국어 마크다운으로, "
+            "해당 카테고리 전수 목록을 1~N 번호 목록(또는 표)으로 누락 없이 출력하세요. "
+            "스냅샷/실시간 전수 섹션 외 추론·재계산·생략 금지."
+        )
+    else:
+        lines.append(
+            "질문에 대해 한국어 마크다운으로 답하되, 필요한 경우 스냅샷·실시간 수치(연도·수량·소진시점·"
+            "가속도·환산액·신뢰도 등급·우선순위점수 등)를 명시해 주세요. "
+            "스냅샷에 있는 수치 외 추론·재계산은 하지 마세요."
+        )
     return "\n".join(lines)
 
 

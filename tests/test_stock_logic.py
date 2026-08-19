@@ -330,9 +330,11 @@ def test_live_query_followup_uses_inventory():
     assert "스냅샷" in live or "by_code" in live
     snap = serialize_flags_snapshot(flags)
     assert "사전 산출 스냅샷" in snap
+    assert "전수" in snap
+    assert "위험등급" in snap or "소진구간" in snap
     prompt = build_followup_prompt(
-        "초기 리포트 요약",
-        "감초 소진 예상 시점은?",
+        "초기 리포트 요약 — 가스트로디게닌, 백출 등 전량 81건",
+        "모니터링 대상 81건 모두 알려줘",
         [item],
         compendium_context="[공정서 DB]\n- 감초 | 기원=콩과",
         flags=flags,
@@ -340,7 +342,15 @@ def test_live_query_followup_uses_inventory():
     assert "실시간 재고" in prompt
     assert "공정서" in prompt
     assert "스냅샷" in prompt
+    assert "전수 목록" in prompt
     assert "초기 리포트보다 이 수치를 우선" in prompt or "실시간 재검토" in prompt
+
+    from stock_logic import detect_full_list_intent
+
+    intent = detect_full_list_intent("모니터링 대상 81건 모두 알려줘")
+    assert intent["wants_full"] and intent["monitoring"]
+    intent2 = detect_full_list_intent("급가속 품목 전체 리스트")
+    assert intent2["wants_full"] and intent2["monitoring"]
 
     html = markdown_report_to_collapsible_html(
         "- 1년 이내 (10건): "
@@ -357,6 +367,65 @@ def test_live_query_followup_uses_inventory():
     assert "collapse:c0" in html_open
     assert "품목11" in html_open
     assert "접기" in html_open
+
+
+def test_full_catalog_snapshot_and_intent():
+    from stock_logic import (
+        StockItem,
+        StockPoint,
+        collect_ai_analysis_flags,
+        detect_full_list_intent,
+        query_live_inventory_context,
+        serialize_flags_snapshot,
+    )
+
+    # 과거 느린 감소 → 최근 빠른 감소 = 급가속
+    items = []
+    for i in range(5):
+        items.append(
+            StockItem(
+                manage_no=f"SURGE-{i:03d}",
+                name_ko=f"급가속품{i}",
+                std_type="표준생약",
+                unit_price=100,
+                corrected_points=[
+                    StockPoint(date(2018, 1, 1), 200),
+                    StockPoint(date(2019, 1, 1), 198),
+                    StockPoint(date(2020, 1, 1), 196),
+                    StockPoint(date(2021, 1, 1), 194),
+                    StockPoint(date(2022, 1, 1), 150),
+                    StockPoint(date(2023, 1, 1), 100),
+                    StockPoint(date(2024, 1, 1), 40),
+                ],
+            )
+        )
+
+    flags = collect_ai_analysis_flags(items)
+    assert "monitoring_targets" in flags
+    assert "depletion_category_items" in flags
+    assert "risk_grade_items" in flags
+    mon = flags["monitoring_targets"]
+    assert len(mon) >= 1
+    assert all("name_ko" in r and "manage_no" in r for r in mon)
+    for grade in ("위험", "경계", "주의", "안정"):
+        assert grade in flags["risk_grade_items"]
+
+    snap = serialize_flags_snapshot(flags)
+    assert "전수" in snap and "생략 없음" in snap
+    for r in mon:
+        assert (r.get("name_ko") or r.get("label")) in snap
+        assert str(r.get("manage_no")) in snap
+    # 더 이상 상위 15건만 자르지 않음
+    assert "monitoring_targets" not in snap or "전수" in snap
+
+    intent = detect_full_list_intent("모니터링 대상 전체 알려줘")
+    assert intent["wants_full"] and intent["monitoring"]
+    live = query_live_inventory_context(
+        items, "모니터링 대상 5건 모두 보여줘", flags=flags
+    )
+    assert "실시간 전수: 모니터링" in live
+    for r in mon:
+        assert str(r.get("manage_no")) in live
 
 
 def test_compendium_db_not_timeseries():
@@ -527,6 +596,7 @@ if __name__ == "__main__":
         test_ai_targets_only_changed_items,
         test_decrease_only_excludes_increases,
         test_live_query_followup_uses_inventory,
+        test_full_catalog_snapshot_and_intent,
         test_compendium_db_not_timeseries,
         test_year_display_and_continuous_axis,
         test_multi_file_merge,
