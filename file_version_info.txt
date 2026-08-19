@@ -1,0 +1,30 @@
+# UTF-8
+# PE VERSIONINFO for Stock_App (used by PyInstaller --version-file / EXE(version=...))
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 351, 0, 0),
+    prodvers=(1, 351, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+      StringTable(
+        '041204B0',
+        [StringStruct('CompanyName', 'Stock_App'),
+        StringStruct('FileDescription', '생약표준품 재고 분석 시스템'),
+        StringStruct('FileVersion', '1.351.0.0'),
+        StringStruct('InternalName', 'Stock_App'),
+        StringStruct('LegalCopyright', 'Copyright (C) 2026'),
+        StringStruct('OriginalFilename', 'Stock_App_v1.351.exe'),
+        StringStruct('ProductName', '생약표준품 재고 분석 시스템'),
+        StringStruct('ProductVersion', '1.351.0.0')])
+      ]),
+    VarFileInfo([VarStruct('Translation', [0x0412, 1200])])
+  ]
+)
