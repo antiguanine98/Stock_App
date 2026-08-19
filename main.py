@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.37
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.38
 """
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote
 
 import matplotlib
@@ -104,7 +104,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.37"
+APP_VERSION = "v1.38"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -506,18 +506,37 @@ class ExcelWorker(QThread):
 
 
 class GeminiWorker(QThread):
+    """프롬프트 구성 + Gemini 호출을 백그라운드에서 수행 (UI 논블로킹)."""
+
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
+    stage = pyqtSignal(str)
 
-    def __init__(self, api_key: str, prompt: str, *, followup: bool = False):
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        prompt: str | None = None,
+        build_prompt: Callable[[], str] | None = None,
+        followup: bool = False,
+    ):
         super().__init__()
         self.api_key = api_key
         self.prompt = prompt
+        self.build_prompt = build_prompt
         self.followup = followup
 
     def run(self) -> None:
         try:
-            self.finished.emit(generate_gemini_report(self.api_key, self.prompt))
+            if self.build_prompt is not None:
+                self.stage.emit("재고 및 공정서 DB 분석 중...")
+                prompt = self.build_prompt()
+            else:
+                prompt = self.prompt or ""
+            self.stage.emit(
+                "AI 답변 생성 중..." if self.followup else "초기 분석 리포트 생성 중..."
+            )
+            self.finished.emit(generate_gemini_report(self.api_key, prompt))
         except Exception as e:
             detail = format_gemini_error(e)
             kind = "후속 질문" if self.followup else "AI 분석"
@@ -1340,6 +1359,19 @@ class MainWindow(QMainWindow):
         )
         right_layout.addWidget(self.chat_view, stretch=1)
 
+        self.chat_busy_bar = QWidget()
+        chat_busy_layout = QHBoxLayout(self.chat_busy_bar)
+        chat_busy_layout.setContentsMargins(2, 0, 2, 0)
+        chat_busy_layout.setSpacing(6)
+        self.chat_busy_label = QLabel("")
+        self.chat_busy_label.setWordWrap(True)
+        self.chat_busy_label.setStyleSheet(
+            "color: #1e3a5f; font-size: 12px; font-weight: 600; padding: 4px 2px;"
+        )
+        chat_busy_layout.addWidget(self.chat_busy_label, stretch=1)
+        self.chat_busy_bar.hide()
+        right_layout.addWidget(self.chat_busy_bar)
+
         chat_row = QHBoxLayout()
         self.chat_input = QLineEdit()
         self.chat_input.setPlaceholderText("추가 질문 또는 세부 분석 요청을 입력하세요…")
@@ -1639,11 +1671,13 @@ class MainWindow(QMainWindow):
 
     def _clear_loaded_files(self) -> None:
         self._close_busy()
+        self._set_ai_progress(None)
         self._loaded_paths = []
         self.inventory_data = None
         self._chat_history.clear()
         self._initial_report = ""
         self._report_expanded_ids.clear()
+        self._chat_busy = False
         self._set_chat_enabled(False)
         self.report_fixed.clear()
         self.chat_view.clear()
@@ -2023,6 +2057,28 @@ class MainWindow(QMainWindow):
         if hasattr(self, "btn_chat_clear"):
             self.btn_chat_clear.setEnabled(bool(self._initial_report) and not self._chat_busy)
 
+    def _set_ai_progress(self, message: str | None) -> None:
+        """모달 없이 챗봇 인라인 + 상태바로 AI 진행 표시 (메인 UI 조작 가능)."""
+        if not hasattr(self, "chat_busy_label"):
+            return
+        if message:
+            self.chat_busy_label.setText(f"🤖 {message}")
+            self.chat_busy_bar.show()
+            self.statusBar().showMessage(message)
+        else:
+            self.chat_busy_bar.hide()
+            self.chat_busy_label.clear()
+            self.statusBar().clearMessage()
+
+    def _on_ai_stage(self, message: str) -> None:
+        self._set_ai_progress(message)
+        # 챗봇 시스템 안내 문구도 단계에 맞게 갱신
+        for msg in reversed(self._chat_history):
+            if msg.get("role") == "system":
+                msg["text"] = message
+                self._render_chat_view()
+                break
+
     def _render_chat_view(self) -> None:
         parts: list[str] = []
         for msg in self._chat_history:
@@ -2074,30 +2130,44 @@ class MainWindow(QMainWindow):
                 "role": "system",
                 "text": (
                     f"AI 분석 리포트 생성 중... (변동 {len(changed)}건 · "
-                    f"소진후보 {deplete_n} · 가속 {surge_n} · 제조검토후보 {mfg_n})\n"
-                    "최상단 KPI 대시보드·환산액·가속도 지표를 포함합니다."
+                    f"소진후보 {deplete_n} · 가속 {surge_n} · 제조검토후보 {mfg_n})"
                 ),
             }
         )
         self._render_chat_view()
-        self._show_busy("AI 분석", "초기 분석 리포트를 생성하는 중...\n잠시만 기다려 주세요.")
+        self._set_ai_progress("재고 및 공정서 DB 분석 중...")
 
-        def _start() -> None:
-            prompt = build_ai_prompt(
-                stock_items,
-                compendium_context=self._compendium_prompt_context(stock_items),
-                compendium_match_report=data.get("compendium_match_report") or None,
-                flags=data.get("ai_flags"),
+        stock_items_snap = list(stock_items)
+        flags_snap = data.get("ai_flags")
+        match_report = data.get("compendium_match_report") or None
+        compendium_df = self.compendium_df
+        compendium_meta = self.compendium_meta
+
+        def _build_prompt() -> str:
+            ctx = None
+            if compendium_df is not None:
+                ctx = format_compendium_context(
+                    compendium_df,
+                    stock_items_snap,
+                    meta=compendium_meta,
+                ) or None
+            return build_ai_prompt(
+                stock_items_snap,
+                compendium_context=ctx,
+                compendium_match_report=match_report,
+                flags=flags_snap,
             )
-            self.gemini_worker = GeminiWorker(key, prompt, followup=False)
-            self.gemini_worker.finished.connect(self._on_report_ready)
-            self.gemini_worker.error.connect(self._on_report_error)
-            self.gemini_worker.start()
 
-        self._run_after_busy_paint(_start)
+        self.gemini_worker = GeminiWorker(
+            key, build_prompt=_build_prompt, followup=False
+        )
+        self.gemini_worker.stage.connect(self._on_ai_stage)
+        self.gemini_worker.finished.connect(self._on_report_ready)
+        self.gemini_worker.error.connect(self._on_report_error)
+        self.gemini_worker.start()
 
     def _on_report_ready(self, text: str) -> None:
-        self._close_busy()
+        self._set_ai_progress(None)
         self._chat_busy = False
         self._chat_history.clear()
         self._initial_report = text
@@ -2120,7 +2190,7 @@ class MainWindow(QMainWindow):
             self._refresh_3d()
 
     def _on_report_error(self, message: str) -> None:
-        self._close_busy()
+        self._set_ai_progress(None)
         self._chat_busy = False
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
         self._chat_history.append(
@@ -2147,52 +2217,65 @@ class MainWindow(QMainWindow):
         self.chat_input.clear()
         self._chat_history.append({"role": "user", "text": question})
         self._chat_history.append(
-            {"role": "system", "text": "재고·공정서 데이터를 실시간 재검토하여 답변 생성 중..."}
+            {"role": "system", "text": "재고 및 공정서 DB 분석 중..."}
         )
         self._chat_busy = True
         self._set_chat_enabled(False)
         self._render_chat_view()
-        self._show_busy("AI 답변", "재고 통합 데이터·공정서 DB를 재조회하는 중...")
+        self._set_ai_progress("재고 및 공정서 DB 분석 중...")
 
-        def _start() -> None:
-            stock_items = None
-            table_df = None
-            ai_flags = None
-            if self.inventory_data:
-                stock_items = self.inventory_data.get("stock_items")
-                table_df = self.inventory_data.get("table_df")
-                ai_flags = self.inventory_data.get("ai_flags")
+        # 메인 스레드에서 참조만 스냅샷 — 무거운 프롬프트 구성은 워커에서 수행
+        base_report = self._initial_report
+        stock_items = None
+        table_df = None
+        ai_flags = None
+        if self.inventory_data:
+            stock_items = self.inventory_data.get("stock_items")
+            table_df = self.inventory_data.get("table_df")
+            ai_flags = self.inventory_data.get("ai_flags")
+        compendium_df = self.compendium_df
+        compendium_meta = self.compendium_meta
+        prior_qas = [
+            m for m in self._chat_history
+            if m.get("role") in ("user", "assistant")
+        ]
+
+        def _build_prompt() -> str:
+            ctx = None
+            if compendium_df is not None:
+                ctx = format_compendium_context(
+                    compendium_df,
+                    stock_items or [],
+                    meta=compendium_meta,
+                ) or None
             prompt = build_followup_prompt(
-                self._initial_report,
+                base_report,
                 question,
                 stock_items,
-                compendium_context=self._compendium_prompt_context(stock_items),
+                compendium_context=ctx,
                 table_df=table_df,
                 flags=ai_flags,
             )
-            # 최근 대화 맥락을 짧게 첨부 (초기 리포트는 chat_history에 없음)
-            prior_qas = [
-                m for m in self._chat_history
-                if m.get("role") in ("user", "assistant")
-            ]
             if len(prior_qas) > 2:
-                tail = prior_qas[-6:-1]  # 직전 질문 제외한 최근 맥락
+                tail = prior_qas[-6:-1]
                 if tail:
-                    ctx = "\n\n".join(
+                    ctx_chat = "\n\n".join(
                         ("사용자: " if m["role"] == "user" else "AI: ") + m["text"][:800]
                         for m in tail
                     )
-                    prompt = prompt + "\n\n[최근 대화 맥락]\n" + ctx
+                    prompt = prompt + "\n\n[최근 대화 맥락]\n" + ctx_chat
+            return prompt
 
-            self.gemini_worker = GeminiWorker(key, prompt, followup=True)
-            self.gemini_worker.finished.connect(self._on_chat_reply)
-            self.gemini_worker.error.connect(self._on_chat_error)
-            self.gemini_worker.start()
-
-        self._run_after_busy_paint(_start)
+        self.gemini_worker = GeminiWorker(
+            key, build_prompt=_build_prompt, followup=True
+        )
+        self.gemini_worker.stage.connect(self._on_ai_stage)
+        self.gemini_worker.finished.connect(self._on_chat_reply)
+        self.gemini_worker.error.connect(self._on_chat_error)
+        self.gemini_worker.start()
 
     def _on_chat_reply(self, text: str) -> None:
-        self._close_busy()
+        self._set_ai_progress(None)
         self._chat_busy = False
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
         self._chat_history.append({"role": "assistant", "text": text})
@@ -2212,7 +2295,7 @@ class MainWindow(QMainWindow):
             self._refresh_3d()
 
     def _on_chat_error(self, message: str) -> None:
-        self._close_busy()
+        self._set_ai_progress(None)
         self._chat_busy = False
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
         self._chat_history.append(

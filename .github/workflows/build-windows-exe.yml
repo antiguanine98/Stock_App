@@ -31,11 +31,11 @@ jobs:
       - name: Rename artifact
         shell: pwsh
         run: |
-          $exe = "dist/Stock_App_v1.37.exe"
+          $exe = "dist/Stock_App_v1.38.exe"
           if (Test-Path $exe) {
             Write-Host "EXE ready: $exe"
-          } elseif (Test-Path "dist/Stock_App_v1.37") {
-            Move-Item "dist/Stock_App_v1.37" $exe
+          } elseif (Test-Path "dist/Stock_App_v1.38") {
+            Move-Item "dist/Stock_App_v1.38" $exe
           } else {
             Get-ChildItem dist -ErrorAction SilentlyContinue | Format-Table Name, Length
             throw "Built EXE not found"
@@ -45,20 +45,19 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Stock_App_v1.37
-          path: dist/Stock_App_v1.37.exe
+          name: Stock_App_v1.38
+          path: dist/Stock_App_v1.38.exe
 
       - name: Create GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: Stock_App v1.37
-          files: dist/Stock_App_v1.37.exe
+          name: Stock_App v1.38
+          files: dist/Stock_App_v1.38.exe
           generate_release_notes: true
           body: |
             ## Summary
-            - 챗봇 전수 목록(모니터링·소진구간·위험등급·제조후보) 컨텍스트 보존
-            - 「전체/모두/N건」 질의 시 1~N 누락 없이 출력
+            - AI/챗봇 답변 생성 시 모달 잠금 제거 (인라인 로딩 + QThread 논블로킹)
 
             ## Assets
-            - `Stock_App_v1.37.exe` (Windows one-file, Python 3.12)
+            - `Stock_App_v1.38.exe` (Windows one-file, Python 3.12)
