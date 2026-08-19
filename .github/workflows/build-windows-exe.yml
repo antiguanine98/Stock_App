@@ -31,11 +31,11 @@ jobs:
       - name: Rename artifact
         shell: pwsh
         run: |
-          $exe = "dist/Stock_App_v1.351.exe"
+          $exe = "dist/Stock_App_v1.36.exe"
           if (Test-Path $exe) {
             Write-Host "EXE ready: $exe"
-          } elseif (Test-Path "dist/Stock_App_v1.351") {
-            Move-Item "dist/Stock_App_v1.351" $exe
+          } elseif (Test-Path "dist/Stock_App_v1.36") {
+            Move-Item "dist/Stock_App_v1.36" $exe
           } else {
             Get-ChildItem dist -ErrorAction SilentlyContinue | Format-Table Name, Length
             throw "Built EXE not found"
@@ -45,20 +45,20 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Stock_App_v1.351
-          path: dist/Stock_App_v1.351.exe
+          name: Stock_App_v1.36
+          path: dist/Stock_App_v1.36.exe
 
       - name: Create GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          name: Stock_App v1.351
-          files: dist/Stock_App_v1.351.exe
+          name: Stock_App v1.36
+          files: dist/Stock_App_v1.36.exe
           generate_release_notes: true
           body: |
             ## Summary
-            - PE VERSIONINFO(회사명·제품명·파일버전) 포함
-            - v1.35 기능 유지: 챗봇 스냅샷 동기화, 리포트 Ctrl+F/접기, 대화 초기화
+            - 표준 리포트 품목 목록 펼쳐보기/접기 앵커 토글 수정
+            - PE VERSIONINFO 포함
 
             ## Assets
-            - `Stock_App_v1.351.exe` (Windows one-file, Python 3.12)
+            - `Stock_App_v1.36.exe` (Windows one-file, Python 3.12)

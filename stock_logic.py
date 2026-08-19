@@ -2136,35 +2136,66 @@ def _md_inline_to_html(text: str) -> str:
     return esc
 
 
-def _collapse_comma_items_html(body: str, preview_n: int) -> str:
-    """긴 쉼표 구분 품목 목록을 details로 접기."""
+def _collapse_comma_items_html(
+    body: str,
+    preview_n: int,
+    *,
+    section_id: str,
+    expanded: bool,
+) -> str:
+    """긴 쉼표 구분 품목 목록을 앵커 토글로 접기/펼치기.
+
+    QTextBrowser는 HTML <details>를 지원하지 않으므로 #expand:id / #collapse:id 링크를 쓴다.
+    """
     parts = [p.strip() for p in body.split(",") if p.strip()]
     if len(parts) <= preview_n:
         return _md_inline_to_html(body)
-    preview = ", ".join(parts[:preview_n])
-    rest = ", ".join(parts[preview_n:])
     n = len(parts)
+    link_style = "color:#1e3a5f;text-decoration:underline;font-weight:600;"
+    if expanded:
+        full = _md_inline_to_html(", ".join(parts))
+        return (
+            f"{full} "
+            f"<a href=\"#collapse:{section_id}\" style=\"{link_style}\">▼ 접기</a>"
+        )
+    preview = ", ".join(parts[:preview_n])
     return (
         f"{_md_inline_to_html(preview)}, … "
-        f"<details style=\"display:inline;margin-left:4px;\">"
-        f"<summary style=\"cursor:pointer;color:#1e3a5f;\">전체 {n}개 품목 펼쳐보기</summary>"
-        f"<div style=\"margin-top:6px;line-height:1.55;\">{_md_inline_to_html(rest)}</div>"
-        f"</details>"
+        f"<a href=\"#expand:{section_id}\" style=\"{link_style}\">"
+        f"▶ 전체 {n}개 품목 펼쳐보기</a>"
     )
 
 
-def markdown_report_to_collapsible_html(md_text: str, preview_n: int = 8) -> str:
+def markdown_report_to_collapsible_html(
+    md_text: str,
+    preview_n: int = 8,
+    expanded_ids: set[str] | frozenset[str] | None = None,
+) -> str:
     """마크다운 리포트를 HTML로 변환하고, 긴 쉼표 품목 목록은 접기 UI로 감싼다."""
     if not md_text:
         return ""
+    expanded = set(expanded_ids or ())
     out: list[str] = []
     in_ul = False
+    section_i = 0
+
+    def _next_section() -> str:
+        nonlocal section_i
+        sid = f"c{section_i}"
+        section_i += 1
+        return sid
 
     def _close_ul() -> None:
         nonlocal in_ul
         if in_ul:
             out.append("</ul>")
             in_ul = False
+
+    def _maybe_collapse(body: str) -> str:
+        sid = _next_section()
+        return _collapse_comma_items_html(
+            body, preview_n, section_id=sid, expanded=sid in expanded
+        )
 
     for raw in md_text.splitlines():
         line = raw.rstrip()
@@ -2191,12 +2222,12 @@ def markdown_report_to_collapsible_html(md_text: str, preview_n: int = 8) -> str
                 if rest.strip():
                     inner = (
                         f"{_md_inline_to_html(prefix)}: "
-                        f"{_collapse_comma_items_html(rest.strip(), preview_n)}"
+                        f"{_maybe_collapse(rest.strip())}"
                     )
                 else:
                     inner = _md_inline_to_html(content)
             elif content.count(",") >= max(preview_n, 8):
-                inner = _collapse_comma_items_html(content, preview_n)
+                inner = _maybe_collapse(content)
             else:
                 inner = _md_inline_to_html(content)
             out.append(f"<li>{inner}</li>")
@@ -2208,7 +2239,7 @@ def markdown_report_to_collapsible_html(md_text: str, preview_n: int = 8) -> str
             if rest.strip() and rest.count(",") >= preview_n - 1:
                 out.append(
                     f"<p>{_md_inline_to_html(prefix)}: "
-                    f"{_collapse_comma_items_html(rest.strip(), preview_n)}</p>"
+                    f"{_maybe_collapse(rest.strip())}</p>"
                 )
                 continue
         out.append(f"<p>{_md_inline_to_html(line)}</p>")

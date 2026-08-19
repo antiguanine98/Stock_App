@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.351
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.36
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.351"
+APP_VERSION = "v1.36"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -1012,6 +1012,7 @@ class MainWindow(QMainWindow):
         self._loaded_paths: list[str] = []
         self._chat_history: list[dict[str, str]] = []
         self._initial_report: str = ""
+        self._report_expanded_ids: set[str] = set()
         self._chat_busy = False
         self.compendium_df = None
         self.compendium_meta: dict[str, Any] | None = None
@@ -1299,6 +1300,7 @@ class MainWindow(QMainWindow):
         self.report_fixed.setReadOnly(True)
         self.report_fixed.setOpenExternalLinks(False)
         self.report_fixed.setOpenLinks(False)
+        self.report_fixed.anchorClicked.connect(self._on_report_anchor_clicked)
         self.report_fixed.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -1641,6 +1643,7 @@ class MainWindow(QMainWindow):
         self.inventory_data = None
         self._chat_history.clear()
         self._initial_report = ""
+        self._report_expanded_ids.clear()
         self._set_chat_enabled(False)
         self.report_fixed.clear()
         self.chat_view.clear()
@@ -1689,6 +1692,7 @@ class MainWindow(QMainWindow):
         self._refresh_compendium_match()
         self._chat_history.clear()
         self._initial_report = ""
+        self._report_expanded_ids.clear()
         self._set_chat_enabled(False)
         self.report_fixed.clear()
         self.chat_view.clear()
@@ -1951,6 +1955,30 @@ class MainWindow(QMainWindow):
         self.report_fixed.setExtraSelections([])
         self.report_fixed.setFocus()
 
+    def _render_report_html(self) -> None:
+        """표준 리포트를 QTextBrowser용 HTML로 다시 그린다 (접기/펼치기 상태 반영)."""
+        if not self._initial_report:
+            self.report_fixed.clear()
+            return
+        self.report_fixed.setHtml(
+            markdown_report_to_collapsible_html(
+                self._initial_report,
+                expanded_ids=self._report_expanded_ids,
+            )
+        )
+
+    def _on_report_anchor_clicked(self, url: QUrl) -> None:
+        """펼쳐보기/접기 앵커 처리. QTextBrowser는 <details>를 지원하지 않음."""
+        frag = (url.fragment() or "").strip()
+        if not frag and url.scheme() in ("expand", "collapse"):
+            frag = f"{url.scheme()}:{url.path()}"
+        if frag.startswith("expand:"):
+            self._report_expanded_ids.add(frag.split(":", 1)[1])
+            self._render_report_html()
+        elif frag.startswith("collapse:"):
+            self._report_expanded_ids.discard(frag.split(":", 1)[1])
+            self._render_report_html()
+
     def _find_in_report(self, forward: bool = True) -> None:
         query = self.report_find_input.text()
         if not query:
@@ -2017,6 +2045,7 @@ class MainWindow(QMainWindow):
             data["ai_flags"] = collect_ai_analysis_flags(stock_items)
         self._chat_history.clear()
         self._initial_report = ""
+        self._report_expanded_ids.clear()
         self.report_fixed.clear()
         self._set_chat_enabled(False)
         if not changed:
@@ -2072,7 +2101,8 @@ class MainWindow(QMainWindow):
         self._chat_busy = False
         self._chat_history.clear()
         self._initial_report = text
-        self.report_fixed.setHtml(markdown_report_to_collapsible_html(text))
+        self._report_expanded_ids.clear()
+        self._render_report_html()
         self.chat_view.setMarkdown(
             "*표준 분석 리포트가 왼쪽에 준비되었습니다. 추가 질문을 입력해 주세요.*"
         )

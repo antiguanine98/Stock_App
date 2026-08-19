@@ -346,8 +346,17 @@ def test_live_query_followup_uses_inventory():
         "- 1년 이내 (10건): "
         + ", ".join(f"품목{i}" for i in range(12))
     )
-    assert "details" in html
+    assert "expand:c0" in html
     assert "전체 12개 품목 펼쳐보기" in html
+    assert "details" not in html
+    html_open = markdown_report_to_collapsible_html(
+        "- 1년 이내 (10건): "
+        + ", ".join(f"품목{i}" for i in range(12)),
+        expanded_ids={"c0"},
+    )
+    assert "collapse:c0" in html_open
+    assert "품목11" in html_open
+    assert "접기" in html_open
 
 
 def test_compendium_db_not_timeseries():
