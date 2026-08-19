@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.34
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.35
 """
 
 from __future__ import annotations
@@ -21,10 +21,15 @@ from PyQt6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QKeySequence,
     QPainter,
     QPainterPath,
     QPen,
     QPixmap,
+    QShortcut,
+    QTextCharFormat,
+    QTextCursor,
+    QTextDocument,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -47,6 +52,7 @@ from PyQt6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -63,6 +69,7 @@ from stock_logic import (
     format_compendium_match_report,
     load_compendium_excel,
     lookup_pharmacopoeia_tag,
+    markdown_report_to_collapsible_html,
     match_compendium_inventory,
     process_excel,
     process_excels,
@@ -97,7 +104,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.34"
+APP_VERSION = "v1.35"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -638,12 +645,18 @@ class InventoryChart(FigureCanvas):
         self._show_placeholder("품목 또는 표준품구분을 선택하면 재고 추이 차트가 표시됩니다.")
 
     def _clear_helpers(self) -> None:
+        if self._cursor is not None:
+            try:
+                self._cursor.remove()
+            except Exception:
+                pass
+            self._cursor = None
         self._annot = None
-        self._cursor = None
         self._points = []
 
     def _show_placeholder(self, message: str) -> None:
         self._clear_helpers()
+        self.figure.clf()
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         ax.set_facecolor("#fafbfc")
@@ -729,6 +742,7 @@ class InventoryChart(FigureCanvas):
             return
 
         self._clear_helpers()
+        self.figure.clf()
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         ax.set_facecolor("#fafbfc")
@@ -782,6 +796,7 @@ class InventoryChart(FigureCanvas):
             return
 
         self._clear_helpers()
+        self.figure.clf()
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         ax.set_facecolor("#fafbfc")
@@ -1258,8 +1273,32 @@ class MainWindow(QMainWindow):
         left_title = QLabel("표준 분석 리포트")
         left_title.setObjectName("sectionLabel")
         left_layout.addWidget(left_title)
-        self.report_fixed = QTextEdit()
+
+        # Ctrl+F 찾기 바 (기본 숨김)
+        self.report_find_bar = QWidget()
+        find_row = QHBoxLayout(self.report_find_bar)
+        find_row.setContentsMargins(0, 0, 0, 0)
+        find_row.setSpacing(6)
+        self.report_find_input = QLineEdit()
+        self.report_find_input.setPlaceholderText("리포트에서 찾기…")
+        self.report_find_input.returnPressed.connect(lambda: self._find_in_report(forward=True))
+        find_row.addWidget(self.report_find_input, stretch=1)
+        self.btn_find_prev = QPushButton("이전")
+        self.btn_find_prev.clicked.connect(lambda: self._find_in_report(forward=False))
+        find_row.addWidget(self.btn_find_prev)
+        self.btn_find_next = QPushButton("다음")
+        self.btn_find_next.clicked.connect(lambda: self._find_in_report(forward=True))
+        find_row.addWidget(self.btn_find_next)
+        self.btn_find_close = QPushButton("닫기")
+        self.btn_find_close.clicked.connect(self._hide_report_find_bar)
+        find_row.addWidget(self.btn_find_close)
+        self.report_find_bar.hide()
+        left_layout.addWidget(self.report_find_bar)
+
+        self.report_fixed = QTextBrowser()
         self.report_fixed.setReadOnly(True)
+        self.report_fixed.setOpenExternalLinks(False)
+        self.report_fixed.setOpenLinks(False)
         self.report_fixed.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -1268,9 +1307,14 @@ class MainWindow(QMainWindow):
         )
         self.report_fixed.setFont(QFont("Malgun Gothic", 10))
         self.report_fixed.setStyleSheet(
-            "QTextEdit { padding: 12px; line-height: 1.65; font-family: 'Malgun Gothic'; font-size: 10.5pt; }"
+            "QTextBrowser { padding: 12px; line-height: 1.65; font-family: 'Malgun Gothic'; font-size: 10.5pt; }"
         )
         left_layout.addWidget(self.report_fixed, stretch=1)
+
+        self._report_find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self.report_fixed)
+        self._report_find_shortcut.activated.connect(self._show_report_find_bar)
+        self._report_find_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.report_find_bar)
+        self._report_find_esc.activated.connect(self._hide_report_find_bar)
         splitter.addWidget(left_pane)
 
         right_pane = QWidget()
@@ -1303,6 +1347,10 @@ class MainWindow(QMainWindow):
         self.btn_chat_send.setEnabled(False)
         self.btn_chat_send.clicked.connect(self._send_chat_message)
         chat_row.addWidget(self.btn_chat_send)
+        self.btn_chat_clear = QPushButton("대화 초기화")
+        self.btn_chat_clear.setEnabled(False)
+        self.btn_chat_clear.clicked.connect(self._clear_chat_history)
+        chat_row.addWidget(self.btn_chat_clear)
         right_layout.addLayout(chat_row)
         splitter.addWidget(right_pane)
 
@@ -1887,9 +1935,65 @@ class MainWindow(QMainWindow):
             source_file=str(self.inventory_data.get("file_name") or ""),
         )
 
+    def _scroll_chat_to_bottom(self) -> None:
+        def _go() -> None:
+            sb = self.chat_view.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        QTimer.singleShot(0, _go)
+
+    def _show_report_find_bar(self) -> None:
+        self.report_find_bar.show()
+        self.report_find_input.setFocus()
+        self.report_find_input.selectAll()
+
+    def _hide_report_find_bar(self) -> None:
+        self.report_find_bar.hide()
+        self.report_fixed.setExtraSelections([])
+        self.report_fixed.setFocus()
+
+    def _find_in_report(self, forward: bool = True) -> None:
+        query = self.report_find_input.text()
+        if not query:
+            return
+        flags = QTextDocument.FindFlag(0)
+        if not forward:
+            flags |= QTextDocument.FindFlag.FindBackward
+        found = self.report_fixed.find(query, flags)
+        if not found:
+            cursor = self.report_fixed.textCursor()
+            if forward:
+                cursor.movePosition(QTextCursor.MoveOperation.Start)
+            else:
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.report_fixed.setTextCursor(cursor)
+            found = self.report_fixed.find(query, flags)
+        if found:
+            # 현재 선택 강조
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = self.report_fixed.textCursor()
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor("#fde68a"))
+            sel.format = fmt
+            self.report_fixed.setExtraSelections([sel])
+        else:
+            self.report_fixed.setExtraSelections([])
+
+    def _clear_chat_history(self) -> None:
+        """대화만 초기화 (좌측 표준 리포트·_initial_report 유지)."""
+        self._chat_history.clear()
+        if self._initial_report:
+            self.chat_view.setMarkdown(
+                "*표준 분석 리포트가 왼쪽에 준비되었습니다. 추가 질문을 입력해 주세요.*"
+            )
+        else:
+            self.chat_view.clear()
+        self._scroll_chat_to_bottom()
+
     def _set_chat_enabled(self, enabled: bool) -> None:
         self.btn_chat_send.setEnabled(enabled and not self._chat_busy)
         self.chat_input.setEnabled(enabled and not self._chat_busy)
+        if hasattr(self, "btn_chat_clear"):
+            self.btn_chat_clear.setEnabled(bool(self._initial_report) and not self._chat_busy)
 
     def _render_chat_view(self) -> None:
         parts: list[str] = []
@@ -1903,6 +2007,7 @@ class MainWindow(QMainWindow):
             else:
                 parts.append(f"### 🤖 AI\n\n{text}")
         self.chat_view.setMarkdown("\n\n---\n\n".join(parts) if parts else "")
+        self._scroll_chat_to_bottom()
 
     def _run_ai_analysis(self, data: dict[str, Any]) -> None:
         key = self.api_key_input.text().strip()
@@ -1918,6 +2023,7 @@ class MainWindow(QMainWindow):
             self.chat_view.setMarkdown(
                 "분석 대상 없음\n\n수량 변화가 있는 품목이 없어 AI 분석을 건너뛰었습니다."
             )
+            self._scroll_chat_to_bottom()
             return
         if not key:
             self.chat_view.setMarkdown(
@@ -1925,6 +2031,7 @@ class MainWindow(QMainWindow):
                 "상단에서 Gemini API Key를 입력하고 [저장]을 눌러 주세요.\n\n"
                         f"(대상 품목 중 변동 {len(changed)}건 대기 중)"
             )
+            self._scroll_chat_to_bottom()
             return
         flags = data.get("ai_flags") or {}
         deplete_n = len(flags.get("deplete_codes") or [])
@@ -1951,6 +2058,7 @@ class MainWindow(QMainWindow):
                 stock_items,
                 compendium_context=self._compendium_prompt_context(stock_items),
                 compendium_match_report=data.get("compendium_match_report") or None,
+                flags=data.get("ai_flags"),
             )
             self.gemini_worker = GeminiWorker(key, prompt, followup=False)
             self.gemini_worker.finished.connect(self._on_report_ready)
@@ -1964,10 +2072,11 @@ class MainWindow(QMainWindow):
         self._chat_busy = False
         self._chat_history.clear()
         self._initial_report = text
-        self.report_fixed.setMarkdown(text)
+        self.report_fixed.setHtml(markdown_report_to_collapsible_html(text))
         self.chat_view.setMarkdown(
             "*표준 분석 리포트가 왼쪽에 준비되었습니다. 추가 질문을 입력해 주세요.*"
         )
+        self._scroll_chat_to_bottom()
         self._set_chat_enabled(True)
         self._set_api_status(True, f"연결됨 ({get_active_gemini_model()})")
         if self.inventory_data is not None:
@@ -2018,15 +2127,18 @@ class MainWindow(QMainWindow):
         def _start() -> None:
             stock_items = None
             table_df = None
+            ai_flags = None
             if self.inventory_data:
                 stock_items = self.inventory_data.get("stock_items")
                 table_df = self.inventory_data.get("table_df")
+                ai_flags = self.inventory_data.get("ai_flags")
             prompt = build_followup_prompt(
                 self._initial_report,
                 question,
                 stock_items,
                 compendium_context=self._compendium_prompt_context(stock_items),
                 table_df=table_df,
+                flags=ai_flags,
             )
             # 최근 대화 맥락을 짧게 첨부 (초기 리포트는 chat_history에 없음)
             prior_qas = [

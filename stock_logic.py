@@ -1,7 +1,8 @@
-﻿"""생약표준품 재고 엑셀 파싱 · 연도별 소급 보정 · AI 프롬프트 구성."""
+"""생약표준품 재고 엑셀 파싱 · 연도별 소급 보정 · AI 프롬프트 구성."""
 
 from __future__ import annotations
 
+import html
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -39,6 +40,14 @@ PRICE_COL_KEYWORDS = ("가격",)
 ACCELERATION_FORMULA_KO = (
     "분양 가속도 = 최근 3년 연평균 분양량(감소구간만) ÷ 과거 연평균 분양량; "
     "급가속=비율≥2, 증가=비율≥1.25"
+)
+PRIORITY_FORMULA_KO = (
+    "제조우선순위점수 f = 0.40×재고위험도 + 0.25×최근분양속도(정규화) "
+    "+ 0.20×분양가속도(정규화) + 0.15×데이터신뢰도\n"
+    "  · 재고위험도 = 1 − (예상소진년수/15)  (0~1, 소진년수 없으면 0.05)\n"
+    "  · 최근분양속도 정규화 = min(1, 연평균분양량/50)\n"
+    "  · 분양가속도 정규화 = min(1, (가속도비율−1)/2)  (비율 없으면 0)\n"
+    "  · 데이터신뢰도 = A:1.0 / B:0.75 / C:0.5 / D:0.25"
 )
 PathLike = Union[str, Path]
 PathList = Sequence[PathLike]
@@ -1484,10 +1493,12 @@ def build_ai_prompt(
     *,
     compendium_context: str | None = None,
     compendium_match_report: str | None = None,
+    flags: dict[str, Any] | None = None,
 ) -> str:
     targets = items_for_ai_analysis(items)
     bulk_dates = detect_bulk_decrease_dates(items)
-    flags = collect_ai_analysis_flags(items)
+    if flags is None:
+        flags = collect_ai_analysis_flags(items)
     as_of = date.today()
     manufacture = flags.get("manufacture_candidates") or {}
     monitoring = flags.get("monitoring_targets") or []
@@ -1526,13 +1537,17 @@ def build_ai_prompt(
         "4. 분양 가속도(급가속/증가/안정/감소) 및 장기 저분양·과다재고 품목(차기 제조 수량 하향 권고)",
         f"   ({ACCELERATION_FORMULA_KO})",
         "5. 차년도 제조검토대상: 제조우선순위점수 상위 · 5년 이내 소진 표준생약·지표성분 각 10종 순위표",
-        "   (점수 = f(재고위험도, 최근 분양속도, 분양 가속도, 데이터 신뢰도))",
+        "   ※ 제조 우선순위 섹션 서두에 아래 산출 공식·가중치를 그대로 인용해 명시할 것:",
+        f"   {PRIORITY_FORMULA_KO}",
         "6. 모니터링 대상: 분양 가속도 급증 품목 + 정량 지표",
         "7. 현 재고 기준 분양금액 환산액(현재재고×가격): 전체·유형별·TOP20",
         "",
         f"[연구과제 대량출고로 제외할 날짜] {', '.join(bulk_dates) if bulk_dates else '해당 없음'}",
         "",
         f"[분양 가속도 산출식] {ACCELERATION_FORMULA_KO}",
+        "",
+        "[제조우선순위점수 산출식·가중치]",
+        PRIORITY_FORMULA_KO,
         "",
     ]
 
@@ -1659,29 +1674,192 @@ def build_ai_prompt(
     return "\n".join(lines)
 
 
+
+def find_items_by_partial_query(
+    items: list[StockItem],
+    question: str,
+) -> list[StockItem]:
+    """질문 문자열로 관리번호·한글명·영문명 부분일치(contains) 품목 검색.
+
+    예: "탄시논" → "탄시논 IIA" 매칭.
+    """
+    q = (question or "").strip()
+    if not q or not items:
+        return []
+    q_lower = q.lower()
+    tokens = [t for t in re.split(r"[\s,./?!~·\-_:;|()\[\]{}]+", q) if len(t) >= 2]
+
+    results: list[StockItem] = []
+    seen: set[str] = set()
+    for it in items:
+        key = it.manage_no or it.label
+        if key in seen:
+            continue
+        code = (it.manage_no or "").strip()
+        ko = (it.name_ko or "").strip()
+        en = ""
+        if not _is_empty(getattr(it, "name_en", None)):
+            en = _cell_str(it.name_en).strip()
+        en_l = en.lower()
+        label = (it.label or "").strip()
+
+        hit = False
+        if code and code.lower() in q_lower:
+            hit = True
+        elif ko and (ko in q or any(t in ko for t in tokens)):
+            hit = True
+        elif en and (en_l in q_lower or any(t.lower() in en_l for t in tokens)):
+            hit = True
+        elif label and (any(t in label for t in tokens) or label.lower() in q_lower):
+            hit = True
+        if not hit and tokens:
+            for t in tokens:
+                tl = t.lower()
+                if (ko and t in ko) or (en and tl in en_l) or (code and tl in code.lower()):
+                    hit = True
+                    break
+        if hit:
+            seen.add(key)
+            results.append(it)
+    return results
+
+
+def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
+    """챗봇용 사전 산출 스냅샷 직렬화 — 표준 리포트와 동일 수치."""
+    if not flags:
+        return "[사전 산출 스냅샷] 없음 (플래그 미제공)"
+
+    by_code = flags.get("by_code") or {}
+    dashboard = flags.get("dashboard") or {}
+    valuation = flags.get("valuation") or {}
+    categories = flags.get("depletion_categories") or {}
+    manufacture = flags.get("manufacture_candidates") or {}
+    monitoring = flags.get("monitoring_targets") or []
+    long_term_low = flags.get("long_term_low_items") or []
+
+    lines = [
+        "[사전 산출 스냅샷 — 표준 분석 리포트와 동일 수치. 이 스냅샷·실시간 조회 수치만 사용하세요]",
+        f"- by_code 품목 수: {len(by_code)}",
+        f"- 5년 이내 소진 후보: {len(flags.get('deplete_codes') or [])}건",
+        f"- 가속(급가속/증가) 후보: {len(flags.get('surge_codes') or [])}건",
+        format_kpi_dashboard_markdown(dashboard) if dashboard else "- KPI 대시보드: 없음",
+        "",
+        f"- 환산 총액: {_fmt_money(valuation.get('total_value'))}",
+    ]
+    for tname, tval in (valuation.get("by_type") or {}).items():
+        lines.append(f"  · {tname}: {_fmt_money(tval)}")
+
+    lines.append("")
+    lines.append("[스냅샷: 소진 기간 카테고리]")
+    for cat_name, labels in categories.items():
+        if labels:
+            preview = ", ".join(labels[:12])
+            more = f" 외 {len(labels) - 12}건" if len(labels) > 12 else ""
+            lines.append(f"- {cat_name} ({len(labels)}건): {preview}{more}")
+        else:
+            lines.append(f"- {cat_name}: 없음")
+
+    lines.append("")
+    lines.append("[스냅샷: 차년도 제조검토 — 표준생약]")
+    lines.append(_format_candidate_lines(manufacture.get("표준생약") or []))
+    lines.append("[스냅샷: 차년도 제조검토 — 지표성분]")
+    lines.append(_format_candidate_lines(manufacture.get("지표성분") or []))
+
+    lines.append("")
+    lines.append(f"[스냅샷: 모니터링 대상] {len(monitoring)}건")
+    for i, r in enumerate(monitoring[:15], 1):
+        lines.append(
+            f"{i}. {r.get('label')} | {r.get('acceleration')} | "
+            f"소진:{r.get('deplete_ym') or '-'} | 우선:{r.get('priority_score')}"
+        )
+
+    if long_term_low:
+        lines.append("")
+        lines.append(f"[스냅샷: 장기 저분양] {len(long_term_low)}건")
+        for i, r in enumerate(long_term_low[:10], 1):
+            lines.append(f"{i}. {r.get('label')} | 연평균:{r.get('annual_rate')}")
+
+    lines.append("")
+    lines.append("[스냅샷: 품목별 핵심 지표]")
+    for i, (code, st) in enumerate(by_code.items()):
+        if i >= 80:
+            lines.append(f"... (이하 {len(by_code) - 80}종 생략, by_code에 존재)")
+            break
+        yl = st.get("years_left")
+        yl_txt = f"{yl:.2f}" if isinstance(yl, (int, float)) else "-"
+        rel = st.get("reliability") or {}
+        rel_g = rel.get("grade") if isinstance(rel, dict) else None
+        lines.append(
+            f"- {code} | {st.get('label')} | 속도:{st.get('speed')} | "
+            f"가속:{st.get('acceleration')} | 소진년:{yl_txt} | "
+            f"소진월:{st.get('deplete_ym')} | f:{st.get('priority_score')} | "
+            f"환산:{_fmt_money(st.get('stock_value'))} | 신뢰:{rel_g}"
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 28_000:
+        text = text[:27_960] + "\n... (스냅샷 이하 생략)"
+    return text
+
+
+def _stats_from_flags(
+    it: StockItem,
+    by_code: dict[str, Any],
+    *,
+    allow_estimate: bool = True,
+) -> dict[str, Any]:
+    """flags by_code 스냅샷 우선, 없을 때만 estimate_depletion."""
+    if it.manage_no and it.manage_no in by_code:
+        return by_code[it.manage_no]
+    if allow_estimate:
+        return estimate_depletion(it)
+    return {}
+
+
 def query_live_inventory_context(
     items: list[StockItem],
     question: str,
     *,
     table_df: pd.DataFrame | None = None,
     max_detail_items: int = 35,
+    flags: dict[str, Any] | None = None,
 ) -> str:
-    """사용자 질문에 맞춰 재고 통합 데이터를 실시간 재계산·필터링한 컨텍스트."""
+    """사용자 질문에 맞춰 재고 데이터를 필터링한 컨텍스트.
+
+    flags가 주어지면 collect_ai_analysis_flags를 재호출하지 않고 스냅샷을 재사용한다.
+    """
     if not items:
         return "[실시간 재고 조회] 업로드된 재고 데이터가 없습니다."
 
     q = (question or "").strip()
     q_lower = q.lower()
-    # 항상 코드로 플래그 재계산
-    flags = collect_ai_analysis_flags(items)
+    reuse_flags = flags is not None
+    if flags is None:
+        flags = collect_ai_analysis_flags(items)
     dashboard = flags.get("dashboard") or build_kpi_dashboard(items, flags)
     valuation = flags.get("valuation") or compute_inventory_valuation(items)
+    by_code = flags.get("by_code") or {}
 
+    matched_items = find_items_by_partial_query(items, q)
+    hit_codes = sorted(
+        {it.manage_no for it in matched_items if it.manage_no},
+        key=len,
+        reverse=True,
+    )
+    hit_names = sorted(
+        {it.name_ko for it in matched_items if it.name_ko},
+        key=len,
+        reverse=True,
+    )
     codes = {it.manage_no for it in items if it.manage_no}
     names = {it.name_ko for it in items if it.name_ko}
-    hit_codes = sorted({c for c in codes if c and c.lower() in q_lower}, key=len, reverse=True)
-    hit_names = sorted({n for n in names if n and n in q}, key=len, reverse=True)
-    specific_hits = bool(hit_codes or hit_names)
+    for c in codes:
+        if c and c.lower() in q_lower and c not in hit_codes:
+            hit_codes.append(c)
+    for n in names:
+        if n and n in q and n not in hit_names:
+            hit_names.append(n)
+    specific_hits = bool(matched_items or hit_codes or hit_names)
 
     want_deplete = any(k in q for k in ("고갈", "소진", "제조", "우선", "5년", "2년"))
     want_accel = any(k in q for k in ("가속", "급증", "모니터링", "속도"))
@@ -1699,14 +1877,14 @@ def query_live_inventory_context(
         seen.add(key)
         selected.append(it)
 
-    for it in items:
-        if it.manage_no in hit_codes or it.name_ko in hit_names:
-            _add(it)
-        elif hit_names and any(n in (it.name_ko or "") or (it.name_ko or "") in n for n in hit_names):
-            _add(it)
+    for it in matched_items:
+        _add(it)
+    if not matched_items:
+        for it in items:
+            if it.manage_no in hit_codes or it.name_ko in hit_names:
+                _add(it)
 
     matched_items = list(selected)
-    by_code = flags.get("by_code") or {}
 
     if not specific_hits:
         if want_deplete:
@@ -1726,15 +1904,17 @@ def query_live_inventory_context(
                     _add(it)
 
     if not selected:
-        scored = sorted(
-            items_for_ai_analysis(items),
-            key=lambda it: float((by_code.get(it.manage_no) or estimate_depletion(it)).get("priority_score") or 0),
-            reverse=True,
-        )
+        def _score(it: StockItem) -> float:
+            st = _stats_from_flags(it, by_code, allow_estimate=not reuse_flags)
+            try:
+                return float(st.get("priority_score") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        scored = sorted(items_for_ai_analysis(items), key=_score, reverse=True)
         for it in scored[:max_detail_items]:
             _add(it)
 
-    # 특정 품목 매칭 시 해당 팩트는 잘리지 않음
     if specific_hits and matched_items:
         extras = [it for it in selected if it not in matched_items]
         selected = matched_items + extras[: max(0, max_detail_items - len(matched_items))]
@@ -1744,6 +1924,11 @@ def query_live_inventory_context(
     lines = [
         "[실시간 재고 데이터 재검토 결과 — 초기 리포트보다 이 수치를 우선하세요]",
         "아래는 코드로 계산된 정량 팩트만입니다. 이 수치 외 추론하지 마세요.",
+        (
+            "- 수치 출처: 사전 산출 스냅샷(by_code) 재사용"
+            if reuse_flags
+            else "- 수치 출처: 실시간 collect_ai_analysis_flags"
+        ),
         f"- 기준 시각: {date.today().isoformat()}",
         f"- 대상 품목 {len(items)}종 · 질문 매칭/선별 상세 {len(selected)}종",
         format_kpi_dashboard_markdown(dashboard),
@@ -1764,19 +1949,20 @@ def query_live_inventory_context(
     if want_reliab:
         grade_counts: dict[str, int] = defaultdict(int)
         for it in items:
-            g = (estimate_depletion(it).get("reliability") or {}).get("grade", "?")
+            st = _stats_from_flags(it, by_code, allow_estimate=not reuse_flags)
+            rel = st.get("reliability") or {}
+            g = rel.get("grade", "?") if isinstance(rel, dict) else "?"
             grade_counts[str(g)] += 1
         lines.append(
             "- 신뢰도 등급 분포: "
             + ", ".join(f"{g}={n}" for g, n in sorted(grade_counts.items()))
         )
 
-    # 특정 품목: estimate_depletion + valuation 전체 정량 팩트
     if matched_items:
         lines.append("")
         lines.append("[질문 매칭 품목 — 정량 팩트 전체 (절단 없음)]")
         for it in matched_items:
-            stats = estimate_depletion(it)
+            stats = _stats_from_flags(it, by_code, allow_estimate=True)
             if it.unit_price is None:
                 it.unit_price = _extract_unit_price_from_meta(it.extra_meta)
             hist = ", ".join(
@@ -1810,10 +1996,10 @@ def query_live_inventory_context(
     lines.append("[선별 품목 실시간 지표]")
     for it in selected:
         if matched_items and it in matched_items:
-            continue  # 이미 전체 팩트 섹션에 포함
-        stats = by_code.get(it.manage_no) or estimate_depletion(it)
-        if "reliability" not in stats:
-            stats = estimate_depletion(it)
+            continue
+        stats = _stats_from_flags(it, by_code, allow_estimate=not reuse_flags)
+        if not stats:
+            continue
         hist = ", ".join(
             f"{format_year(p.change_date)}={p.quantity:g}" for p in it.corrected_points
         )
@@ -1830,16 +2016,20 @@ def query_live_inventory_context(
             f"증가구간제외:{stats.get('increase_segments_excluded', 0)} | 추이:[{hist}]"
         )
 
-    # 표 DataFrame: 매칭 품목 행 + 핵심 수치 열 우선
-    if table_df is not None and not table_df.empty and (hit_codes or hit_names):
+    if table_df is not None and not table_df.empty and (hit_codes or hit_names or matched_items):
         lines.append("")
         lines.append("[통합 표(DataFrame) 매칭 행]")
         df = table_df
         mask = None
         if "관리번호" in df.columns and hit_codes:
             mask = df["관리번호"].astype(str).isin(hit_codes)
-        if "한글명" in df.columns and hit_names:
-            name_mask = df["한글명"].astype(str).isin(hit_names)
+        match_names = hit_names or [it.name_ko for it in matched_items if it.name_ko]
+        if "한글명" in df.columns and match_names:
+            name_mask = df["한글명"].astype(str).isin(match_names)
+            for n in match_names:
+                name_mask = name_mask | df["한글명"].astype(str).str.contains(
+                    re.escape(n), regex=True, na=False
+                )
             mask = name_mask if mask is None else (mask | name_mask)
         if mask is not None:
             sub = df.loc[mask]
@@ -1862,7 +2052,6 @@ def query_live_inventory_context(
                 lines.append("- " + " | ".join(brief))
 
     text = "\n".join(lines)
-    # 매칭 품목 팩트는 보존 — 비매칭 덤프만 길면 말미 절단
     if len(text) > 24_000 and not matched_items:
         text = text[:23_960] + "\n... (이하 생략)"
     elif len(text) > 40_000:
@@ -1877,24 +2066,38 @@ def build_followup_prompt(
     *,
     compendium_context: str | None = None,
     table_df: pd.DataFrame | None = None,
+    flags: dict[str, Any] | None = None,
 ) -> str:
-    """초기 리포트 이후 추가 질문용 — 재고/공정서 원본을 실시간 재검토."""
+    """초기 리포트 이후 추가 질문용 — 사전 산출 스냅샷과 실시간 조회를 주입."""
     lines = [
         "당신은 생약표준품 재고·분양 분석 전문가입니다.",
         "사용자의 후속 질문에는 초기 리포트 문구만 반복하지 말고, "
-        "아래 [실시간 재고 데이터 재검토 결과]와 공정서 DB를 우선 근거로 답하세요.",
+        "아래 [사전 산출 스냅샷]과 [실시간 재고 데이터 재검토 결과]·공정서 DB를 우선 근거로 답하세요.",
         "",
-        "[할루시네이션 금지] 제공된 실시간 수치·공정서 DB에 없는 내용을 단정하지 마세요. "
+        "[할루시네이션 금지] 제공된 스냅샷·실시간 수치·공정서 DB에 없는 내용을 단정하지 마세요. "
         "불확실하면 '확실하지 않음' 또는 '추측입니다'라고 밝히세요.",
         "[형식] '분석 전문가의 제언' 섹션은 작성하지 마세요.",
         "[공정서 DB] 규격/기준 참조에만 사용하고, 재고·분양 수치 산출에는 쓰지 마세요.",
-        "[우선순위] 초기 리포트와 실시간 수치가 다르면 실시간 재검토 수치를 사용하세요.",
+        "[수치 동기화] 표준 분석 리포트 생성 시 산출된 스냅샷 수치만 사용하세요. "
+        "임의로 다시 계산·추정하지 마세요.",
+        "[우선순위] 초기 리포트 문구와 스냅샷/실시간 수치가 다르면 스냅샷·실시간 수치를 사용하세요.",
         "아래는 코드로 계산된 정량 팩트만입니다. 이 수치 외 추론하지 마세요.",
         "",
     ]
 
+    if flags:
+        lines.append(serialize_flags_snapshot(flags))
+        lines.append("")
+    else:
+        lines.append("[사전 산출 스냅샷] 미제공 — 실시간 조회 결과만 사용")
+        lines.append("")
+
     if items:
-        lines.append(query_live_inventory_context(items, user_question, table_df=table_df))
+        lines.append(
+            query_live_inventory_context(
+                items, user_question, table_df=table_df, flags=flags
+            )
+        )
         lines.append("")
     else:
         lines.append("[실시간 재고 데이터 재검토 결과] 재고 데이터 없음")
@@ -1907,7 +2110,6 @@ def build_followup_prompt(
         lines.append(ctx)
         lines.append("")
 
-    # 초기 리포트는 보조 맥락으로만 짧게 — 정량 팩트 우선
     report = (base_report or "").strip()
     if report:
         if len(report) > 3500:
@@ -1919,10 +2121,105 @@ def build_followup_prompt(
     lines.append(f"[사용자 질문]\n{user_question.strip()}")
     lines.append("")
     lines.append(
-        "질문에 대해 한국어 마크다운으로 답하되, 필요한 경우 실시간 재검토 수치(연도·수량·소진시점·"
-        "가속도·환산액·신뢰도 등급 등)를 명시해 주세요. 코드 산출 수치 외 추론은 하지 마세요."
+        "질문에 대해 한국어 마크다운으로 답하되, 필요한 경우 스냅샷·실시간 수치(연도·수량·소진시점·"
+        "가속도·환산액·신뢰도 등급·우선순위점수 등)를 명시해 주세요. "
+        "스냅샷에 있는 수치 외 추론·재계산은 하지 마세요."
     )
     return "\n".join(lines)
+
+
+def _md_inline_to_html(text: str) -> str:
+    """Escape + simple **bold** / `code` inline markdown."""
+    esc = html.escape(text)
+    esc = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", esc)
+    esc = re.sub(r"`([^`]+)`", r"<code>\1</code>", esc)
+    return esc
+
+
+def _collapse_comma_items_html(body: str, preview_n: int) -> str:
+    """긴 쉼표 구분 품목 목록을 details로 접기."""
+    parts = [p.strip() for p in body.split(",") if p.strip()]
+    if len(parts) <= preview_n:
+        return _md_inline_to_html(body)
+    preview = ", ".join(parts[:preview_n])
+    rest = ", ".join(parts[preview_n:])
+    n = len(parts)
+    return (
+        f"{_md_inline_to_html(preview)}, … "
+        f"<details style=\"display:inline;margin-left:4px;\">"
+        f"<summary style=\"cursor:pointer;color:#1e3a5f;\">전체 {n}개 품목 펼쳐보기</summary>"
+        f"<div style=\"margin-top:6px;line-height:1.55;\">{_md_inline_to_html(rest)}</div>"
+        f"</details>"
+    )
+
+
+def markdown_report_to_collapsible_html(md_text: str, preview_n: int = 8) -> str:
+    """마크다운 리포트를 HTML로 변환하고, 긴 쉼표 품목 목록은 접기 UI로 감싼다."""
+    if not md_text:
+        return ""
+    out: list[str] = []
+    in_ul = False
+
+    def _close_ul() -> None:
+        nonlocal in_ul
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+
+    for raw in md_text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            _close_ul()
+            out.append("<br/>")
+            continue
+
+        hm = re.match(r"^(#{1,4})\s+(.*)$", line.strip())
+        if hm:
+            _close_ul()
+            level = len(hm.group(1))
+            out.append(f"<h{level}>{_md_inline_to_html(hm.group(2))}</h{level}>")
+            continue
+
+        lm = re.match(r"^(\s*[-*+]|\s*\d+\.)\s+(.*)$", line)
+        if lm:
+            if not in_ul:
+                out.append("<ul>")
+                in_ul = True
+            content = lm.group(2)
+            if ":" in content and content.count(",") >= preview_n:
+                prefix, _, rest = content.partition(":")
+                if rest.strip():
+                    inner = (
+                        f"{_md_inline_to_html(prefix)}: "
+                        f"{_collapse_comma_items_html(rest.strip(), preview_n)}"
+                    )
+                else:
+                    inner = _md_inline_to_html(content)
+            elif content.count(",") >= max(preview_n, 8):
+                inner = _collapse_comma_items_html(content, preview_n)
+            else:
+                inner = _md_inline_to_html(content)
+            out.append(f"<li>{inner}</li>")
+            continue
+
+        _close_ul()
+        if line.count(",") >= max(preview_n, 8) and ":" in line:
+            prefix, _, rest = line.partition(":")
+            if rest.strip() and rest.count(",") >= preview_n - 1:
+                out.append(
+                    f"<p>{_md_inline_to_html(prefix)}: "
+                    f"{_collapse_comma_items_html(rest.strip(), preview_n)}</p>"
+                )
+                continue
+        out.append(f"<p>{_md_inline_to_html(line)}</p>")
+
+    _close_ul()
+    style = (
+        "<div style=\"font-family:'Malgun Gothic','Segoe UI',sans-serif;"
+        "font-size:10.5pt;line-height:1.65;color:#1a2332;padding:4px;\">"
+    )
+    return style + "\n".join(out) + "</div>"
+
 
 
 def category_counts(items: list[StockItem]) -> dict[str, int]:
@@ -2043,23 +2340,35 @@ def load_compendium_excel(path: PathLike) -> dict[str, Any]:
 
 
 def _pharmacopoeia_tag_from_text(pharm: str) -> str:
-    """공정서 문자열 → '[KP 수재]' / '[KHP 수재]' 등."""
+    """공정서 문자열 → '[KP 수재]' / '[KHP(생약규격집) 수재]'."""
     if not pharm:
         return ""
-    upper = pharm.upper()
+    text = str(pharm).strip()
+    upper = text.upper()
+    # 약전외·생약규격집 = KHP (KP와 혼동 방지: '약전외'를 먼저 판정)
+    is_khp = (
+        "KHP" in upper
+        or "생약규격집" in text
+        or "약전외" in text
+        or "한약(생약)규격" in text
+        or "한약규격집" in text
+    )
+    is_kp = (
+        bool(re.search(r"(?<![A-Z])KP(?![A-Z])", upper))
+        or ("대한민국약전" in text and "약전외" not in text)
+        or text in ("약전", "KP", "kp")
+    )
     tags: list[str] = []
-    if "KHP" in upper or "생약규격집" in pharm:
-        tags.append("KHP")
-    if re.search(r"\bKP\b", upper) or "대한민국약전" in pharm or "약전" in pharm:
-        if "KP" not in tags:
-            tags.append("KP")
+    if is_kp:
+        tags.append("KP")
+    if is_khp:
+        tags.append("KHP(생약규격집)")
     if not tags:
-        # 원문 약어 그대로 시도
         m = re.search(r"\b([A-Z]{2,5})\b", upper)
-        if m:
+        if m and m.group(1) not in ("IIA", "IIB", "III"):
             tags.append(m.group(1))
     if not tags:
-        return f"[{pharm} 수재]" if pharm else ""
+        return f"[{text} 수재]" if text else ""
     return " ".join(f"[{t} 수재]" for t in tags)
 
 
@@ -2139,10 +2448,20 @@ def match_compendium_inventory(
         tag = _pharmacopoeia_tag_from_text(hit.pharmacopoeia)
         short = ""
         if tag:
-            found = re.findall(r"\[([^\s\]]+)", tag)
-            short = found[0] if found else (hit.pharmacopoeia or "")
+            # "[KHP(생약규격집) 수재]" → "KHP(생약규격집)" (lookup이 다시 태그화 가능하도록)
+            inners = re.findall(r"\[(.+?)\s*수재\]", tag)
+            short = inners[0].strip() if inners else ""
+            if not short:
+                found = re.findall(r"\[([^\]]+)", tag)
+                short = found[0].strip() if found else (hit.pharmacopoeia or "")
+            if short.upper() == "KHP" or (
+                short.upper().startswith("KHP") and "생약규격집" not in short
+            ):
+                short = "KHP(생약규격집)"
         elif hit.pharmacopoeia:
             short = hit.pharmacopoeia.strip()
+            if "생약규격집" in short or "약전외" in short or "KHP" in short.upper():
+                short = "KHP(생약규격집)"
         if it.manage_no and short:
             by_manage_no[it.manage_no] = short
         if tag:

@@ -285,7 +285,11 @@ def test_live_query_followup_uses_inventory():
         StockItem,
         StockPoint,
         build_followup_prompt,
+        collect_ai_analysis_flags,
+        find_items_by_partial_query,
+        markdown_report_to_collapsible_html,
         query_live_inventory_context,
+        serialize_flags_snapshot,
     )
 
     item = StockItem(
@@ -309,18 +313,41 @@ def test_live_query_followup_uses_inventory():
             StockPoint(date(2024, 1, 1), 120),
         ],
     )
-    live = query_live_inventory_context([item], "감초 소진 언제야?")
+    tanshinone = StockItem(
+        manage_no="STD-099",
+        name_ko="탄시논 IIA",
+        std_type="지표성분",
+        unit_price=500,
+        corrected_points=[StockPoint(date(2024, 1, 1), 10)],
+    )
+    partial = find_items_by_partial_query([item, tanshinone], "탄시논 소진?")
+    assert any(it.name_ko == "탄시논 IIA" for it in partial)
+
+    flags = collect_ai_analysis_flags([item])
+    live = query_live_inventory_context([item], "감초 소진 언제야?", flags=flags)
     assert "실시간 재고" in live
     assert "STD-001" in live or "감초" in live
+    assert "스냅샷" in live or "by_code" in live
+    snap = serialize_flags_snapshot(flags)
+    assert "사전 산출 스냅샷" in snap
     prompt = build_followup_prompt(
         "초기 리포트 요약",
         "감초 소진 예상 시점은?",
         [item],
         compendium_context="[공정서 DB]\n- 감초 | 기원=콩과",
+        flags=flags,
     )
     assert "실시간 재고" in prompt
     assert "공정서" in prompt
+    assert "스냅샷" in prompt
     assert "초기 리포트보다 이 수치를 우선" in prompt or "실시간 재검토" in prompt
+
+    html = markdown_report_to_collapsible_html(
+        "- 1년 이내 (10건): "
+        + ", ".join(f"품목{i}" for i in range(12))
+    )
+    assert "details" in html
+    assert "전체 12개 품목 펼쳐보기" in html
 
 
 def test_compendium_db_not_timeseries():
