@@ -1,10 +1,11 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.38
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.39
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -60,6 +61,7 @@ from PyQt6.QtWidgets import (
 
 from stock_logic import (
     StockItem,
+    attach_compendium_match_to_flags,
     build_ai_prompt,
     build_followup_prompt,
     build_scatter3d_records,
@@ -104,7 +106,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.38"
+APP_VERSION = "v1.39"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -140,6 +142,20 @@ QLabel#settingsHeaderLabel {
     color: #0b1f3a;
     font-size: 13px;
     font-weight: 700;
+}
+QLabel#stepLabel {
+    color: #0b1f3a;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 2px 0;
+}
+QLabel#apiBadge {
+    font-size: 13px;
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 8px;
+    background: #f1f5f9;
+    min-width: 88px;
 }
 QPushButton#collapseToggleBtn {
     background-color: #eef3f9;
@@ -1037,9 +1053,11 @@ class MainWindow(QMainWindow):
         self.compendium_meta: dict[str, Any] | None = None
         self.compendium_worker: CompendiumWorker | None = None
         self._busy_dialog: QProgressDialog | None = None
+        self._api_connected = False
 
         self._build_ui()
-        self._load_api_key()
+        # API Key는 세션 메모리만 사용 — 파일/레지스트리에서 불러오지 않음
+        self._update_api_badge(False, "미연결")
 
     def _show_busy(self, title: str, text: str) -> None:
         """작업 중 로딩창. Windows에서 바로 보이도록 즉시 표시·최상위 유지."""
@@ -1119,77 +1137,100 @@ class MainWindow(QMainWindow):
         )
         top_layout = QVBoxLayout(self._settings_body)
         top_layout.setContentsMargins(0, 2, 0, 0)
-        top_layout.setSpacing(10)
+        top_layout.setSpacing(12)
 
+        # --- STEP 1: Gemini API (최상단) ---
+        step1 = QLabel("STEP 1 · Gemini API 설정")
+        step1.setObjectName("stepLabel")
+        top_layout.addWidget(step1)
+
+        api_row = QHBoxLayout()
+        api_row.setSpacing(8)
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("Google Gemini API Key (이 실행 세션에서만 유지)")
+        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_input.textChanged.connect(self._on_api_key_edited)
+        api_row.addWidget(self.api_key_input, stretch=1)
+        self.btn_test = QPushButton("연결 테스트")
+        self.btn_test.setObjectName("secondaryBtn")
+        self.btn_test.setMinimumHeight(36)
+        self.btn_test.clicked.connect(self._test_api_connection)
+        api_row.addWidget(self.btn_test)
+        self.api_badge = QLabel("🔴 미연결")
+        self.api_badge.setObjectName("apiBadge")
+        self.api_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.api_badge.setToolTip("STEP 1에서 연결 테스트가 성공해야 분석·챗봇을 사용할 수 있습니다.")
+        api_row.addWidget(self.api_badge)
+        top_layout.addLayout(api_row)
+        api_hint = QLabel("API Key는 디스크에 저장되지 않으며, 프로그램을 종료하면 사라집니다.")
+        api_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        top_layout.addWidget(api_hint)
+
+        # --- STEP 2: 데이터 파일 (재고 | 공정서 나란히) ---
+        step2 = QLabel("STEP 2 · 데이터 파일 등록")
+        step2.setObjectName("stepLabel")
+        top_layout.addWidget(step2)
+
+        files_row = QHBoxLayout()
+        files_row.setSpacing(12)
+
+        stock_col = QVBoxLayout()
+        stock_col.setSpacing(6)
         file_label = QLabel("재고 엑셀 업로드")
         file_label.setObjectName("sectionLabel")
-        top_layout.addWidget(file_label)
-
-        file_row = QHBoxLayout()
+        stock_col.addWidget(file_label)
+        stock_inner = QHBoxLayout()
         self.dropzone = DropZone(min_height=78)
         self.dropzone.files_dropped.connect(self._load_excels)
-        file_row.addWidget(self.dropzone, stretch=1)
+        stock_inner.addWidget(self.dropzone, stretch=1)
         btn_col = QVBoxLayout()
         btn_select = QPushButton("파일 선택")
         btn_select.setObjectName("secondaryBtn")
-        btn_select.setMinimumWidth(110)
+        btn_select.setMinimumWidth(100)
         btn_select.setMinimumHeight(42)
         btn_select.clicked.connect(self._browse_file)
         btn_clear = QPushButton("목록 초기화")
         btn_clear.setObjectName("secondaryBtn")
-        btn_clear.setMinimumWidth(110)
+        btn_clear.setMinimumWidth(100)
         btn_clear.clicked.connect(self._clear_loaded_files)
         btn_col.addWidget(btn_select)
         btn_col.addWidget(btn_clear)
-        file_row.addLayout(btn_col)
-        top_layout.addLayout(file_row)
+        stock_inner.addLayout(btn_col)
+        stock_col.addLayout(stock_inner)
+        files_row.addLayout(stock_col, stretch=1)
 
-        comp_label = QLabel("공정서 DB 업로드 (규격 참조 · 재고 분석 제외)")
+        comp_col = QVBoxLayout()
+        comp_col.setSpacing(6)
+        comp_label = QLabel("공정서 DB 업로드 (규격 참조)")
         comp_label.setObjectName("sectionLabel")
-        top_layout.addWidget(comp_label)
-
-        comp_row = QHBoxLayout()
+        comp_col.addWidget(comp_label)
+        comp_inner = QHBoxLayout()
         self.compendium_dropzone = DropZone(
             title="공정서 DB 엑셀을 드래그 앤 드롭",
-            subtitle=".xlsx / .xls · 재고 시계열로 파싱하지 않음 · AI 규격/기준 참조 전용",
-            min_height=64,
+            subtitle=".xlsx / .xls · AI 규격/기준 참조 전용",
+            min_height=78,
         )
         self.compendium_dropzone.files_dropped.connect(self._on_compendium_dropped)
-        comp_row.addWidget(self.compendium_dropzone, stretch=1)
+        comp_inner.addWidget(self.compendium_dropzone, stretch=1)
         comp_btn_col = QVBoxLayout()
         btn_comp_select = QPushButton("공정서 선택")
         btn_comp_select.setObjectName("secondaryBtn")
-        btn_comp_select.setMinimumWidth(110)
+        btn_comp_select.setMinimumWidth(100)
         btn_comp_select.clicked.connect(self._browse_compendium)
         btn_comp_clear = QPushButton("공정서 해제")
         btn_comp_clear.setObjectName("secondaryBtn")
-        btn_comp_clear.setMinimumWidth(110)
+        btn_comp_clear.setMinimumWidth(100)
         btn_comp_clear.clicked.connect(self._clear_compendium)
         comp_btn_col.addWidget(btn_comp_select)
         comp_btn_col.addWidget(btn_comp_clear)
-        comp_row.addLayout(comp_btn_col)
-        top_layout.addLayout(comp_row)
+        comp_inner.addLayout(comp_btn_col)
+        comp_col.addLayout(comp_inner)
+        files_row.addLayout(comp_col, stretch=1)
+
+        top_layout.addLayout(files_row)
         self.compendium_status = QLabel("공정서 DB: 미등록")
         self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
         top_layout.addWidget(self.compendium_status)
-
-        api_label = QLabel("Gemini API Key")
-        api_label.setObjectName("sectionLabel")
-        top_layout.addWidget(api_label)
-
-        api_row = QHBoxLayout()
-        self.api_key_input = QLineEdit()
-        self.api_key_input.setPlaceholderText("Google Gemini API Key 입력")
-        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        api_row.addWidget(self.api_key_input, stretch=1)
-        btn_save_key = QPushButton("저장")
-        btn_save_key.clicked.connect(self._save_api_key)
-        api_row.addWidget(btn_save_key)
-        self.btn_test = QPushButton("연결 테스트")
-        self.btn_test.setObjectName("secondaryBtn")
-        self.btn_test.clicked.connect(self._test_api_connection)
-        api_row.addWidget(self.btn_test)
-        top_layout.addLayout(api_row)
 
         settings_outer.addWidget(self._settings_body)
         root.addWidget(settings_card, stretch=0)
@@ -1486,21 +1527,52 @@ class MainWindow(QMainWindow):
             central.layout().activate()
         self.update()
 
-    def _load_api_key(self) -> None:
-        key = load_config().get("gemini_api_key", "")
-        if key:
-            self.api_key_input.setText(key)
+    def _on_api_key_edited(self, _text: str = "") -> None:
+        """키 변경 시 연결 상태 무효화 (세션 메모리만 유지, 디스크 저장 없음)."""
+        if self._api_connected:
+            self._api_connected = False
+            self._update_api_badge(False, "재연결 필요")
 
-    def _save_api_key(self) -> None:
-        key = self.api_key_input.text().strip()
-        if not key:
-            QMessageBox.warning(self, "경고", "API Key를 입력해 주세요.")
+    def _update_api_badge(self, ok: bool, message: str = "") -> None:
+        if not hasattr(self, "api_badge"):
             return
-        save_config({"gemini_api_key": key})
-        QMessageBox.information(self, "저장 완료", "API Key가 config.json에 저장되었습니다.")
-        self._test_api_connection()
+        if ok:
+            self.api_badge.setText("🟢 연결됨")
+            self.api_badge.setStyleSheet(
+                "QLabel#apiBadge { color: #15803d; background: #dcfce7; }"
+            )
+            self.api_badge.setToolTip(message or "Gemini API 연결됨")
+        else:
+            self.api_badge.setText("🔴 미연결")
+            self.api_badge.setStyleSheet(
+                "QLabel#apiBadge { color: #b91c1c; background: #fee2e2; }"
+            )
+            self.api_badge.setToolTip(
+                message or "STEP 1에서 API Key 입력 후 연결 테스트를 완료해 주세요."
+            )
+
+    def _require_api_ready(self) -> bool:
+        """분석/챗봇 전 STEP 1 API 연결 확인."""
+        key = self.api_key_input.text().strip()
+        if key and self._api_connected:
+            return True
+        self._set_settings_collapsed(False)
+        self.api_key_input.setFocus()
+        tip = "STEP 1의 API Key 연결이 먼저 필요합니다."
+        if not key:
+            tip += "\nAPI Key를 입력한 뒤 [연결 테스트]를 눌러 주세요."
+        elif not self._api_connected:
+            tip += "\n[연결 테스트]가 성공해야 분석을 시작할 수 있습니다."
+        self.api_badge.setToolTip(tip)
+        self.statusBar().showMessage(tip.replace("\n", " "), 8000)
+        # offscreen(자동 테스트)에서는 모달 팝업을 띄우지 않음
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen":
+            QMessageBox.information(self, "STEP 1 필요", tip)
+        return False
 
     def _set_api_status(self, ok: bool, message: str) -> None:
+        self._api_connected = bool(ok)
+        self._update_api_badge(ok, message)
         full = f"API: {message}"
         self.status_api.setText(full if len(full) <= 100 else full[:97] + "...")
         self.status_api.setToolTip(message)
@@ -1515,11 +1587,20 @@ class MainWindow(QMainWindow):
         key = self.api_key_input.text().strip()
         if not key:
             self._set_api_status(False, "키 없음 — API Key를 입력해 주세요.")
+            QMessageBox.warning(
+                self,
+                "STEP 1 필요",
+                "STEP 1에서 API Key를 입력한 뒤 연결 테스트를 진행해 주세요.",
+            )
             return
         self.btn_test.setEnabled(False)
         self.btn_test.setText("확인 중...")
         self.status_api.setText("API: 연결 확인 중...")
         self.status_api.setStyleSheet("color: #64748b;")
+        self.api_badge.setText("🟡 확인 중")
+        self.api_badge.setStyleSheet(
+            "QLabel#apiBadge { color: #a16207; background: #fef9c3; }"
+        )
         self.test_worker = GeminiTestWorker(key)
         self.test_worker.finished.connect(self._on_api_test_finished)
         self.test_worker.start()
@@ -1615,6 +1696,10 @@ class MainWindow(QMainWindow):
         match = match_compendium_inventory(entries, stock_items)
         self.inventory_data["compendium_match"] = match
         self.inventory_data["compendium_match_report"] = format_compendium_match_report(match)
+        # AI/챗봇 스냅샷과 동기화
+        flags = self.inventory_data.get("ai_flags")
+        if isinstance(flags, dict) or flags is None:
+            self.inventory_data["ai_flags"] = attach_compendium_match_to_flags(flags, match)
         return match
 
     def _pharmacopoeia_tag_for_item(self, item: dict[str, Any] | StockItem | str) -> str:
@@ -1742,8 +1827,15 @@ class MainWindow(QMainWindow):
         else:
             file_label = f"{names[0]} 외 {len(names) - 1}개"
         match = data.get("compendium_match") or {}
+        stats = match.get("stats") or {}
+        miss_n = stats.get("missing_count")
         match_n = match.get("correction_count")
-        match_txt = f" · 공정서매칭 {match_n}건" if match_n is not None and match else ""
+        match_bits = []
+        if match_n is not None and match:
+            match_bits.append(f"매칭 {match_n}")
+        if miss_n is not None and match:
+            match_bits.append(f"미보유 {miss_n}")
+        match_txt = f" · 공정서 {'/'.join(match_bits)}" if match_bits else ""
         self.status_excel.setText(f"파일: {file_label} ({data['row_count']}품목)")
         self.status_excel.setToolTip("\n".join(names))
         self.status_correction.setText(
@@ -2099,6 +2191,8 @@ class MainWindow(QMainWindow):
         changed = [it for it in stock_items if it.has_stock_change]
         if "ai_flags" not in data:
             data["ai_flags"] = collect_ai_analysis_flags(stock_items)
+        match = data.get("compendium_match") or {}
+        data["ai_flags"] = attach_compendium_match_to_flags(data.get("ai_flags"), match)
         self._chat_history.clear()
         self._initial_report = ""
         self._report_expanded_ids.clear()
@@ -2110,14 +2204,16 @@ class MainWindow(QMainWindow):
             )
             self._scroll_chat_to_bottom()
             return
-        if not key:
+        if not self._require_api_ready():
             self.chat_view.setMarkdown(
-                "API Key가 설정되지 않았습니다.\n"
-                "상단에서 Gemini API Key를 입력하고 [저장]을 눌러 주세요.\n\n"
-                        f"(대상 품목 중 변동 {len(changed)}건 대기 중)"
+                "**STEP 1의 API Key 연결이 먼저 필요합니다.**\n\n"
+                "상단에서 Gemini API Key를 입력하고 [연결 테스트]를 완료한 뒤, "
+                "재고 파일을 다시 불러오거나 분석을 재시작해 주세요.\n\n"
+                f"(대상 품목 중 변동 {len(changed)}건 대기 중)"
             )
             self._scroll_chat_to_bottom()
             return
+        key = self.api_key_input.text().strip()
         flags = data.get("ai_flags") or {}
         deplete_n = len(flags.get("deplete_codes") or [])
         surge_n = len(flags.get("surge_codes") or [])
@@ -2209,10 +2305,9 @@ class MainWindow(QMainWindow):
         if not self._initial_report:
             QMessageBox.information(self, "안내", "초기 AI 리포트가 생성된 뒤 질문할 수 있습니다.")
             return
-        key = self.api_key_input.text().strip()
-        if not key:
-            QMessageBox.warning(self, "경고", "API Key를 입력해 주세요.")
+        if not self._require_api_ready():
             return
+        key = self.api_key_input.text().strip()
 
         self.chat_input.clear()
         self._chat_history.append({"role": "user", "text": question})
@@ -2232,7 +2327,11 @@ class MainWindow(QMainWindow):
         if self.inventory_data:
             stock_items = self.inventory_data.get("stock_items")
             table_df = self.inventory_data.get("table_df")
-            ai_flags = self.inventory_data.get("ai_flags")
+            ai_flags = attach_compendium_match_to_flags(
+                self.inventory_data.get("ai_flags"),
+                self.inventory_data.get("compendium_match"),
+            )
+            self.inventory_data["ai_flags"] = ai_flags
         compendium_df = self.compendium_df
         compendium_meta = self.compendium_meta
         prior_qas = [

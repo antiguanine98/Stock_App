@@ -428,6 +428,53 @@ def test_full_catalog_snapshot_and_intent():
         assert str(r.get("manage_no")) in live
 
 
+def test_compendium_missing_set_and_followup_filter():
+    from stock_logic import (
+        CompendiumEntry,
+        StockItem,
+        attach_compendium_match_to_flags,
+        detect_full_list_intent,
+        filter_missing_compendium_items,
+        format_compendium_stats_markdown,
+        match_compendium_inventory,
+        serialize_flags_snapshot,
+        _norm_key,
+    )
+
+    assert _norm_key("감 초 (A)") == _norm_key("감초A")
+    entries = [
+        CompendiumEntry(name_ko="감초", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="지황", pharmacopoeia="KHP"),
+        CompendiumEntry(name_ko="백출 (규격)", pharmacopoeia="생약규격집"),
+        CompendiumEntry(name_ko="당귀", pharmacopoeia="KP"),
+    ]
+    items = [StockItem(manage_no="1", name_ko="감초", std_type="표준생약")]
+    match = match_compendium_inventory(entries, items)
+    assert match["stats"]["missing_count"] == 3
+    assert match["stats"]["inventory_matched"] == 1
+    assert len(match["missing_items"]) == 3
+    md = format_compendium_stats_markdown(match)
+    assert "공정서 DB 매칭" in md and "3건" in md
+    assert "챗봇" in md
+
+    intent = detect_full_list_intent("공정서 미보유 품목 전체 알려줘")
+    assert intent["missing_compendium"]
+    khp = filter_missing_compendium_items(
+        match["missing_items"], "그 중 KHP 수재 품목만 골라줘"
+    )
+    assert len(khp) == 2
+    assert all(r["pharmacopoeia_kind"] == "KHP" for r in khp)
+    jih = filter_missing_compendium_items(
+        match["missing_items"], "미보유 중 지황 관련 품목 있어?"
+    )
+    assert len(jih) == 1 and jih[0]["name_ko"] == "지황"
+
+    flags = attach_compendium_match_to_flags({"by_code": {}}, match)
+    snap = serialize_flags_snapshot(flags)
+    assert "공정서 미보유" in snap
+    assert "지황" in snap and "당귀" in snap
+
+
 def test_compendium_db_not_timeseries():
     from stock_logic import (
         StockItem,
@@ -597,6 +644,7 @@ if __name__ == "__main__":
         test_decrease_only_excludes_increases,
         test_live_query_followup_uses_inventory,
         test_full_catalog_snapshot_and_intent,
+        test_compendium_missing_set_and_followup_filter,
         test_compendium_db_not_timeseries,
         test_year_display_and_continuous_axis,
         test_multi_file_merge,

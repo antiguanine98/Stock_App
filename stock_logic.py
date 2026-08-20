@@ -1660,18 +1660,143 @@ def detect_full_list_intent(question: str) -> dict[str, Any]:
             and any(k in q for k in ("등급", "군", "품목", "목록", "전체", "모두"))
         )
     )
+    want_missing = any(
+        k in q
+        for k in (
+            "미보유",
+            "부재",
+            "없는 품목",
+            "없는품목",
+            "미등록",
+            "공정서에만",
+            "보유하지",
+            "안 가진",
+            "안가진",
+        )
+    )
 
-    any_category = want_monitoring or want_depletion or want_manufacture or want_risk
+    any_category = (
+        want_monitoring or want_depletion or want_manufacture or want_risk or want_missing
+    )
     # 카테고리 없이 "전체/모두"만 있으면 주요 카탈로그 전부 제공
     dump_all = wants_full and not any_category
+    # 미보유는 키워드만으로도 전수 출력 의도로 간주 (「미보유 알려줘」)
+    missing_full = want_missing and (
+        wants_full or any(k in q for k in ("알려", "보여", "리스트", "목록", "뭐", "어느"))
+    )
     return {
-        "wants_full": wants_full,
+        "wants_full": wants_full or missing_full,
         "monitoring": wants_full and (want_monitoring or dump_all),
         "depletion": wants_full and (want_depletion or dump_all),
         "manufacture": wants_full and (want_manufacture or dump_all),
         "risk": wants_full and (want_risk or dump_all),
+        "missing_compendium": missing_full or (wants_full and (want_missing or dump_all)),
         "dump_all": dump_all,
     }
+
+
+def filter_missing_compendium_items(
+    rows: list[dict[str, Any]],
+    question: str,
+) -> list[dict[str, Any]]:
+    """미보유 목록 꼬리질문 필터 (KHP/KP/키워드)."""
+    if not rows:
+        return []
+    q = (question or "").strip()
+    filtered = list(rows)
+
+    want_khp = any(k in q for k in ("KHP", "khp", "생약규격집", "약전외"))
+    want_kp = False
+    if not want_khp:
+        if re.search(r"(?<![A-Za-z])KP(?![A-Za-z])", q) or "대한민국약전" in q:
+            want_kp = True
+        elif "약전" in q and "규격집" not in q and "약전외" not in q:
+            want_kp = True
+
+    if want_khp:
+        filtered = [
+            r
+            for r in filtered
+            if (r.get("pharmacopoeia_kind") or "") == "KHP"
+            or "KHP" in str(r.get("pharmacopoeia_tag") or "").upper()
+            or "생약규격집" in str(r.get("pharmacopoeia") or "")
+        ]
+    elif want_kp:
+        filtered = [
+            r
+            for r in filtered
+            if (r.get("pharmacopoeia_kind") or "") == "KP"
+            or (
+                "KP" in str(r.get("pharmacopoeia_tag") or "")
+                and "KHP" not in str(r.get("pharmacopoeia_tag") or "").upper()
+            )
+        ]
+
+    stop = {
+        "그", "중", "중에", "만", "골라", "골라줘", "관련", "품목", "품목만", "있어", "있니",
+        "미보유", "부재", "전체", "모두", "알려줘", "보여줘", "리스트", "목록",
+        "공정서", "수재", "우선", "검토", "대상", "은", "는", "이", "가", "의",
+        "없는", "없는품목", "다", "좀", "해줘", "생약규격집", "약전외", "대한민국약전",
+        "약전", "kp", "khp", "KHP", "KP", "수재품목",
+    }
+    tokens = [
+        t
+        for t in re.split(r"[\s,./|?!~·\-_:;]+", q)
+        if t and len(t) >= 2 and t not in stop and t.upper() not in ("KP", "KHP")
+    ]
+    # 조사·접미 제거 (품목만 → 품목)
+    cleaned: list[str] = []
+    for t in tokens:
+        tt = re.sub(r"(만|은|는|이|가|을|를|의|도|만)$", "", t)
+        if tt and tt not in stop and len(tt) >= 2:
+            cleaned.append(tt)
+    tokens = cleaned
+    # 한글 실명 또는 의미 있는 영문 토큰만 이름 필터에 사용 (only/list 등과 공정서 구분 충돌 방지)
+    ascii_noise = {
+        "only", "just", "from", "with", "that", "this", "list", "show", "full",
+        "all", "the", "and", "for", "item", "items", "please",
+    }
+    name_tokens = [t for t in tokens if re.search(r"[가-힣]", t)] + [
+        t
+        for t in tokens
+        if t.isascii() and t.isalpha() and len(t) >= 3 and t.lower() not in ascii_noise
+    ]
+    if name_tokens:
+        out: list[dict[str, Any]] = []
+        for r in filtered:
+            blob = (
+                f"{r.get('name_ko') or ''}{r.get('name_en') or ''}"
+                f"{r.get('origin_ko') or ''}{r.get('origin_en') or ''}"
+            )
+            norm_blob = _norm_key(blob)
+            if any(
+                (t in blob) or (_norm_key(t) and _norm_key(t) in norm_blob)
+                for t in name_tokens
+            ):
+                out.append(r)
+        filtered = out
+    return filtered
+
+
+def attach_compendium_match_to_flags(
+    flags: dict[str, Any] | None,
+    match_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """ai_flags에 공정서 통계·미보유 전수를 붙여 챗봇 스냅샷과 동기화."""
+    out = dict(flags or {})
+    if not match_result:
+        out.setdefault("compendium_stats", {})
+        out.setdefault("missing_compendium_items", [])
+        return out
+    out["compendium_stats"] = match_result.get("stats") or {}
+    items = match_result.get("missing_items")
+    if items is None and match_result.get("missing"):
+        items = [
+            _missing_compendium_row(e, i) if isinstance(e, CompendiumEntry) else e
+            for i, e in enumerate(match_result["missing"], 1)
+        ]
+    out["missing_compendium_items"] = list(items or [])
+    return out
 
 
 def build_ai_prompt(
@@ -1727,6 +1852,9 @@ def build_ai_prompt(
         f"   {PRIORITY_FORMULA_KO}",
         "6. 모니터링 대상: 분양 가속도 급증 품목 + 정량 지표",
         "7. 현 재고 기준 분양금액 환산액(현재재고×가격): 전체·유형별·TOP20",
+        "8. 공정서 DB가 제공된 경우: '공정서 DB 매칭 및 수재 현황' 섹션을 반드시 포함 "
+        "(총 수재·보유 매칭·자동 보정 매칭·미보유 총 N건·대표 예시·챗봇 조회 안내). "
+        "미보유 전수 나열은 리포트에 넣지 말고 건수·예시·안내만 기입.",
         "",
         f"[연구과제 대량출고로 제외할 날짜] {', '.join(bulk_dates) if bulk_dates else '해당 없음'}",
         "",
@@ -1942,6 +2070,30 @@ def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
     ]
     for tname, tval in (valuation.get("by_type") or {}).items():
         lines.append(f"  · {tname}: {_fmt_money(tval)}")
+
+    comp_stats = flags.get("compendium_stats") or {}
+    missing_comp = flags.get("missing_compendium_items") or []
+    if comp_stats or missing_comp:
+        lines.append("")
+        lines.append("[스냅샷: 공정서 DB 매칭 통계]")
+        lines.append(
+            f"- 총 수재:{comp_stats.get('compendium_total', 0)} · "
+            f"보유매칭:{comp_stats.get('inventory_matched', 0)} · "
+            f"자동보정:{comp_stats.get('auto_corrected', 0)} · "
+            f"미보유:{comp_stats.get('missing_count', len(missing_comp))}"
+        )
+        lines.append(
+            f"[스냅샷: 공정서 미보유 품목 전수] {len(missing_comp)}건 "
+            "(생략 없음 · 1~N 전부 출력 · '등 N건' 금지)"
+        )
+        for i, r in enumerate(missing_comp, 1):
+            lines.append(
+                f"{i}. {r.get('name_ko') or r.get('name_en') or '-'} | "
+                f"영문:{r.get('name_en') or '-'} | "
+                f"공정서:{r.get('pharmacopoeia_kind') or r.get('pharmacopoeia') or '-'} | "
+                f"태그:{r.get('pharmacopoeia_tag') or '-'} | "
+                f"기원:{r.get('origin_ko') or '-'}"
+            )
 
     lines.append("")
     lines.append("[스냅샷: 소진 기간 카테고리 — 건수 요약]")
@@ -2166,6 +2318,7 @@ def query_live_inventory_context(
         or full_intent.get("depletion")
         or full_intent.get("manufacture")
         or full_intent.get("risk")
+        or full_intent.get("missing_compendium")
     ):
         pass  # keep full selected
     elif specific_hits and matched_items:
@@ -2188,6 +2341,30 @@ def query_live_inventory_context(
         format_kpi_dashboard_markdown(dashboard),
         "",
     ]
+
+    missing_all = list(flags.get("missing_compendium_items") or [])
+    # 미보유 꼬리질문/전수 — 스냅샷 정규화 목록을 즉시 필터
+    if full_intent.get("missing_compendium") or any(
+        k in q for k in ("미보유", "부재", "없는 품목", "없는품목")
+    ):
+        filtered_missing = filter_missing_compendium_items(missing_all, q)
+        lines.append(
+            "[공정서 미보유 출력 지시] 아래 목록만 근거로 답하세요. "
+            "1~N 번호 또는 마크다운 표로 생략 없이 출력하고 '등 N건'을 쓰지 마세요. "
+            f"필터 결과 {len(filtered_missing)}건 / 전체 미보유 {len(missing_all)}건."
+        )
+        lines.append(
+            f"[실시간: 공정서 미보유 필터 결과] {len(filtered_missing)}건 (생략 없음)"
+        )
+        for i, r in enumerate(filtered_missing, 1):
+            lines.append(
+                f"{i}. {r.get('name_ko') or r.get('name_en') or '-'} | "
+                f"영문:{r.get('name_en') or '-'} | "
+                f"공정서:{r.get('pharmacopoeia_kind') or r.get('pharmacopoeia') or '-'} | "
+                f"태그:{r.get('pharmacopoeia_tag') or '-'} | "
+                f"기원:{r.get('origin_ko') or '-'}"
+            )
+        lines.append("")
 
     if full_intent.get("wants_full"):
         lines.append(
@@ -2227,6 +2404,18 @@ def query_live_inventory_context(
             lines.append(_format_candidate_lines(mfg.get("표준생약") or [], full=True))
             lines.append("[실시간 전수: 차년도 제조검토 — 지표성분]")
             lines.append(_format_candidate_lines(mfg.get("지표성분") or [], full=True))
+            lines.append("")
+        if full_intent.get("missing_compendium") and missing_all:
+            lines.append(
+                f"[실시간 전수: 공정서 미보유 전체] {len(missing_all)}건 "
+                "(필터 없이 원본 전수 · 위 필터 결과와 구분)"
+            )
+            for i, r in enumerate(missing_all, 1):
+                lines.append(
+                    f"{i}. {r.get('name_ko') or r.get('name_en') or '-'} | "
+                    f"공정서:{r.get('pharmacopoeia_kind') or '-'} | "
+                    f"태그:{r.get('pharmacopoeia_tag') or '-'}"
+                )
             lines.append("")
 
     if hit_codes or hit_names:
@@ -2389,6 +2578,8 @@ def build_followup_prompt(
         "마크다운 표/불릿으로 빠짐없이 한 번에 출력하세요.",
         "- '등 N건', '일부만', '대표 예시'로 줄이지 말고, 없는 품목을 지어내지 마세요.",
         "- 출력 건수는 해당 섹션의 '전수 N건'과 반드시 일치해야 합니다.",
+        "- 공정서 미보유/부재/없는 품목 질문·꼬리질문(KHP만, 키워드 포함 등)은 "
+        "스냅샷·실시간의 '공정서 미보유' 필터 결과만 사용하세요.",
         f"- 이번 질문 전수 요청 감지: {full_intent}",
         "",
     ]
@@ -2604,12 +2795,50 @@ class CompendiumEntry:
 
 
 def _norm_key(s: Any) -> str:
-    """소문자·공백·구두점 제거 정규화 키."""
+    """소문자·공백·괄호·특수문자 제거 정규화 키 (차집합·퍼지 매칭용)."""
     if _is_empty(s):
         return ""
-    text = str(s).strip().lower()
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", str(s)).strip().lower()
+    # 괄호·구두점·공백·언더스코어 등 비문자 제거
     text = re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
     return text
+
+
+def _pharmacopoeia_kind(pharm: str) -> str:
+    """공정서 구분: KP / KHP / 기타."""
+    tag = _pharmacopoeia_tag_from_text(pharm)
+    if "KHP" in tag:
+        return "KHP"
+    if "KP" in tag and "KHP" not in tag:
+        return "KP"
+    if not pharm:
+        return ""
+    upper = str(pharm).upper()
+    if "KHP" in upper or "생약규격집" in str(pharm) or "약전외" in str(pharm):
+        return "KHP"
+    if re.search(r"(?<![A-Z])KP(?![A-Z])", upper) or "대한민국약전" in str(pharm):
+        return "KP"
+    return str(pharm).strip()[:24]
+
+
+def _missing_compendium_row(e: CompendiumEntry, index: int = 0) -> dict[str, Any]:
+    kind = _pharmacopoeia_kind(e.pharmacopoeia)
+    tag = _pharmacopoeia_tag_from_text(e.pharmacopoeia)
+    return {
+        "index": index,
+        "name_ko": e.name_ko,
+        "name_en": e.name_en,
+        "origin_ko": e.origin_ko,
+        "origin_en": e.origin_en,
+        "pharmacopoeia": e.pharmacopoeia,
+        "pharmacopoeia_kind": kind,
+        "pharmacopoeia_tag": tag,
+        "norm_ko": _norm_key(e.name_ko),
+        "norm_en": _norm_key(e.name_en),
+        "label": e.name_ko or e.name_en or f"entry-{index}",
+    }
 
 
 def _pick_column(columns: Sequence[str], keywords: Sequence[str]) -> Optional[str]:
@@ -2832,44 +3061,141 @@ def match_compendium_inventory(
     missing: list[CompendiumEntry] = [
         e for e in entries if id(e) not in matched_entry_ids
     ]
+    missing_items = [
+        _missing_compendium_row(e, i) for i, e in enumerate(missing, 1)
+    ]
+    auto_corrected = sum(
+        1 for c in corrections if c.get("match_type") and c.get("match_type") != "exact_ko"
+    )
+    exact_matched = sum(1 for c in corrections if c.get("match_type") == "exact_ko")
+    stats = {
+        "compendium_total": len(entries),
+        "inventory_matched": len(corrections),
+        "entries_matched": len(matched_entry_ids),
+        "exact_matched": exact_matched,
+        "auto_corrected": auto_corrected,
+        "missing_count": len(missing_items),
+    }
 
     return {
         "corrections": corrections,
         "missing": missing,
+        "missing_items": missing_items,
+        "stats": stats,
         "by_manage_no": by_manage_no,
         "by_label": by_label,
         "correction_count": len(corrections),
     }
 
 
-def format_compendium_match_report(match_result: dict[str, Any]) -> str:
-    """보정 매칭·미보유 공정서 표준품 보고 텍스트."""
-    corrections = match_result.get("corrections") or []
-    missing = match_result.get("missing") or []
+def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str:
+    """표준 리포트용 공정서 매칭·수재 현황 섹션 (동적 집계)."""
+    if not match_result:
+        return (
+            "## 공정서 DB 매칭 및 수재 현황\n\n"
+            "- 공정서 DB가 등록되지 않아 집계할 수 없습니다.\n"
+        )
+    stats = match_result.get("stats") or {}
+    missing_items = match_result.get("missing_items") or []
+    if not stats and match_result.get("missing") is not None:
+        # 구버전 결과 호환
+        missing = match_result.get("missing") or []
+        corrections = match_result.get("corrections") or []
+        stats = {
+            "compendium_total": len(missing) + len({id(c) for c in corrections}),
+            "inventory_matched": len(corrections),
+            "auto_corrected": sum(
+                1 for c in corrections if c.get("match_type") != "exact_ko"
+            ),
+            "missing_count": len(missing),
+        }
+        if not missing_items and missing:
+            missing_items = [
+                _missing_compendium_row(e, i) if isinstance(e, CompendiumEntry)
+                else e
+                for i, e in enumerate(missing, 1)
+            ]
+
+    total = int(stats.get("compendium_total") or 0)
+    held = int(stats.get("inventory_matched") or 0)
+    auto_n = int(stats.get("auto_corrected") or 0)
+    miss_n = int(stats.get("missing_count") or len(missing_items))
+    examples = []
+    for row in missing_items[:8]:
+        if isinstance(row, dict):
+            name = row.get("name_ko") or row.get("name_en") or row.get("label")
+            kind = row.get("pharmacopoeia_kind") or ""
+            if name:
+                examples.append(f"{name}" + (f"({kind})" if kind else ""))
+        else:
+            examples.append(getattr(row, "name_ko", None) or str(row))
+    ex_txt = ", ".join(examples) if examples else "(해당 없음)"
+
     lines = [
-        f"[공정서 매칭 보정] 총 {len(corrections)}건 보정 매칭 완료",
+        "## 공정서 DB 매칭 및 수재 현황",
+        "",
+        f"- 총 공정서 수재 품목 수: **{total}건**",
+        f"- 재고 엑셀 보유 매칭 품목 수: **{held}건**",
+        f"- 기원/영문명 자동 보정 매칭 품목 수: **{auto_n}건**",
+        f"- 공정서 수재 품목 중 미보유(부재) 품목 총 건수: **{miss_n}건**",
+        f"- 미보유 대표 예시: {ex_txt}",
+        "- 세부 전체 목록은 우측 챗봇에서 「공정서 미보유 품목 전체」로 조회 가능합니다.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def format_compendium_match_report(match_result: dict[str, Any]) -> str:
+    """보정 매칭·미보유 공정서 표준품 보고 텍스트 (표준 리포트 정식 섹션 포함)."""
+    corrections = match_result.get("corrections") or []
+    missing_items = match_result.get("missing_items") or []
+    if not missing_items and match_result.get("missing"):
+        missing_items = [
+            _missing_compendium_row(e, i) if isinstance(e, CompendiumEntry) else e
+            for i, e in enumerate(match_result["missing"], 1)
+        ]
+
+    lines = [
+        format_compendium_stats_markdown(match_result).rstrip(),
+        "",
+        "[표준 리포트 작성 지시] 위 '공정서 DB 매칭 및 수재 현황' 마크다운을 "
+        "리포트 본문에 수치 변경 없이 그대로 포함하세요. "
+        "미보유 전수 목록은 챗봇 조회용이며, 리포트에는 건수·대표 예시·챗봇 안내만 둡니다.",
+        "",
+        f"[공정서 매칭 보정 상세] 총 {len(corrections)}건",
     ]
     if corrections:
-        for i, c in enumerate(corrections, 1):
+        for i, c in enumerate(corrections[:30], 1):
             lines.append(
                 f"{i}. {c.get('stock_label')} ← {c.get('matched_name_ko') or c.get('matched_name_en')} "
                 f"(type={c.get('match_type')}) | 기원:{c.get('matched_origin_ko') or '-'} | "
                 f"공정서:{c.get('pharmacopoeia') or '-'}"
             )
+        if len(corrections) > 30:
+            lines.append(f"- … 보정 상세 외 {len(corrections) - 30}건 (스냅샷·챗봇 전수 참고)")
     else:
         lines.append("- 보정 매칭 없음")
 
     lines.append("")
-    lines.append(f"[미보유 공정서 표준품] ({len(missing)}건)")
-    if not missing:
+    lines.append(
+        f"[미보유 공정서 표준품 전수] {len(missing_items)}건 "
+        "(챗봇 '전체/모두' 요청 시 1~N 전부 출력)"
+    )
+    if not missing_items:
         lines.append("- 없음")
-    elif len(missing) > 40:
-        names = [e.name_ko or e.name_en for e in missing[:40]]
-        lines.append(f"- 총 {len(missing)}건 중 상위 40건: {', '.join(names)}")
-        lines.append(f"- … 외 {len(missing) - 40}건 생략")
     else:
-        for e in missing:
-            lines.append(f"- {e.name_ko or e.name_en}" + (f" / {e.name_en}" if e.name_ko and e.name_en else ""))
+        for i, row in enumerate(missing_items, 1):
+            if isinstance(row, dict):
+                ko = row.get("name_ko") or "-"
+                en = row.get("name_en") or ""
+                kind = row.get("pharmacopoeia_kind") or row.get("pharmacopoeia") or "-"
+                lines.append(
+                    f"{i}. {ko}"
+                    + (f" / {en}" if en else "")
+                    + f" | 공정서:{kind}"
+                )
+            else:
+                lines.append(f"{i}. {getattr(row, 'name_ko', row)}")
 
     return "\n".join(lines)
 
