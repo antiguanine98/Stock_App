@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.39
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.40
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.39"
+APP_VERSION = "v1.40"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [

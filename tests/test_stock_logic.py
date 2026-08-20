@@ -14,6 +14,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from stock_logic import (  # noqa: E402
+    StockItem,
     StockPoint,
     apply_retroactive_correction,
     build_ai_prompt,
@@ -428,6 +429,84 @@ def test_full_catalog_snapshot_and_intent():
         assert str(r.get("manage_no")) in live
 
 
+def test_markdown_report_renders_tables_as_html():
+    from stock_logic import (
+        format_kpi_dashboard_markdown,
+        markdown_report_to_collapsible_html,
+    )
+
+    md = format_kpi_dashboard_markdown(
+        {
+            "kpis": [
+                {"label": "대상품목 수", "display": "491종"},
+                {"label": "2년 내 소진예상", "display": "34종"},
+            ],
+            "summary_lines": ["요약 의견"],
+        }
+    )
+    html = markdown_report_to_collapsible_html(md)
+    assert "<table" in html
+    assert "<th" in html and "<td" in html
+    assert "491종" in html and "대상품목 수" in html
+    assert "| 지표 |" not in html
+    assert "| --- |" not in html
+
+
+def test_manufacture_candidates_always_top10_by_score():
+    """5년 이내 소진이 없어도 유형별 우선순위 상위 10건을 채운다."""
+    from stock_logic import select_manufacture_candidates
+
+    items: list[StockItem] = []
+    for i in range(12):
+        items.append(
+            StockItem(
+                manage_no=f"S{i:02d}",
+                name_ko=f"표준{i}",
+                std_type="표준생약",
+                corrected_points=[
+                    StockPoint(date(2020, 1, 1), 500),
+                    StockPoint(date(2021, 1, 1), 495),
+                    StockPoint(date(2022, 1, 1), 490),
+                    StockPoint(date(2023, 1, 1), 485),
+                    StockPoint(date(2024, 1, 1), 480 - i),
+                ],
+            )
+        )
+    for i in range(3):
+        items.append(
+            StockItem(
+                manage_no=f"M{i:02d}",
+                name_ko=f"지표{i}",
+                std_type="지표성분",
+                corrected_points=[
+                    StockPoint(date(2022, 1, 1), 100),
+                    StockPoint(date(2023, 1, 1), 80),
+                    StockPoint(date(2024, 1, 1), 50 - i),
+                ],
+            )
+        )
+    # 대조생약은 제외
+    items.append(
+        StockItem(
+            manage_no="C01",
+            name_ko="대조",
+            std_type="대조생약",
+            corrected_points=[
+                StockPoint(date(2023, 1, 1), 10),
+                StockPoint(date(2024, 1, 1), 1),
+            ],
+        )
+    )
+
+    result = select_manufacture_candidates(items)
+    assert len(result["표준생약"]) == 10
+    assert len(result["지표성분"]) == 3
+    scores = [r["priority_score"] for r in result["표준생약"]]
+    assert scores == sorted(scores, reverse=True)
+    assert all(not r.get("deplete_within_5y") for r in result["표준생약"])
+    assert "C01" not in {r["manage_no"] for r in result["표준생약"]}
+
+
 def test_compendium_missing_set_and_followup_filter():
     from stock_logic import (
         CompendiumEntry,
@@ -644,6 +723,8 @@ if __name__ == "__main__":
         test_decrease_only_excludes_increases,
         test_live_query_followup_uses_inventory,
         test_full_catalog_snapshot_and_intent,
+        test_markdown_report_renders_tables_as_html,
+        test_manufacture_candidates_always_top10_by_score,
         test_compendium_missing_set_and_followup_filter,
         test_compendium_db_not_timeseries,
         test_year_display_and_continuous_axis,

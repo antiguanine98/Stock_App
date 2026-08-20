@@ -1191,15 +1191,17 @@ def select_manufacture_candidates(
     items: list[StockItem],
     limit_per_type: int = MANUFACTURE_CANDIDATE_LIMIT,
 ) -> dict[str, list[dict[str, Any]]]:
-    """차년도 제조검토대상: 점수 높고 5년 이내 소진 예상 표준생약/지표성분."""
+    """차년도 제조검토대상: 표준생약·지표성분 각각 제조우선순위점수 상위 N건(기본 10).
+
+    5년 이내 소진 여부는 하드 필터가 아니라 결과에 표기만 한다.
+    해당 유형 품목이 N건 미만이면 전량을 반환한다.
+    """
     result: dict[str, list[dict[str, Any]]] = {"표준생약": [], "지표성분": []}
     scored: list[tuple[float, StockItem, dict[str, Any]]] = []
     for it in items:
         if it.std_type not in result:
             continue
         stats = estimate_depletion(it)
-        if not stats["deplete_within_5y"]:
-            continue
         scored.append((float(stats["priority_score"]), it, stats))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -1237,6 +1239,7 @@ def select_manufacture_candidates(
                 "years_left": stats["years_left"],
                 "deplete_ym": stats["deplete_ym"],
                 "depletion_category": stats["depletion_category"],
+                "deplete_within_5y": bool(stats.get("deplete_within_5y")),
                 "last_qty": it.last_qty,
                 "acceleration": stats["acceleration"],
             }
@@ -1847,7 +1850,8 @@ def build_ai_prompt(
         "3. 데이터 신뢰도 등급 A~D (수집 횟수·관측 간격). D/부족은 '신뢰도 낮음(데이터 부족)'으로 명시",
         "4. 분양 가속도(급가속/증가/안정/감소) 및 장기 저분양·과다재고 품목(차기 제조 수량 하향 권고)",
         f"   ({ACCELERATION_FORMULA_KO})",
-        "5. 차년도 제조검토대상: 제조우선순위점수 상위 · 5년 이내 소진 표준생약·지표성분 각 10종 순위표",
+        "5. 차년도 제조검토대상: 제조우선순위점수 상위 표준생약·지표성분 각 10종 순위표 "
+        "(5년 이내 소진 여부와 무관하게 항상 상위 10건; 해당 유형이 10건 미만이면 전량)",
         "   ※ 제조 우선순위 섹션 서두에 아래 산출 공식·가중치를 그대로 인용해 명시할 것:",
         f"   {PRIORITY_FORMULA_KO}",
         "6. 모니터링 대상: 분양 가속도 급증 품목 + 정량 지표",
@@ -2644,6 +2648,75 @@ def _md_inline_to_html(text: str) -> str:
     return esc
 
 
+_MD_TABLE_SEP_RE = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
+
+
+def _is_md_table_row(line: str) -> bool:
+    s = line.strip()
+    return s.startswith("|") and "|" in s[1:]
+
+
+def _is_md_table_sep(line: str) -> bool:
+    return bool(_MD_TABLE_SEP_RE.match(line.strip()))
+
+
+def _parse_md_table_cells(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _md_table_rows_to_html(table_lines: list[str]) -> str:
+    """연속된 마크다운 표 행을 HTML <table>로 변환."""
+    if not table_lines:
+        return ""
+    rows: list[list[str]] = []
+    header: list[str] | None = None
+    for i, line in enumerate(table_lines):
+        if _is_md_table_sep(line):
+            if i == 1 and rows:
+                header = rows.pop(0)
+            continue
+        cells = _parse_md_table_cells(line)
+        if cells:
+            rows.append(cells)
+
+    parts = [
+        '<table class="md-table" cellspacing="0" cellpadding="0" '
+        'style="border-collapse:collapse;width:100%;max-width:560px;'
+        'margin:8px 0 14px;font-size:10.5pt;">'
+    ]
+    if header:
+        parts.append("<thead><tr>")
+        for cell in header:
+            parts.append(
+                '<th style="border:1px solid #cbd5e1;background:#e8eef7;'
+                'padding:7px 12px;text-align:left;font-weight:600;">'
+                f"{_md_inline_to_html(cell)}</th>"
+            )
+        parts.append("</tr></thead>")
+    parts.append("<tbody>")
+    for ri, row in enumerate(rows):
+        bg = "#ffffff" if ri % 2 == 0 else "#f8fafc"
+        parts.append("<tr>")
+        for ci, cell in enumerate(row):
+            align = "right" if ci == len(row) - 1 and len(row) == 2 else "left"
+            weight = "600" if ci == len(row) - 1 and len(row) == 2 else "400"
+            parts.append(
+                f'<td style="border:1px solid #cbd5e1;background:{bg};'
+                f'padding:6px 12px;text-align:{align};font-weight:{weight};">'
+                f"{_md_inline_to_html(cell)}</td>"
+            )
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
 def _collapse_comma_items_html(
     body: str,
     preview_n: int,
@@ -2686,6 +2759,8 @@ def markdown_report_to_collapsible_html(
     out: list[str] = []
     in_ul = False
     section_i = 0
+    lines = md_text.splitlines()
+    i = 0
 
     def _next_section() -> str:
         nonlocal section_i
@@ -2705,11 +2780,22 @@ def markdown_report_to_collapsible_html(
             body, preview_n, section_id=sid, expanded=sid in expanded
         )
 
-    for raw in md_text.splitlines():
-        line = raw.rstrip()
+    while i < len(lines):
+        line = lines[i].rstrip()
         if not line.strip():
             _close_ul()
             out.append("<br/>")
+            i += 1
+            continue
+
+        # 마크다운 표 블록 → HTML table (파이프 raw 텍스트 방지)
+        if _is_md_table_row(line):
+            _close_ul()
+            block: list[str] = []
+            while i < len(lines) and _is_md_table_row(lines[i].rstrip()):
+                block.append(lines[i].rstrip())
+                i += 1
+            out.append(_md_table_rows_to_html(block))
             continue
 
         hm = re.match(r"^(#{1,4})\s+(.*)$", line.strip())
@@ -2717,6 +2803,7 @@ def markdown_report_to_collapsible_html(
             _close_ul()
             level = len(hm.group(1))
             out.append(f"<h{level}>{_md_inline_to_html(hm.group(2))}</h{level}>")
+            i += 1
             continue
 
         lm = re.match(r"^(\s*[-*+]|\s*\d+\.)\s+(.*)$", line)
@@ -2739,6 +2826,7 @@ def markdown_report_to_collapsible_html(
             else:
                 inner = _md_inline_to_html(content)
             out.append(f"<li>{inner}</li>")
+            i += 1
             continue
 
         _close_ul()
@@ -2749,8 +2837,10 @@ def markdown_report_to_collapsible_html(
                     f"<p>{_md_inline_to_html(prefix)}: "
                     f"{_maybe_collapse(rest.strip())}</p>"
                 )
+                i += 1
                 continue
         out.append(f"<p>{_md_inline_to_html(line)}</p>")
+        i += 1
 
     _close_ul()
     style = (
