@@ -946,10 +946,10 @@ def depletion_bucket(years_left: Optional[float], *, stock_zero: bool = False) -
 
 
 def format_deplete_ym(last_date: date, years_left: float) -> str:
-    """현재 추세 기준 예상 소진 시점 — 소진예상일시(YYYY년 MM월 기준)."""
+    """현재 추세 기준 예상 소진 시점 — YYYY년 MM월."""
     days = max(0, int(round(years_left * 365.25)))
     target = last_date + timedelta(days=days)
-    return f"소진예상일시({target.year}년 {target.month:02d}월 기준)"
+    return f"{target.year}년 {target.month:02d}월"
 
 
 def _priority_components(
@@ -1971,11 +1971,12 @@ def build_ai_prompt(
         "3. 사전 산출 목록·수치를 임의로 바꾸지 마세요.",
         "4. 소진 예상 목록·미보유 목록·제조 검토 대상 등 목록성 데이터는 "
         "접기/토글 없이 마크다운 표로 전수 나열하세요. 재고량은 정수만 표기하고, "
-        "소진 시점은 '소진예상일시(YYYY년 MM월 기준)' 형식을 유지하세요.",
+        "소진 시점은 'YYYY년 MM월' 형식만 사용하세요 (예: 2027년 03월). "
+        "'소진예상일시', '기준' 등 부가 문구는 붙이지 마세요.",
         "",
         "[분석 요청 항목]",
         "1. 품목별 분양 속도(빠름/보통/느림) — 증가 구간 제외 속도 사용",
-        "2. 소진 예상 시점을 '소진예상일시(YYYY년 MM월 기준)'로 명시하고 "
+        "2. 소진 예상 시점을 'YYYY년 MM월'로만 명시하고 "
         "카테고리 마크다운 표로 전수 목록화:",
         "   [1년 이내] / [2년 이내] / [3년 이내] / [4년 이내] / [5년 이내] / "
         "[5년 초과/안정] / [재고 없음(미보유)]",
@@ -2205,7 +2206,8 @@ def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
         "[전수 목록 규칙] 아래 마크다운 표는 요약·생략 없이 전부 수록되어 있습니다. "
         "사용자가 전체/모두/전수/N건·미보유·1년 이내 소진 목록을 요청하면 "
         "해당 표를 그대로 출력하세요. '등 N건'·일부만 나열·환각 추가를 금지합니다. "
-        "재고량은 정수, 소진 시점은 '소진예상일시(YYYY년 MM월 기준)' 형식을 유지하세요.",
+        "재고량은 정수, 소진 시점은 'YYYY년 MM월'만 표기하세요 "
+        "(예: 2027년 03월. '소진예상일시'·'기준' 문구 금지).",
         f"- by_code 품목 수: {len(by_code)}",
         f"- 5년 이내 소진 후보: {len(flags.get('deplete_codes') or [])}건",
         f"- 가속(급가속/증가) 후보: {len(flags.get('surge_codes') or [])}건",
@@ -2709,7 +2711,7 @@ def build_followup_prompt(
         "- 사용자가 '전체/모두/전수/전량/리스트/목록/N건 모두' 등을 요청하면, "
         "초기 리포트의 '… 등 N건' 요약만 반복하지 마세요.",
         "- '공정서 수재 품목 중 미보유 표준품 목록/개수', '1년 이내 소진 예상 목록' 질문 시 "
-        "스냅샷·실시간의 해당 마크다운 표를 정수 재고량·소진예상일시 포함으로 누락 없이 출력하세요.",
+        "스냅샷·실시간의 해당 마크다운 표를 정수 재고량·소진시점(YYYY년 MM월) 포함으로 누락 없이 출력하세요.",
         "- 접기/토글 없이 마크다운 표로 1~N 전수 출력. '등 N건'·임의 생략·없는 품목 추가 금지.",
         "- 출력 건수는 해당 섹션의 '전수 N건'과 반드시 일치해야 합니다.",
         "- 공정서 미보유/부재 꼬리질문(KHP만, 키워드 포함 등)은 "
@@ -2875,6 +2877,79 @@ def _collapse_comma_items_html(
         f"<a href=\"#expand:{section_id}\" style=\"{link_style}\">"
         f"▶ 전체 {n}개 품목 펼쳐보기</a>"
     )
+
+
+def split_markdown_report_sections(md_text: str) -> list[dict[str, str]]:
+    """마크다운 리포트를 ## 헤딩 기준 섹션으로 분리.
+
+    Returns:
+        [{"id", "title", "short", "markdown"}, ...]
+        본문 앞에 헤딩이 없으면 '서두' 섹션으로 묶음.
+    """
+    text = (md_text or "").strip()
+    if not text:
+        return []
+
+    lines = text.splitlines()
+    sections: list[dict[str, str]] = []
+    cur_title = "서두"
+    cur_lines: list[str] = []
+
+    def _flush() -> None:
+        nonlocal cur_title, cur_lines
+        body = "\n".join(cur_lines).strip()
+        if not body and cur_title == "서두":
+            cur_lines = []
+            return
+        if not body:
+            body = f"## {cur_title}\n\n(내용 없음)"
+        elif not body.lstrip().startswith("#"):
+            body = f"## {cur_title}\n\n{body}"
+        sections.append(
+            {
+                "id": f"s{len(sections)}",
+                "title": cur_title,
+                "short": _report_section_short_label(cur_title),
+                "markdown": body,
+            }
+        )
+        cur_lines = []
+
+    for line in lines:
+        hm = re.match(r"^##\s+(.+)$", line.strip())
+        if hm:
+            _flush()
+            cur_title = hm.group(1).strip()
+            cur_lines = [line]
+        else:
+            cur_lines.append(line)
+    _flush()
+    return sections
+
+
+def _report_section_short_label(title: str) -> str:
+    """사이드 버튼용 짧은 라벨."""
+    t = re.sub(r"\([^)]*\)", "", title or "").strip()
+    t = re.sub(r"[#*_`]", "", t).strip()
+    mapping = (
+        ("대시보드", "요약"),
+        ("KPI", "요약"),
+        ("요약", "요약"),
+        ("소진", "소진"),
+        ("제조", "제조"),
+        ("모니터링", "가속"),
+        ("가속", "가속"),
+        ("공정서", "공정서"),
+        ("매칭", "공정서"),
+        ("신뢰", "신뢰"),
+        ("환산", "환산"),
+        ("저분양", "저분양"),
+    )
+    for key, short in mapping:
+        if key in t:
+            return short
+    compact = re.sub(r"\s+", "", t)
+    return compact[:3] if compact else "기타"
 
 
 def markdown_report_to_collapsible_html(

@@ -423,6 +423,25 @@ def test_full_catalog_snapshot_and_intent():
         assert str(r.get("manage_no")) in live
 
 
+def test_split_markdown_report_sections():
+    from stock_logic import split_markdown_report_sections, _report_section_short_label
+
+    md = (
+        "## 1페이지 요약 대시보드 (핵심 KPI)\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
+        "## 소진 예상 기간\n\n내용A\n\n"
+        "## 차년도 제조검토대상\n\n내용B\n\n"
+        "## 공정서 DB 매칭 및 수재 현황\n\n내용C\n"
+    )
+    secs = split_markdown_report_sections(md)
+    assert len(secs) == 4
+    assert secs[0]["short"] == "요약"
+    assert secs[1]["short"] == "소진"
+    assert secs[2]["short"] == "제조"
+    assert secs[3]["short"] == "공정서"
+    assert "내용A" in secs[1]["markdown"]
+    assert _report_section_short_label("모니터링 대상") == "가속"
+
+
 def test_markdown_report_renders_tables_as_html():
     from stock_logic import (
         format_kpi_dashboard_markdown,
@@ -718,6 +737,7 @@ if __name__ == "__main__":
         test_live_query_followup_uses_inventory,
         test_full_catalog_snapshot_and_intent,
         test_markdown_report_renders_tables_as_html,
+        test_split_markdown_report_sections,
         test_manufacture_candidates_always_top10_by_score,
         test_compendium_missing_set_and_followup_filter,
         test_compendium_db_not_timeseries,

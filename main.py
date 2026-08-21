@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.41
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.42
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QCompleter,
     QFrame,
@@ -76,6 +77,7 @@ from stock_logic import (
     match_compendium_inventory,
     process_excel,
     process_excels,
+    split_markdown_report_sections,
 )
 
 matplotlib.use("QtAgg")
@@ -107,7 +109,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.41"
+APP_VERSION = "v1.42"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -264,6 +266,27 @@ QPushButton#primaryBtn:hover { background-color: #0d9488; }
 QPushButton#primaryBtn:disabled {
     background-color: #94a3b8;
     color: #e2e8f0;
+}
+QPushButton#reportNavBtn {
+    background-color: #eef3f9;
+    color: #1e3a5f;
+    border: 1px solid #c5d0de;
+    border-radius: 12px;
+    min-width: 42px;
+    max-width: 46px;
+    padding: 10px 4px;
+    font-weight: 700;
+    font-size: 11px;
+    text-align: center;
+}
+QPushButton#reportNavBtn:hover {
+    background-color: #dce6f2;
+    border-color: #1e3a5f;
+}
+QPushButton#reportNavBtn:checked {
+    background-color: #1e3a5f;
+    color: #ffffff;
+    border-color: #152a45;
 }
 QTabWidget::pane {
     border: 1px solid #d8e0ea;
@@ -1062,6 +1085,8 @@ class MainWindow(QMainWindow):
         self._loaded_paths: list[str] = []
         self._chat_history: list[dict[str, str]] = []
         self._initial_report: str = ""
+        self._report_sections: list[dict[str, str]] = []
+        self._report_section_key: str = "all"  # "all" | section id
         self._report_expanded_ids: set[str] = set()
         self._chat_busy = False
         self.compendium_df = None
@@ -1393,6 +1418,40 @@ class MainWindow(QMainWindow):
         self.report_find_bar.hide()
         left_layout.addWidget(self.report_find_bar)
 
+        report_body = QWidget()
+        report_body_row = QHBoxLayout(report_body)
+        report_body_row.setContentsMargins(0, 0, 0, 0)
+        report_body_row.setSpacing(8)
+
+        # 좌측 주황색 섹션 버튼 (세로 탭)
+        nav_wrap = QWidget()
+        nav_wrap.setFixedWidth(52)
+        nav_outer = QVBoxLayout(nav_wrap)
+        nav_outer.setContentsMargins(0, 0, 0, 0)
+        nav_outer.setSpacing(0)
+        self.report_nav_scroll = QScrollArea()
+        self.report_nav_scroll.setWidgetResizable(True)
+        self.report_nav_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.report_nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.report_nav_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+        )
+        self.report_nav_host = QWidget()
+        self.report_nav_layout = QVBoxLayout(self.report_nav_host)
+        self.report_nav_layout.setContentsMargins(2, 2, 2, 2)
+        self.report_nav_layout.setSpacing(8)
+        self.report_nav_layout.addStretch(1)
+        self.report_nav_scroll.setWidget(self.report_nav_host)
+        nav_outer.addWidget(self.report_nav_scroll, stretch=1)
+        report_body_row.addWidget(nav_wrap, stretch=0)
+
+        self._report_nav_group = QButtonGroup(self)
+        self._report_nav_group.setExclusive(True)
+        self._report_nav_group.idClicked.connect(self._on_report_nav_clicked)
+        self._report_nav_buttons: dict[str, QPushButton] = {}
+
         self.report_fixed = QTextBrowser()
         self.report_fixed.setReadOnly(True)
         self.report_fixed.setOpenExternalLinks(False)
@@ -1406,9 +1465,11 @@ class MainWindow(QMainWindow):
         )
         self.report_fixed.setFont(QFont("Malgun Gothic", 10))
         self.report_fixed.setStyleSheet(
-            "QTextBrowser { padding: 12px; line-height: 1.65; font-family: 'Malgun Gothic'; font-size: 10.5pt; }"
+            "QTextBrowser { padding: 12px; line-height: 1.65; font-family: 'Malgun Gothic'; font-size: 10.5pt; "
+            "border: 1px solid #d8e0ea; border-radius: 10px; background: #ffffff; }"
         )
-        left_layout.addWidget(self.report_fixed, stretch=1)
+        report_body_row.addWidget(self.report_fixed, stretch=1)
+        left_layout.addWidget(report_body, stretch=1)
 
         self._report_find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self.report_fixed)
         self._report_find_shortcut.activated.connect(self._show_report_find_bar)
@@ -1795,10 +1856,13 @@ class MainWindow(QMainWindow):
         self.inventory_data = None
         self._chat_history.clear()
         self._initial_report = ""
+        self._report_sections = []
+        self._report_section_key = "all"
         self._report_expanded_ids.clear()
         self._chat_busy = False
         self._set_chat_enabled(False)
         self.report_fixed.clear()
+        self._clear_report_nav()
         self.chat_view.clear()
         self.table.clear()
         self.table.setRowCount(0)
@@ -1846,9 +1910,12 @@ class MainWindow(QMainWindow):
         self._refresh_compendium_match()
         self._chat_history.clear()
         self._initial_report = ""
+        self._report_sections = []
+        self._report_section_key = "all"
         self._report_expanded_ids.clear()
         self._set_chat_enabled(False)
         self.report_fixed.clear()
+        self._clear_report_nav()
         self.chat_view.clear()
         changed = sum(1 for it in data["items"] if it["has_change"])
         deplete_n = len(data["ai_flags"].get("deplete_codes") or [])
@@ -2165,14 +2232,95 @@ class MainWindow(QMainWindow):
         self.report_fixed.setExtraSelections([])
         self.report_fixed.setFocus()
 
+    def _vertical_nav_label(self, text: str) -> str:
+        """주황색 사이드 버튼용 세로 글자 배치."""
+        chars = [c for c in (text or "").strip() if not c.isspace()]
+        if not chars:
+            return "·"
+        return "\n".join(chars[:4])
+
+    def _clear_report_nav(self) -> None:
+        for btn in list(self._report_nav_buttons.values()):
+            self._report_nav_group.removeButton(btn)
+            btn.deleteLater()
+        self._report_nav_buttons.clear()
+        while self.report_nav_layout.count():
+            item = self.report_nav_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.report_nav_layout.addStretch(1)
+
+    def _rebuild_report_nav(self) -> None:
+        """리포트 ## 섹션 기준 주황색 사이드 버튼 재구성."""
+        self._clear_report_nav()
+        if not self._report_sections and not self._initial_report:
+            return
+
+        # stretch 제거 후 버튼 추가
+        while self.report_nav_layout.count():
+            self.report_nav_layout.takeAt(0)
+
+        entries: list[tuple[str, str, str]] = [("all", "전체", "전체 리포트")]
+        for sec in self._report_sections:
+            entries.append(
+                (sec["id"], sec.get("short") or "항목", sec.get("title") or "")
+            )
+
+        for i, (key, short, tip) in enumerate(entries):
+            btn = QPushButton(self._vertical_nav_label(short))
+            btn.setObjectName("reportNavBtn")
+            btn.setCheckable(True)
+            btn.setToolTip(tip or short)
+            btn.setProperty("section_key", key)
+            btn.setMinimumHeight(max(56, 14 * min(4, len(short))))
+            self._report_nav_group.addButton(btn, i)
+            self._report_nav_buttons[key] = btn
+            self.report_nav_layout.addWidget(btn)
+
+        self.report_nav_layout.addStretch(1)
+
+        # 기본: 첫 섹션(있으면) 또는 전체
+        default_key = (
+            self._report_sections[0]["id"] if self._report_sections else "all"
+        )
+        if self._report_section_key not in self._report_nav_buttons:
+            self._report_section_key = default_key
+        btn = self._report_nav_buttons.get(self._report_section_key)
+        if btn is not None:
+            btn.setChecked(True)
+
+    def _on_report_nav_clicked(self, btn_id: int) -> None:
+        btn = self._report_nav_group.button(btn_id)
+        if btn is None:
+            return
+        key = btn.property("section_key")
+        if key:
+            self._report_section_key = str(key)
+            self._render_report_html()
+
     def _render_report_html(self) -> None:
-        """표준 리포트를 QTextBrowser용 HTML로 다시 그린다 (접기/펼치기 상태 반영)."""
+        """표준 리포트를 섹션 버튼 선택에 맞춰 HTML로 표시."""
         if not self._initial_report:
             self.report_fixed.clear()
+            self._clear_report_nav()
+            self._report_sections = []
             return
+
+        if not self._report_sections:
+            self._report_sections = split_markdown_report_sections(self._initial_report)
+            self._rebuild_report_nav()
+
+        md = self._initial_report
+        if self._report_section_key != "all":
+            for sec in self._report_sections:
+                if sec["id"] == self._report_section_key:
+                    md = sec["markdown"]
+                    break
+
         self.report_fixed.setHtml(
             markdown_report_to_collapsible_html(
-                self._initial_report,
+                md,
                 expanded_ids=self._report_expanded_ids,
             )
         )
@@ -2279,8 +2427,11 @@ class MainWindow(QMainWindow):
         data["ai_flags"] = attach_compendium_match_to_flags(data.get("ai_flags"), match)
         self._chat_history.clear()
         self._initial_report = ""
+        self._report_sections = []
+        self._report_section_key = "all"
         self._report_expanded_ids.clear()
         self.report_fixed.clear()
+        self._clear_report_nav()
         self._set_chat_enabled(False)
         if not changed:
             self.chat_view.setMarkdown(
@@ -2352,6 +2503,11 @@ class MainWindow(QMainWindow):
         self._chat_history.clear()
         self._initial_report = text
         self._report_expanded_ids.clear()
+        self._report_sections = split_markdown_report_sections(text)
+        self._report_section_key = (
+            self._report_sections[0]["id"] if self._report_sections else "all"
+        )
+        self._rebuild_report_nav()
         self._render_report_html()
         self.chat_view.setMarkdown(
             "*표준 분석 리포트가 왼쪽에 준비되었습니다. 추가 질문을 입력해 주세요.*"
