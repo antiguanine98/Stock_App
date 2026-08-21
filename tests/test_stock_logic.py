@@ -429,16 +429,22 @@ def test_split_markdown_report_sections():
     md = (
         "## 1페이지 요약 대시보드 (핵심 KPI)\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
         "## 소진 예상 기간\n\n내용A\n\n"
+        "### 재고 없음(미보유)\n\n제로품목\n\n"
         "## 차년도 제조검토대상\n\n내용B\n\n"
-        "## 공정서 DB 매칭 및 수재 현황\n\n내용C\n"
+        "## 공정서 DB 매칭 및 수재 현황\n\n"
+        "### 공정서 미보유 표준품 전수\n\n지황\n"
     )
     secs = split_markdown_report_sections(md)
-    assert len(secs) == 4
-    assert secs[0]["short"] == "요약"
-    assert secs[1]["short"] == "소진"
-    assert secs[2]["short"] == "검토"
-    assert secs[3]["short"] == "공정서"
-    assert "내용A" in secs[1]["markdown"]
+    by_id = {s["id"]: s for s in secs}
+    assert by_id["summary"]["short"] == "요약"
+    assert by_id["deplete"]["short"] == "소진"
+    assert by_id["missing"]["short"] == "미보유"
+    assert "제로품목" in by_id["missing"]["markdown"] or "지황" in by_id["missing"]["markdown"]
+    assert by_id["manufacture"]["short"] == "검토"
+    assert "내용B" in by_id["manufacture"]["markdown"]
+    assert by_id["compendium"]["short"] == "공정서"
+    # 고정 버튼용 섹션은 본문 없어도 항상 존재
+    assert by_id["accel"]["short"] == "가속"
     assert _report_section_short_label("모니터링 대상") == "가속"
     assert _report_section_short_label("재고 없음(미보유)") == "미보유"
     assert _report_section_short_label("차년도 제조검토대상") == "검토"
@@ -454,7 +460,9 @@ def test_markdown_report_renders_tables_as_html():
         {
             "kpis": [
                 {"label": "대상품목 수", "display": "491종"},
-                {"label": "2년 내 소진예상", "display": "34종"},
+                {"label": "1년 내 소진예상", "display": "10종"},
+                {"label": "1~3년 소진예상", "display": "20종"},
+                {"label": "3~5년 소진예상", "display": "14종"},
             ],
             "summary_lines": ["요약 의견"],
         }

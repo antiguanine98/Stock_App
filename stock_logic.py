@@ -1442,14 +1442,36 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
     flags = flags or {}
     valuation = flags.get("valuation") or compute_inventory_valuation(items)
     by_code = flags.get("by_code") or {}
+    category_items = flags.get("depletion_category_items") or {}
 
     managed = len(items)
-    deplete_2y = 0
-    # deplete_codes가 없으면 직접 집계 (estimate_depletion과 동일 기준)
-    if flags.get("deplete_codes") is not None:
-        deplete_5y = len(flags.get("deplete_codes") or [])
+    # 소진 예상: 1년 내 / 1~3년 / 3~5년 (상호 배타 구간, 재고 0 제외)
+    deplete_1y = 0
+    deplete_1_3y = 0
+    deplete_3_5y = 0
+    if category_items:
+        deplete_1y = len(category_items.get("1년 이내") or [])
+        deplete_1_3y = len(category_items.get("2년 이내") or []) + len(
+            category_items.get("3년 이내") or []
+        )
+        deplete_3_5y = len(category_items.get("4년 이내") or []) + len(
+            category_items.get("5년 이내") or []
+        )
     else:
-        deplete_5y = 0
+        for it in items:
+            stats = by_code.get(it.manage_no) or estimate_depletion(it)
+            if stats.get("stock_zero") or is_zero_stock(it):
+                continue
+            yl = stats.get("years_left")
+            if not isinstance(yl, (int, float)):
+                continue
+            if yl <= 1:
+                deplete_1y += 1
+            elif yl <= 3:
+                deplete_1_3y += 1
+            elif yl <= 5:
+                deplete_3_5y += 1
+
     accel_n = 0
     low_n = 0
     grade_ab = 0
@@ -1457,10 +1479,6 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
         stats = by_code.get(it.manage_no) or estimate_depletion(it)
         if stats.get("stock_zero") or is_zero_stock(it):
             continue
-        if stats.get("deplete_within_2y"):
-            deplete_2y += 1
-        if flags.get("deplete_codes") is None and stats.get("deplete_within_5y"):
-            deplete_5y += 1
         if stats.get("acceleration") in ("급가속", "증가"):
             accel_n += 1
         if stats.get("long_term_low"):
@@ -1470,6 +1488,7 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
             grade_ab += 1
 
     zero_n = sum(1 for it in items if is_zero_stock(it))
+    deplete_5y_total = deplete_1y + deplete_1_3y + deplete_3_5y
 
     mfg = flags.get("manufacture_candidates")
     if mfg is None:
@@ -1481,8 +1500,9 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
     kpis = [
         {"key": "managed", "label": "대상품목 수", "value": managed, "display": f"{managed}종"},
         {"key": "zero_stock", "label": "재고 없음(미보유)", "value": zero_n, "display": f"{zero_n}종"},
-        {"key": "deplete_2y", "label": "2년 내 소진예상", "value": deplete_2y, "display": f"{deplete_2y}종"},
-        {"key": "deplete_5y", "label": "5년 내 소진예상", "value": deplete_5y, "display": f"{deplete_5y}종"},
+        {"key": "deplete_1y", "label": "1년 내 소진예상", "value": deplete_1y, "display": f"{deplete_1y}종"},
+        {"key": "deplete_1_3y", "label": "1~3년 소진예상", "value": deplete_1_3y, "display": f"{deplete_1_3y}종"},
+        {"key": "deplete_3_5y", "label": "3~5년 소진예상", "value": deplete_3_5y, "display": f"{deplete_3_5y}종"},
         {"key": "manufacture", "label": "제조 우선검토 수", "value": mfg_n, "display": f"{mfg_n}종"},
         {"key": "accel", "label": "분양 가속 품목 수", "value": accel_n, "display": f"{accel_n}종"},
         {"key": "low_dist", "label": "장기 저분양 품목 수", "value": low_n, "display": f"{low_n}종"},
@@ -1509,7 +1529,8 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
     summary_lines = [
         f"대상 품목 {managed}종을 기준으로 재고·분양 지표를 산출했습니다.",
         f"재고 없음(미보유) {zero_n}종은 소진 위험군에서 제외했습니다.",
-        f"2년 내 소진 예상 {deplete_2y}종, 5년 내 소진 예상 {deplete_5y}종이며 제조 우선검토 후보는 {mfg_n}종입니다.",
+        f"소진 예상: 1년 내 {deplete_1y}종 · 1~3년 {deplete_1_3y}종 · 3~5년 {deplete_3_5y}종 "
+        f"(5년 이내 합계 {deplete_5y_total}종), 제조 우선검토 후보는 {mfg_n}종입니다.",
         f"분양 가속도(급가속·증가) 품목은 {accel_n}종, 장기 저분양/과다재고 후보는 {low_n}종입니다.",
         f"현 재고 기준 분양금액 환산 총액은 {_fmt_money(total_value)}입니다"
         + (
@@ -1972,7 +1993,9 @@ def build_ai_prompt(
         "4. 소진 예상 목록·미보유 목록·제조 검토 대상 등 목록성 데이터는 "
         "접기/토글 없이 마크다운 표로 전수 나열하세요. 재고량은 정수만 표기하고, "
         "소진 시점은 'YYYY년 MM월' 형식만 사용하세요 (예: 2027년 03월). "
-        "'소진예상일시', '기준' 등 부가 문구는 붙이지 마세요.",
+        "'소진예상일시', '기준' 등 부가 문구는 붙이지 마세요. "
+        "섹션 제목은 반드시 ## 헤딩으로 분리하세요: "
+        "'## 소진 예상', '## 미보유', '## 차년도 제조검토', '## 공정서 DB 매칭' 등.",
         "",
         "[분석 요청 항목]",
         "1. 품목별 분양 속도(빠름/보통/느림) — 증가 구간 제외 속도 사용",
@@ -2879,78 +2902,114 @@ def _collapse_comma_items_html(
     )
 
 
-def split_markdown_report_sections(md_text: str) -> list[dict[str, str]]:
-    """마크다운 리포트를 ## 헤딩 기준 섹션으로 분리.
+CANONICAL_REPORT_NAV = (
+    # (key, short_label, title_keywords) — 앞쪽 키워드 우선
+    ("summary", "요약", ("대시보드", "KPI", "요약")),
+    ("deplete", "소진", ("소진 예상", "소진기간", "소진 기간", "소진구간", "소진")),
+    ("missing", "미보유", ("미보유", "재고 없음", "재고없음", "부재")),
+    ("manufacture", "검토", ("제조검토", "제조 검토", "우선검토", "제조")),
+    ("accel", "가속", ("모니터링", "급가속", "분양 가속", "가속")),
+    ("compendium", "공정서", ("공정서", "수재", "매칭")),
+)
 
-    Returns:
-        [{"id", "title", "short", "markdown"}, ...]
-        본문 앞에 헤딩이 없으면 '서두' 섹션으로 묶음.
+
+def split_markdown_report_sections(md_text: str) -> list[dict[str, str]]:
+    """마크다운 리포트를 고정 사이드 버튼(요약·소진·미보유·검토 등) 기준으로 묶음.
+
+    ## / ### 헤딩을 모두 수집해 키워드로 분류하고, 버튼용 섹션은 항상 반환한다.
     """
     text = (md_text or "").strip()
-    if not text:
-        return []
+    buckets: dict[str, list[str]] = {key: [] for key, _, _ in CANONICAL_REPORT_NAV}
+    other: list[str] = []
 
-    lines = text.splitlines()
-    sections: list[dict[str, str]] = []
-    cur_title = "서두"
-    cur_lines: list[str] = []
+    if text:
+        lines = text.splitlines()
+        cur_key: str | None = None
+        cur_lines: list[str] = []
 
-    def _flush() -> None:
-        nonlocal cur_title, cur_lines
-        body = "\n".join(cur_lines).strip()
-        if not body and cur_title == "서두":
+        def _flush() -> None:
+            nonlocal cur_key, cur_lines
+            body = "\n".join(cur_lines).strip()
+            if not body:
+                cur_lines = []
+                return
+            if cur_key and cur_key in buckets:
+                buckets[cur_key].append(body)
+            else:
+                other.append(body)
             cur_lines = []
-            return
-        if not body:
-            body = f"## {cur_title}\n\n(내용 없음)"
-        elif not body.lstrip().startswith("#"):
-            body = f"## {cur_title}\n\n{body}"
+
+        for line in lines:
+            hm = re.match(r"^(#{2,3})\s+(.+)$", line.strip())
+            if hm:
+                _flush()
+                title = hm.group(2).strip()
+                cur_key = _canonical_section_key(title)
+                cur_lines = [line]
+            else:
+                cur_lines.append(line)
+        _flush()
+
+    sections: list[dict[str, str]] = []
+    for key, short, _ in CANONICAL_REPORT_NAV:
+        parts = buckets.get(key) or []
+        title = {
+            "summary": "1페이지 요약 대시보드",
+            "deplete": "소진 예상",
+            "missing": "미보유(재고 없음·공정서 미보유)",
+            "manufacture": "차년도 제조 검토",
+            "accel": "분양 가속·모니터링",
+            "compendium": "공정서 DB 매칭",
+        }.get(key, short)
+        if parts:
+            body = "\n\n".join(parts).strip()
+            if not body.lstrip().startswith("#"):
+                body = f"## {title}\n\n{body}"
+        else:
+            body = f"## {title}\n\n_(이 리포트에 해당 섹션 본문이 없습니다.)_"
         sections.append(
             {
-                "id": f"s{len(sections)}",
-                "title": cur_title,
-                "short": _report_section_short_label(cur_title),
+                "id": key,
+                "title": title,
+                "short": short,
                 "markdown": body,
             }
         )
-        cur_lines = []
 
-    for line in lines:
-        hm = re.match(r"^##\s+(.+)$", line.strip())
-        if hm:
-            _flush()
-            cur_title = hm.group(1).strip()
-            cur_lines = [line]
-        else:
-            cur_lines.append(line)
-    _flush()
+    if other:
+        body = "\n\n".join(other).strip()
+        sections.append(
+            {
+                "id": "other",
+                "title": "기타",
+                "short": "기타",
+                "markdown": body if body.lstrip().startswith("#") else f"## 기타\n\n{body}",
+            }
+        )
     return sections
+
+
+def _canonical_section_key(title: str) -> str | None:
+    """헤딩 제목 → 고정 네비 키 (미보유·검토가 공정서/소진에 먹히지 않도록 순서 고정)."""
+    t = re.sub(r"\([^)]*\)", "", title or "").strip()
+    t = re.sub(r"[#*_`]", "", t).strip()
+    # 미보유·제조검토를 공정서/소진보다 먼저
+    for key, _short, keywords in CANONICAL_REPORT_NAV:
+        for kw in keywords:
+            if kw in t:
+                return key
+    return None
 
 
 def _report_section_short_label(title: str) -> str:
     """사이드 버튼용 짧은 라벨."""
+    key = _canonical_section_key(title)
+    if key:
+        for k, short, _ in CANONICAL_REPORT_NAV:
+            if k == key:
+                return short
     t = re.sub(r"\([^)]*\)", "", title or "").strip()
     t = re.sub(r"[#*_`]", "", t).strip()
-    mapping = (
-        ("대시보드", "요약"),
-        ("KPI", "요약"),
-        ("요약", "요약"),
-        ("소진", "소진"),
-        ("미보유", "미보유"),
-        ("재고 없음", "미보유"),
-        ("재고없음", "미보유"),
-        ("제조", "검토"),
-        ("모니터링", "가속"),
-        ("가속", "가속"),
-        ("공정서", "공정서"),
-        ("매칭", "공정서"),
-        ("신뢰", "신뢰"),
-        ("환산", "환산"),
-        ("저분양", "저분양"),
-    )
-    for key, short in mapping:
-        if key in t:
-            return short
     compact = re.sub(r"\s+", "", t)
     return compact[:3] if compact else "기타"
 

@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.43
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.44
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.43"
+APP_VERSION = "v1.44"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -271,12 +271,13 @@ QPushButton#reportNavBtn {
     background-color: #eef3f9;
     color: #1e3a5f;
     border: 1px solid #c5d0de;
-    border-radius: 12px;
-    min-width: 42px;
-    max-width: 46px;
-    padding: 10px 4px;
+    border-radius: 10px;
+    min-width: 58px;
+    max-width: 64px;
+    min-height: 40px;
+    padding: 8px 4px;
     font-weight: 700;
-    font-size: 11px;
+    font-size: 12px;
     text-align: center;
 }
 QPushButton#reportNavBtn:hover {
@@ -1423,9 +1424,9 @@ class MainWindow(QMainWindow):
         report_body_row.setContentsMargins(0, 0, 0, 0)
         report_body_row.setSpacing(8)
 
-        # 좌측 주황색 섹션 버튼 (세로 탭)
+        # 좌측 섹션 버튼 (고정 라벨: 전체·요약·소진·미보유·검토…)
         nav_wrap = QWidget()
-        nav_wrap.setFixedWidth(52)
+        nav_wrap.setFixedWidth(72)
         nav_outer = QVBoxLayout(nav_wrap)
         nav_outer.setContentsMargins(0, 0, 0, 0)
         nav_outer.setSpacing(0)
@@ -1441,7 +1442,7 @@ class MainWindow(QMainWindow):
         self.report_nav_host = QWidget()
         self.report_nav_layout = QVBoxLayout(self.report_nav_host)
         self.report_nav_layout.setContentsMargins(2, 2, 2, 2)
-        self.report_nav_layout.setSpacing(8)
+        self.report_nav_layout.setSpacing(6)
         self.report_nav_layout.addStretch(1)
         self.report_nav_scroll.setWidget(self.report_nav_host)
         nav_outer.addWidget(self.report_nav_scroll, stretch=1)
@@ -2233,11 +2234,9 @@ class MainWindow(QMainWindow):
         self.report_fixed.setFocus()
 
     def _vertical_nav_label(self, text: str) -> str:
-        """주황색 사이드 버튼용 세로 글자 배치."""
-        chars = [c for c in (text or "").strip() if not c.isspace()]
-        if not chars:
-            return "·"
-        return "\n".join(chars[:4])
+        """사이드 버튼 라벨 — 가독성을 위해 가로 표기(미보유·검토 등)."""
+        label = (text or "").strip() or "·"
+        return label
 
     def _clear_report_nav(self) -> None:
         for btn in list(self._report_nav_buttons.values()):
@@ -2252,12 +2251,11 @@ class MainWindow(QMainWindow):
         self.report_nav_layout.addStretch(1)
 
     def _rebuild_report_nav(self) -> None:
-        """리포트 ## 섹션 기준 주황색 사이드 버튼 재구성."""
+        """고정 섹션 버튼(미보유·검토 포함) 재구성."""
         self._clear_report_nav()
         if not self._report_sections and not self._initial_report:
             return
 
-        # stretch 제거 후 버튼 추가
         while self.report_nav_layout.count():
             self.report_nav_layout.takeAt(0)
 
@@ -2273,15 +2271,14 @@ class MainWindow(QMainWindow):
             btn.setCheckable(True)
             btn.setToolTip(tip or short)
             btn.setProperty("section_key", key)
-            btn.setMinimumHeight(max(56, 14 * min(4, len(short))))
+            btn.setMinimumHeight(40)
             self._report_nav_group.addButton(btn, i)
             self._report_nav_buttons[key] = btn
             self.report_nav_layout.addWidget(btn)
 
         self.report_nav_layout.addStretch(1)
 
-        # 기본: 첫 섹션(있으면) 또는 전체
-        default_key = (
+        default_key = "summary" if "summary" in self._report_nav_buttons else (
             self._report_sections[0]["id"] if self._report_sections else "all"
         )
         if self._report_section_key not in self._report_nav_buttons:
@@ -2505,7 +2502,9 @@ class MainWindow(QMainWindow):
         self._report_expanded_ids.clear()
         self._report_sections = split_markdown_report_sections(text)
         self._report_section_key = (
-            self._report_sections[0]["id"] if self._report_sections else "all"
+            "summary"
+            if any(s["id"] == "summary" for s in self._report_sections)
+            else (self._report_sections[0]["id"] if self._report_sections else "all")
         )
         self._rebuild_report_nav()
         self._render_report_html()
