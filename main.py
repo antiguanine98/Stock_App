@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.40
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.41
 """
 
 from __future__ import annotations
@@ -69,6 +69,7 @@ from stock_logic import (
     extract_mentioned_codes_from_report,
     format_compendium_context,
     format_compendium_match_report,
+    format_qty_int,
     load_compendium_excel,
     lookup_pharmacopoeia_tag,
     markdown_report_to_collapsible_html,
@@ -106,7 +107,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.40"
+APP_VERSION = "v1.41"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -250,6 +251,20 @@ QPushButton#secondaryBtn {
     border: 1px solid #1e3a5f;
 }
 QPushButton#secondaryBtn:hover { background-color: #eef3f9; }
+QPushButton#primaryBtn {
+    background-color: #0f766e;
+    color: #ffffff;
+    border: none;
+    border-radius: 10px;
+    font-weight: 700;
+    font-size: 14px;
+    padding: 10px 22px;
+}
+QPushButton#primaryBtn:hover { background-color: #0d9488; }
+QPushButton#primaryBtn:disabled {
+    background-color: #94a3b8;
+    color: #e2e8f0;
+}
 QTabWidget::pane {
     border: 1px solid #d8e0ea;
     border-radius: 12px;
@@ -803,7 +818,7 @@ class InventoryChart(FigureCanvas):
             color="#1e3a5f", linewidth=2.2, markersize=7,
         )
         labels = [
-            f"{label}\n연도: {y}\n재고량: {q:g}" if q == q else f"{label}\n연도: {y}"
+            f"{label}\n연도: {y}\n재고량: {format_qty_int(q)}" if q == q else f"{label}\n연도: {y}"
             for y, q in zip(years, y_corr)
         ]
         self._attach_hover(ax, line, labels)
@@ -858,7 +873,7 @@ class InventoryChart(FigureCanvas):
             lines.append(line)
             for yr, q in zip(years, y):
                 hover_labels.append(
-                    f"{item['label']}\n연도: {yr}\n재고량: {q:g}" if q == q else f"{item['label']}\n연도: {yr}"
+                    f"{item['label']}\n연도: {yr}\n재고량: {format_qty_int(q)}" if q == q else f"{item['label']}\n연도: {yr}"
                 )
 
         if lines:
@@ -873,7 +888,7 @@ class InventoryChart(FigureCanvas):
                     di = int(sel.index) if sel.index is not None else 0
                     if 0 <= di < len(item["dates"]):
                         q = item["corrected"][di]
-                        qtxt = f"{q:g}" if q is not None else "-"
+                        qtxt = format_qty_int(q) if q is not None else "-"
                         sel.annotation.set_text(
                             f"{item['label']}\n연도: {item['dates'][di]}\n재고량: {qtxt}"
                         )
@@ -1232,6 +1247,28 @@ class MainWindow(QMainWindow):
         self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
         top_layout.addWidget(self.compendium_status)
 
+        analyze_row = QHBoxLayout()
+        analyze_row.addStretch(1)
+        self.btn_analyze = QPushButton("🚀 분석 시작")
+        self.btn_analyze.setObjectName("primaryBtn")
+        self.btn_analyze.setMinimumHeight(44)
+        self.btn_analyze.setMinimumWidth(180)
+        self.btn_analyze.setEnabled(False)
+        self.btn_analyze.setToolTip(
+            "재고 엑셀과 공정서 DB를 모두 등록한 뒤 클릭하세요. "
+            "분석 시작 시 상단 업로드 영역이 접힙니다."
+        )
+        self.btn_analyze.clicked.connect(self._on_analyze_clicked)
+        analyze_row.addWidget(self.btn_analyze)
+        analyze_row.addStretch(1)
+        top_layout.addLayout(analyze_row)
+        self.analyze_hint = QLabel(
+            "재고 엑셀 + 공정서 DB 등록 후 [🚀 분석 시작]을 누르면 AI 분석이 실행됩니다."
+        )
+        self.analyze_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.analyze_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top_layout.addWidget(self.analyze_hint)
+
         settings_outer.addWidget(self._settings_body)
         root.addWidget(settings_card, stretch=0)
 
@@ -1244,8 +1281,8 @@ class MainWindow(QMainWindow):
         table_layout = QVBoxLayout(table_wrap)
         table_layout.setContentsMargins(8, 8, 8, 8)
         hint = QLabel(
-            "행을 더블클릭하면 해당 품목의 재고 추이 차트로 이동합니다. "
-            "(등록일자 제외 · 잔고→재고 · 변경일자는 연도 YYYY)"
+            "행을 더블클릭하면 해당 품목의 분양차트로 이동합니다. "
+            "(등록일자 제외 · 잔고→재고 · 변경일자는 연도 YYYY · 재고량은 정수)"
         )
         hint.setStyleSheet("color: #64748b; font-size: 12px;")
         table_layout.addWidget(hint)
@@ -1260,7 +1297,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.cellDoubleClicked.connect(self._on_table_double_clicked)
         table_layout.addWidget(self.table, stretch=1)
-        self.tabs.addTab(table_wrap, "보정 데이터 표")
+        self.tabs.addTab(table_wrap, "분양현황")
 
         # Tab 2 chart
         chart_widget = QWidget()
@@ -1310,7 +1347,7 @@ class MainWindow(QMainWindow):
 
         self.chart = InventoryChart()
         chart_layout.addWidget(self.chart, stretch=1)
-        self.tabs.addTab(chart_widget, "재고 추이 차트")
+        self.tabs.addTab(chart_widget, "분양차트")
 
         # Tab 3 AI chatbot — left: fixed report / right: interactive chat
         report_wrap = QWidget()
@@ -1464,11 +1501,6 @@ class MainWindow(QMainWindow):
         viz_row.addWidget(self.viz_ai_filter)
         viz_row.addStretch(1)
         viz_layout.addLayout(viz_row)
-        viz_hint = QLabel(
-            "클릭 시 재고 추이 차트로 이동 · 드래그 회전 · 휠 확대"
-        )
-        viz_hint.setStyleSheet("color: #64748b; font-size: 12px;")
-        viz_layout.addWidget(viz_hint)
         self.chart3d = Scatter3DView()
         self.chart3d.point_picked.connect(self._on_3d_point_picked)
         viz_layout.addWidget(self.chart3d, stretch=1)
@@ -1632,6 +1664,7 @@ class MainWindow(QMainWindow):
         if self.inventory_data is not None:
             self.inventory_data["compendium_match"] = {}
             self.inventory_data["compendium_match_report"] = ""
+        self._update_analyze_button()
 
     def _load_compendium(self, file_path: str) -> None:
         self.compendium_status.setText(f"공정서 DB: 로딩 중... ({Path(file_path).name})")
@@ -1672,13 +1705,14 @@ class MainWindow(QMainWindow):
         self.compendium_status.setToolTip(
             f"{name}\n열: {', '.join((data.get('columns') or [])[:30])}"
         )
-        # 이미 재고가 로드된 상태면 다음 AI 질문부터 반영 (초기 리포트는 재실행하지 않음)
-        if self._initial_report:
+        self._update_analyze_button()
+        # 이미 재고가 로드된 상태면 분석 시작 안내
+        if self.inventory_data is not None and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
             QMessageBox.information(
                 self,
                 "공정서 DB 등록",
                 "공정서 DB가 등록되었습니다.\n"
-                "이후 챗봇 답변과, 재고 파일을 다시 불러와 생성하는 초기 리포트에 규격 참조로 사용됩니다.",
+                "[🚀 분석 시작]을 눌러 AI 분석을 실행하세요.",
             )
 
     def _refresh_compendium_match(self) -> dict[str, Any] | None:
@@ -1774,6 +1808,7 @@ class MainWindow(QMainWindow):
         self.chart._show_placeholder("품목 또는 표준품구분을 선택하면 재고 추이 차트가 표시됩니다.")
         self.chart3d.show_message("엑셀을 다시 업로드해 주세요.")
         self._set_settings_collapsed(False)
+        self._update_analyze_button()
 
     def _load_excel(self, file_path: str) -> None:
         self._load_excels([file_path])
@@ -1845,10 +1880,55 @@ class MainWindow(QMainWindow):
         self._populate_table(data)
         self._populate_filters(data)
         self._refresh_3d()
-        self._run_ai_analysis(data)
+        self._update_analyze_button()
         self.tabs.setCurrentIndex(0)
-        # 로드 완료 후 상단을 접어 탭/챗봇 영역을 넓힘
+        # 파일 로드만 수행 — AI 분석은 [🚀 분석 시작]에서 실행
+        self.statusBar().showMessage(
+            "재고 파일 로드 완료. 공정서 DB 등록 후 [🚀 분석 시작]을 눌러 주세요.",
+            8000,
+        )
+
+    def _update_analyze_button(self) -> None:
+        has_stock = self.inventory_data is not None
+        has_comp = self.compendium_df is not None
+        ready = has_stock and has_comp
+        if hasattr(self, "btn_analyze"):
+            self.btn_analyze.setEnabled(ready)
+        if hasattr(self, "analyze_hint"):
+            if ready:
+                self.analyze_hint.setText(
+                    "준비 완료 — [🚀 분석 시작]을 누르면 AI 분석이 실행되고 상단이 접힙니다."
+                )
+                self.analyze_hint.setStyleSheet("color: #0f766e; font-size: 11px; font-weight: 600;")
+            elif has_stock and not has_comp:
+                self.analyze_hint.setText("공정서 DB를 등록하면 분석을 시작할 수 있습니다.")
+                self.analyze_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+            elif has_comp and not has_stock:
+                self.analyze_hint.setText("재고 엑셀을 등록하면 분석을 시작할 수 있습니다.")
+                self.analyze_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+            else:
+                self.analyze_hint.setText(
+                    "재고 엑셀 + 공정서 DB 등록 후 [🚀 분석 시작]을 누르면 AI 분석이 실행됩니다."
+                )
+                self.analyze_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+
+    def _on_analyze_clicked(self) -> None:
+        if not self.inventory_data:
+            tip = "STEP 2에서 재고 엑셀을 먼저 등록해 주세요."
+            if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+                QMessageBox.information(self, "분석 시작", tip)
+            return
+        if self.compendium_df is None:
+            tip = "STEP 2에서 공정서 DB를 먼저 등록해 주세요."
+            self._set_settings_collapsed(False)
+            if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+                QMessageBox.information(self, "분석 시작", tip)
+            return
+        if not self._require_api_ready():
+            return
         self._set_settings_collapsed(True)
+        self.tabs.setCurrentIndex(2)  # AI 분석 탭
+        self._run_ai_analysis(self.inventory_data)
 
     def _populate_table(self, data: dict[str, Any]) -> None:
         meta_cols = data["meta_cols"]
@@ -1873,8 +1953,12 @@ class MainWindow(QMainWindow):
                     date_text = str(item["dates"][i])
                     orig = item["original"][i] if i < len(item["original"]) else None
                     corr = item["corrected"][i]
-                    orig_text = "" if orig is None else f"{orig:g}"
-                    corr_text = "" if corr is None else f"{corr:g}"
+                    orig_text = "" if orig is None else format_qty_int(orig)
+                    corr_text = "" if corr is None else format_qty_int(corr)
+                    if orig_text == "-":
+                        orig_text = ""
+                    if corr_text == "-":
+                        corr_text = ""
                 else:
                     date_text = orig_text = corr_text = ""
                     orig = corr = None
@@ -2208,7 +2292,7 @@ class MainWindow(QMainWindow):
             self.chat_view.setMarkdown(
                 "**STEP 1의 API Key 연결이 먼저 필요합니다.**\n\n"
                 "상단에서 Gemini API Key를 입력하고 [연결 테스트]를 완료한 뒤, "
-                "재고 파일을 다시 불러오거나 분석을 재시작해 주세요.\n\n"
+                "[🚀 분석 시작]을 눌러 주세요.\n\n"
                 f"(대상 품목 중 변동 {len(changed)}건 대기 중)"
             )
             self._scroll_chat_to_bottom()

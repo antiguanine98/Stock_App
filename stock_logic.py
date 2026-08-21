@@ -36,6 +36,16 @@ RELIABILITY_MID_MAX = 4
 MANUFACTURE_CANDIDATE_LIMIT = 10
 LONG_TERM_LOW_YEARS = 5.0
 LONG_TERM_LOW_REL_DROP = 0.05  # 5년+ 구간 상대 감소율 5% 미만 → 저분양
+ZERO_STOCK_CATEGORY = "재고 없음(미보유)"
+DEPLETION_CATEGORY_ORDER = (
+    "1년 이내",
+    "2년 이내",
+    "3년 이내",
+    "4년 이내",
+    "5년 이내",
+    "5년 초과/안정",
+    ZERO_STOCK_CATEGORY,
+)
 PRICE_COL_KEYWORDS = ("가격",)
 ACCELERATION_FORMULA_KO = (
     "분양 가속도 = 최근 3년 연평균 분양량(감소구간만) ÷ 과거 연평균 분양량; "
@@ -100,6 +110,40 @@ def parse_qty(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def format_qty_int(value: Any) -> str:
+    """표·리포트용 재고 수량 — 소수점 없는 정수 문자열."""
+    if _is_empty(value):
+        return "-"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if num != num:  # NaN
+        return "-"
+    return str(int(round(num)))
+
+
+def to_qty_int(value: Any) -> Optional[int]:
+    """재고 수량을 int로 정규화 (None 유지)."""
+    if _is_empty(value):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num != num:
+        return None
+    return int(round(num))
+
+
+def is_zero_stock(item: "StockItem") -> bool:
+    """현재 재고(잔고)가 0 이하인지."""
+    qty = item.current_qty
+    if qty is None:
+        return False
+    return float(qty) <= 0
 
 
 def format_date(d: date) -> str:
@@ -881,29 +925,31 @@ def compute_data_reliability(item: StockItem) -> dict[str, Any]:
     }
 
 
-def depletion_bucket(years_left: Optional[float]) -> str:
-    """소진 예상 기간 카테고리 (최대 15년 기준)."""
+def depletion_bucket(years_left: Optional[float], *, stock_zero: bool = False) -> str:
+    """소진 예상 기간 카테고리 (1~5년 연 단위 분할)."""
+    if stock_zero:
+        return ZERO_STOCK_CATEGORY
     if years_left is None:
-        return "15년 이상/안정"
-    if years_left <= 1:
-        months = max(1, int(round(years_left * 12)))
-        return f"1년 이내 ({months}개월)"
-    if years_left <= 3:
-        return "1~3년 이내"
-    if years_left <= 5:
-        return "3~5년 이내"
-    if years_left <= 10:
-        return "5~10년 이내"
-    if years_left <= 15:
-        return "10~15년 이내"
-    return "15년 이상/안정"
+        return "5년 초과/안정"
+    y = float(years_left)
+    if y <= 1:
+        return "1년 이내"
+    if y <= 2:
+        return "2년 이내"
+    if y <= 3:
+        return "3년 이내"
+    if y <= 4:
+        return "4년 이내"
+    if y <= 5:
+        return "5년 이내"
+    return "5년 초과/안정"
 
 
 def format_deplete_ym(last_date: date, years_left: float) -> str:
-    """현재 추세 기준 예상 소진 시점 (YYYY년 M월)."""
+    """현재 추세 기준 예상 소진 시점 — 소진예상일시(YYYY년 MM월 기준)."""
     days = max(0, int(round(years_left * 365.25)))
     target = last_date + timedelta(days=days)
-    return f"{target.year}년 {target.month}월"
+    return f"소진예상일시({target.year}년 {target.month:02d}월 기준)"
 
 
 def _priority_components(
@@ -997,7 +1043,8 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
         "long_term_low": False,
         "increase_segments_excluded": 0,
         "deplete_ym": None,
-        "depletion_category": "15년 이상/안정",
+        "depletion_category": "5년 초과/안정",
+        "stock_zero": False,
         "reliability": reliability,
         "stock_risk": 0.0,
         "priority_score": manufacturing_priority_score(
@@ -1010,6 +1057,26 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
         "stock_value": item.stock_value,
         "as_of_year": date.today().year,
     }
+
+    # 현재 재고 0 → 소진 위험군 제외, 재고 없음(미보유)으로 분리
+    if is_zero_stock(item):
+        empty.update(
+            {
+                "speed": "해당없음",
+                "stock_zero": True,
+                "depletion_category": ZERO_STOCK_CATEGORY,
+                "deplete_within_2y": False,
+                "deplete_within_5y": False,
+                "deplete_ym": None,
+                "years_left": None,
+                "stock_risk": 0.0,
+                "priority_score": 0.0,
+                "acceleration": "해당없음",
+                "long_term_low": False,
+            }
+        )
+        return empty
+
     if len(pts) < 2 or item.first_qty is None or item.last_qty is None:
         return empty
 
@@ -1039,7 +1106,7 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
         deplete_2 = years_left is not None and years_left <= 2.0
         deplete_ym = format_deplete_ym(pts[-1].change_date, float(years_left))
 
-    category = depletion_bucket(years_left)
+    category = depletion_bucket(years_left, stock_zero=False)
     long_term_low = is_long_term_low_distribution(item, annual_rate)
     comps = _priority_components(
         years_left=years_left,
@@ -1068,6 +1135,7 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
         "increase_segments_excluded": dec["increase_segments"],
         "deplete_ym": deplete_ym,
         "depletion_category": category,
+        "stock_zero": False,
         "reliability": reliability,
         "stock_risk": stock_risk,
         "speed_n": comps["speed_n"],
@@ -1084,17 +1152,19 @@ def _catalog_item_row(it: StockItem, stats: dict[str, Any]) -> dict[str, Any]:
     rel = stats.get("reliability") or {}
     grade = rel.get("grade") if isinstance(rel, dict) else None
     years_left = stats.get("years_left")
+    stock_zero = bool(stats.get("stock_zero")) or is_zero_stock(it)
+    risk = "재고없음" if stock_zero else risk_grade_from_years(years_left)
     return {
         "label": it.label,
         "name_ko": it.name_ko,
         "manage_no": it.manage_no,
         "std_type": it.std_type,
-        "last_qty": it.last_qty,
+        "last_qty": to_qty_int(it.last_qty if it.last_qty is not None else it.current_qty),
         "annual_rate": stats.get("annual_rate"),
         "years_left": years_left,
         "deplete_ym": stats.get("deplete_ym"),
         "depletion_category": stats.get("depletion_category"),
-        "risk_grade": risk_grade_from_years(years_left),
+        "risk_grade": risk,
         "acceleration": stats.get("acceleration"),
         "acceleration_ratio": stats.get("acceleration_ratio"),
         "priority_score": stats.get("priority_score"),
@@ -1102,13 +1172,14 @@ def _catalog_item_row(it: StockItem, stats: dict[str, Any]) -> dict[str, Any]:
         "reliability_grade": grade,
         "reliability": rel.get("label") if isinstance(rel, dict) else rel,
         "stock_value": stats.get("stock_value"),
+        "stock_zero": stock_zero,
         "deplete_within_2y": bool(stats.get("deplete_within_2y")),
         "deplete_within_5y": bool(stats.get("deplete_within_5y")),
     }
 
 
 def risk_grade_from_years(years_left: Optional[float]) -> str:
-    """소진 잔여년수 기반 위험등급: 위험/경계/주의/안정."""
+    """소진 잔여년수 기반 위험등급: 위험/경계/주의/안정 (재고 0 제외)."""
     if years_left is None:
         return "안정"
     if years_left <= 2:
@@ -1122,46 +1193,25 @@ def risk_grade_from_years(years_left: Optional[float]) -> str:
 
 def group_by_depletion_category(items: list[StockItem]) -> dict[str, list[str]]:
     """소진 기간 카테고리별 품목 라벨 목록(리포트 요약용)."""
-    order = [
-        "1년 이내",
-        "1~3년 이내",
-        "3~5년 이내",
-        "5~10년 이내",
-        "10~15년 이내",
-        "15년 이상/안정",
-    ]
-    buckets: dict[str, list[str]] = {k: [] for k in order}
+    buckets: dict[str, list[str]] = {k: [] for k in DEPLETION_CATEGORY_ORDER}
     for it in items_for_ai_analysis(items):
         stats = estimate_depletion(it)
-        cat = stats["depletion_category"]
-        key = cat
-        if cat.startswith("1년 이내"):
-            key = "1년 이내"
+        key = stats["depletion_category"]
         if key not in buckets:
             buckets[key] = []
-        buckets[key].append(f"{it.label} [{cat}]")
+        qty = format_qty_int(it.last_qty if it.last_qty is not None else it.current_qty)
+        buckets[key].append(f"{it.label} [재고:{qty}]")
     return buckets
 
 
 def group_by_depletion_category_items(
     items: list[StockItem],
 ) -> dict[str, list[dict[str, Any]]]:
-    """소진 예상 구간별 전수 품목 리스트(챗봇 컨텍스트용)."""
-    order = [
-        "1년 이내",
-        "1~3년 이내",
-        "3~5년 이내",
-        "5~10년 이내",
-        "10~15년 이내",
-        "15년 이상/안정",
-    ]
-    buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in order}
+    """소진 예상 구간별 전수 품목 리스트(챗봇·리포트 표용)."""
+    buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in DEPLETION_CATEGORY_ORDER}
     for it in items_for_ai_analysis(items):
         stats = estimate_depletion(it)
-        cat = stats["depletion_category"]
-        key = cat
-        if isinstance(cat, str) and cat.startswith("1년 이내"):
-            key = "1년 이내"
+        key = stats["depletion_category"]
         if key not in buckets:
             buckets[key] = []
         buckets[key].append(_catalog_item_row(it, stats))
@@ -1169,14 +1219,18 @@ def group_by_depletion_category_items(
 
 
 def group_by_risk_grade(items: list[StockItem]) -> dict[str, list[dict[str, Any]]]:
-    """위험등급(위험/경계/주의/안정)별 전수 품목 리스트."""
+    """위험등급(위험/경계/주의/안정)별 전수 — 재고 0은 제외."""
     order = ["위험", "경계", "주의", "안정"]
     buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in order}
     for it in items_for_ai_analysis(items):
         stats = estimate_depletion(it)
+        if stats.get("stock_zero") or is_zero_stock(it):
+            continue
         row = _catalog_item_row(it, stats)
         grade = row["risk_grade"]
-        buckets.setdefault(grade, []).append(row)
+        if grade not in buckets:
+            continue
+        buckets[grade].append(row)
     for g in order:
         buckets[g].sort(
             key=lambda r: (
@@ -1201,7 +1255,11 @@ def select_manufacture_candidates(
     for it in items:
         if it.std_type not in result:
             continue
+        if is_zero_stock(it):
+            continue
         stats = estimate_depletion(it)
+        if stats.get("stock_zero"):
+            continue
         scored.append((float(stats["priority_score"]), it, stats))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -1240,7 +1298,7 @@ def select_manufacture_candidates(
                 "deplete_ym": stats["deplete_ym"],
                 "depletion_category": stats["depletion_category"],
                 "deplete_within_5y": bool(stats.get("deplete_within_5y")),
-                "last_qty": it.last_qty,
+                "last_qty": to_qty_int(it.last_qty),
                 "acceleration": stats["acceleration"],
             }
         )
@@ -1256,7 +1314,11 @@ def select_monitoring_targets(items: list[StockItem], limit: int = 30) -> list[d
     surge_rows: list[dict[str, Any]] = []
     increase_rows: list[dict[str, Any]] = []
     for it in items:
+        if is_zero_stock(it):
+            continue
         stats = estimate_depletion(it)
+        if stats.get("stock_zero"):
+            continue
         accel = stats.get("acceleration")
         if accel not in ("급가속", "증가"):
             continue
@@ -1393,6 +1455,8 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
     grade_ab = 0
     for it in items:
         stats = by_code.get(it.manage_no) or estimate_depletion(it)
+        if stats.get("stock_zero") or is_zero_stock(it):
+            continue
         if stats.get("deplete_within_2y"):
             deplete_2y += 1
         if flags.get("deplete_codes") is None and stats.get("deplete_within_5y"):
@@ -1405,6 +1469,8 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
         if isinstance(rel, dict) and rel.get("grade") in ("A", "B"):
             grade_ab += 1
 
+    zero_n = sum(1 for it in items if is_zero_stock(it))
+
     mfg = flags.get("manufacture_candidates")
     if mfg is None:
         mfg = select_manufacture_candidates(items)
@@ -1414,6 +1480,7 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
 
     kpis = [
         {"key": "managed", "label": "대상품목 수", "value": managed, "display": f"{managed}종"},
+        {"key": "zero_stock", "label": "재고 없음(미보유)", "value": zero_n, "display": f"{zero_n}종"},
         {"key": "deplete_2y", "label": "2년 내 소진예상", "value": deplete_2y, "display": f"{deplete_2y}종"},
         {"key": "deplete_5y", "label": "5년 내 소진예상", "value": deplete_5y, "display": f"{deplete_5y}종"},
         {"key": "manufacture", "label": "제조 우선검토 수", "value": mfg_n, "display": f"{mfg_n}종"},
@@ -1441,6 +1508,7 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
 
     summary_lines = [
         f"대상 품목 {managed}종을 기준으로 재고·분양 지표를 산출했습니다.",
+        f"재고 없음(미보유) {zero_n}종은 소진 위험군에서 제외했습니다.",
         f"2년 내 소진 예상 {deplete_2y}종, 5년 내 소진 예상 {deplete_5y}종이며 제조 우선검토 후보는 {mfg_n}종입니다.",
         f"분양 가속도(급가속·증가) 품목은 {accel_n}종, 장기 저분양/과다재고 후보는 {low_n}종입니다.",
         f"현 재고 기준 분양금액 환산 총액은 {_fmt_money(total_value)}입니다"
@@ -1451,7 +1519,7 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
             if by_type
             else "."
         ),
-        "아래 수치는 사전 정량 산출 결과이며, 데이터에 없는 원인 단정은 하지 않습니다.",
+        "아래 수치는 정량 산출 결과이며, 데이터에 없는 원인 단정은 하지 않습니다.",
     ]
 
     return {
@@ -1493,34 +1561,39 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
 
     for it in items_for_ai_analysis(items):
         stats = estimate_depletion(it)
+        stock_zero = bool(stats.get("stock_zero")) or is_zero_stock(it)
         flag = {
             "label": it.label,
             "name_ko": it.name_ko,
             "manage_no": it.manage_no,
             "speed": stats["speed"],
             "years_left": stats["years_left"],
-            "deplete_within_2y": bool(stats["deplete_within_2y"]),
-            "deplete_within_5y": bool(stats["deplete_within_5y"]),
-            "recent_surge": bool(stats["recent_surge"]),
+            "deplete_within_2y": bool(stats["deplete_within_2y"]) and not stock_zero,
+            "deplete_within_5y": bool(stats["deplete_within_5y"]) and not stock_zero,
+            "recent_surge": bool(stats["recent_surge"]) and not stock_zero,
             "deplete_ym": stats["deplete_ym"],
             "depletion_category": stats["depletion_category"],
-            "risk_grade": risk_grade_from_years(stats.get("years_left")),
+            "risk_grade": (
+                "재고없음" if stock_zero else risk_grade_from_years(stats.get("years_left"))
+            ),
             "reliability": stats["reliability"],
             "priority_score": stats["priority_score"],
             "annual_rate": stats["annual_rate"],
             "rate_change_ratio": stats["rate_change_ratio"],
             "acceleration": stats["acceleration"],
             "acceleration_ratio": stats["acceleration_ratio"],
-            "long_term_low": stats["long_term_low"],
+            "long_term_low": stats["long_term_low"] and not stock_zero,
             "stock_value": stats.get("stock_value"),
             "unit_price": stats.get("unit_price"),
+            "last_qty": to_qty_int(it.last_qty if it.last_qty is not None else it.current_qty),
+            "stock_zero": stock_zero,
             "increase_segments_excluded": stats.get("increase_segments_excluded", 0),
         }
         if it.manage_no:
             by_code[it.manage_no] = flag
         if flag["deplete_within_5y"]:
             deplete_codes.append(it.manage_no or it.label)
-        if flag["acceleration"] in ("급가속", "증가"):
+        if flag["acceleration"] in ("급가속", "증가") and not stock_zero:
             surge_codes.append(it.manage_no or it.label)
 
     flags = {
@@ -1558,7 +1631,7 @@ def extract_mentioned_codes_from_report(report: str, known_codes: list[str]) -> 
 
 
 def _format_catalog_row_line(i: int, r: dict[str, Any]) -> str:
-    """전수 목록 한 줄(번호·한글명·관리번호·세부 수치)."""
+    """전수 목록 한 줄(번호·한글명·관리번호·세부 수치) — 표 미사용 시 폴백."""
     name = r.get("name_ko") or r.get("label") or "-"
     code = r.get("manage_no") or "-"
     yl = r.get("years_left")
@@ -1572,58 +1645,110 @@ def _format_catalog_row_line(i: int, r: dict[str, Any]) -> str:
     rel = r.get("reliability_grade") or r.get("reliability") or "-"
     return (
         f"{i}. {name} | 관리번호:{code} | 유형:{r.get('std_type') or '-'} | "
-        f"재고:{r.get('last_qty', '-')} | 연평균:{ar_txt} | "
+        f"재고:{format_qty_int(r.get('last_qty'))} | 연평균:{ar_txt} | "
         f"가속도:{r.get('acceleration') or '-'}/{ratio_txt} | "
-        f"소진년:{yl_txt} | 소진월:{r.get('deplete_ym') or '-'} | "
+        f"소진년:{yl_txt} | {r.get('deplete_ym') or '-'} | "
         f"소진구간:{r.get('depletion_category') or '-'} | "
         f"위험등급:{r.get('risk_grade') or '-'} | "
         f"우선:{score_txt} | 신뢰:{rel}"
     )
 
 
+def _rows_to_markdown_table(
+    rows: list[dict[str, Any]],
+    *,
+    include_stock: bool = True,
+) -> list[str]:
+    """목록성 데이터를 마크다운 표로 전수 나열 (정수 재고·소진예상일시)."""
+    headers = ["#", "한글명", "관리번호", "유형"]
+    if include_stock:
+        headers.append("재고")
+    headers.extend(["소진예상일시", "소진구간", "위험등급"])
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for i, r in enumerate(rows, 1):
+        cells = [
+            str(i),
+            str(r.get("name_ko") or r.get("label") or "-").replace("|", "/"),
+            str(r.get("manage_no") or "-").replace("|", "/"),
+            str(r.get("std_type") or "-").replace("|", "/"),
+        ]
+        if include_stock:
+            cells.append(format_qty_int(r.get("last_qty")))
+        cells.extend(
+            [
+                str(r.get("deplete_ym") or "-").replace("|", "/"),
+                str(r.get("depletion_category") or "-").replace("|", "/"),
+                str(r.get("risk_grade") or "-").replace("|", "/"),
+            ]
+        )
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
+def _missing_rows_to_markdown_table(rows: list[dict[str, Any]]) -> list[str]:
+    headers = ["#", "한글명", "기원(한글)", "기원(영문)", "공정서"]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for i, r in enumerate(rows, 1):
+        cells = [
+            str(i),
+            str(r.get("name_ko") or r.get("name_en") or "-").replace("|", "/"),
+            str(r.get("origin_ko") or "-").replace("|", "/"),
+            str(r.get("origin_en") or "-").replace("|", "/"),
+            str(
+                r.get("pharmacopoeia_kind") or r.get("pharmacopoeia") or "-"
+            ).replace("|", "/"),
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
 def _format_full_catalog_block(title: str, rows: list[dict[str, Any]]) -> list[str]:
-    """카테고리 전수 목록 블록(생략 없음)."""
-    lines = [f"{title} — 전수 {len(rows)}건 (생략 없음, 1~{len(rows)} 번호)"]
+    """카테고리 전수 목록 블록 — 마크다운 표(생략 없음)."""
+    lines = [
+        f"{title} — 전수 {len(rows)}건 (마크다운 표 · 생략 없음)",
+        "",
+    ]
     if not rows:
         lines.append("(해당 없음)")
         return lines
-    for i, r in enumerate(rows, 1):
-        lines.append(_format_catalog_row_line(i, r))
+    lines.extend(_rows_to_markdown_table(rows))
     return lines
 
 
 def _format_candidate_lines(rows: list[dict[str, Any]], *, full: bool = False) -> str:
     if not rows:
         return "없음"
-    if full:
-        return "\n".join(_format_catalog_row_line(i, r) for i, r in enumerate(rows, 1))
-    parts = []
-    for i, r in enumerate(rows, 1):
-        score = r.get("priority_score")
-        score_txt = f"{score:.3f}" if isinstance(score, (int, float)) else str(score)
-        if i <= 3:
-            risk = r.get("stock_risk")
-            speed_n = r.get("speed_n")
-            accel_n = r.get("accel_n")
-            rel = r.get("reliability_score")
-            ar = r.get("annual_rate")
-            ar_txt = f"{ar:.2f}" if isinstance(ar, (int, float)) else "-"
-            ratio = r.get("acceleration_ratio")
-            ratio_txt = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "-"
-            parts.append(
-                f"{i}. {r['label']} | 점수:{score_txt} | "
-                f"재고위험도({risk}) | 분양속도정규화({speed_n}) | "
-                f"가속도정규화({accel_n}) | 신뢰도점수({rel}) | "
-                f"연평균:{ar_txt} | 가속도:{r.get('acceleration')}/{ratio_txt} | "
-                f"소진시점:{r.get('deplete_ym') or '-'}"
-            )
-        else:
-            parts.append(
-                f"{i}. {r['label']} | 점수:{score_txt} | "
-                f"소진:{r.get('deplete_ym') or '-'} | "
-                f"가속도:{r.get('acceleration') or '-'}"
-            )
-    return "\n".join(parts)
+    # 제조검토 대상도 마크다운 표로 전수 나열
+    table_rows = []
+    for r in rows:
+        table_rows.append(
+            {
+                "name_ko": r.get("name_ko") or r.get("label"),
+                "manage_no": r.get("manage_no"),
+                "std_type": r.get("std_type"),
+                "last_qty": r.get("last_qty"),
+                "deplete_ym": r.get("deplete_ym"),
+                "depletion_category": r.get("depletion_category"),
+                "risk_grade": r.get("risk_grade")
+                or (
+                    "재고없음"
+                    if r.get("stock_zero")
+                    else risk_grade_from_years(r.get("years_left"))
+                ),
+            }
+        )
+    header = (
+        f"전수 {len(rows)}건 (마크다운 표)"
+        if full
+        else f"상위 {len(rows)}건 (마크다운 표)"
+    )
+    return "\n".join([header, ""] + _rows_to_markdown_table(table_rows))
 
 
 _FULL_LIST_HINTS = (
@@ -1652,7 +1777,8 @@ def detect_full_list_intent(question: str) -> dict[str, Any]:
     wants_full = any(h in q for h in _FULL_LIST_HINTS) or bool(_FULL_LIST_COUNT_RE.search(q))
     want_monitoring = any(k in q for k in ("모니터링", "급가속", "가속", "급증"))
     want_depletion = any(
-        k in q for k in ("소진", "고갈", "1년", "3년", "5년", "10년", "15년", "구간")
+        k in q
+        for k in ("소진", "고갈", "1년", "2년", "3년", "4년", "5년", "10년", "15년", "구간", "미보유")
     )
     want_manufacture = any(k in q for k in ("제조", "후보", "우선검토", "우선 검토"))
     want_risk = (
@@ -1838,27 +1964,33 @@ def build_ai_prompt(
         "- 공정서 DB는 규격/기준 참조용이며 재고·분양 수치 산출에 사용하지 마세요.",
         "",
         "[출력 형식 — 필수]",
-        "1. 리포트 맨 최상단에 아래 '사전 산출: 1페이지 요약 대시보드' 마크다운을 그대로 포함하고, "
-        "자동 종합 의견을 5줄 내외로 다듬어 제시하세요.",
+        "1. 리포트 맨 최상단에 아래 '1페이지 요약 대시보드(핵심 KPI)' 마크다운 표를 그대로 포함하고, "
+        "자동 종합 의견을 5줄 내외로 다듬어 제시하세요. "
+        "('사전산출'·'사전 산출' 문구는 사용하지 마세요.)",
         "2. '분석 전문가의 제언', '전문가 제언', '제언' 섹션은 작성하지 마세요.",
         "3. 사전 산출 목록·수치를 임의로 바꾸지 마세요.",
+        "4. 소진 예상 목록·미보유 목록·제조 검토 대상 등 목록성 데이터는 "
+        "접기/토글 없이 마크다운 표로 전수 나열하세요. 재고량은 정수만 표기하고, "
+        "소진 시점은 '소진예상일시(YYYY년 MM월 기준)' 형식을 유지하세요.",
         "",
         "[분석 요청 항목]",
         "1. 품목별 분양 속도(빠름/보통/느림) — 증가 구간 제외 속도 사용",
-        "2. 소진 예상 시점을 'YYYY년 M월'로 명시하고 카테고리 목록화:",
-        "   [1년 이내 (n개월)] / [1~3년 이내] / [3~5년 이내] / [5~10년 이내] / [10~15년 이내] / [15년 이상/안정]",
+        "2. 소진 예상 시점을 '소진예상일시(YYYY년 MM월 기준)'로 명시하고 "
+        "카테고리 마크다운 표로 전수 목록화:",
+        "   [1년 이내] / [2년 이내] / [3년 이내] / [4년 이내] / [5년 이내] / "
+        "[5년 초과/안정] / [재고 없음(미보유)]",
+        "   ※ 현재 재고 0인 품목은 소진 위험군에서 제외하고 '재고 없음(미보유)'에만 둡니다.",
         "3. 데이터 신뢰도 등급 A~D (수집 횟수·관측 간격). D/부족은 '신뢰도 낮음(데이터 부족)'으로 명시",
         "4. 분양 가속도(급가속/증가/안정/감소) 및 장기 저분양·과다재고 품목(차기 제조 수량 하향 권고)",
         f"   ({ACCELERATION_FORMULA_KO})",
         "5. 차년도 제조검토대상: 제조우선순위점수 상위 표준생약·지표성분 각 10종 순위표 "
-        "(5년 이내 소진 여부와 무관하게 항상 상위 10건; 해당 유형이 10건 미만이면 전량)",
+        "(마크다운 표, 재고 0 제외, 항상 상위 10건; 해당 유형이 10건 미만이면 전량)",
         "   ※ 제조 우선순위 섹션 서두에 아래 산출 공식·가중치를 그대로 인용해 명시할 것:",
         f"   {PRIORITY_FORMULA_KO}",
         "6. 모니터링 대상: 분양 가속도 급증 품목 + 정량 지표",
         "7. 현 재고 기준 분양금액 환산액(현재재고×가격): 전체·유형별·TOP20",
-        "8. 공정서 DB가 제공된 경우: '공정서 DB 매칭 및 수재 현황' 섹션을 반드시 포함 "
-        "(총 수재·보유 매칭·자동 보정 매칭·미보유 총 N건·대표 예시·챗봇 조회 안내). "
-        "미보유 전수 나열은 리포트에 넣지 말고 건수·예시·안내만 기입.",
+        "8. 공정서 DB가 제공된 경우: '공정서 DB 매칭 및 수재 현황'과 "
+        "미보유 표준품 전수 마크다운 표를 포함하세요.",
         "",
         f"[연구과제 대량출고로 제외할 날짜] {', '.join(bulk_dates) if bulk_dates else '해당 없음'}",
         "",
@@ -1878,26 +2010,33 @@ def build_ai_prompt(
         lines.append("")
 
     lines.extend([
-        "[사전 산출: 1페이지 요약 대시보드]",
+        "[1페이지 요약 대시보드(핵심 KPI)]",
         format_kpi_dashboard_markdown(dashboard),
         "",
-        "[사전 산출: 소진 기간 카테고리]",
+        "[소진 기간 카테고리 — 마크다운 표 전수]",
     ])
 
-    for cat_name, labels in categories.items():
-        if labels:
-            lines.append(f"- {cat_name} ({len(labels)}건): {', '.join(labels)}")
-        else:
-            lines.append(f"- {cat_name}: 없음")
+    category_items = flags.get("depletion_category_items") or {}
+    if category_items:
+        for cat_name in DEPLETION_CATEGORY_ORDER:
+            rows = category_items.get(cat_name) or []
+            lines.extend(_format_full_catalog_block(f"소진구간 {cat_name}", rows))
+            lines.append("")
+    else:
+        for cat_name, labels in categories.items():
+            if labels:
+                lines.append(f"- {cat_name} ({len(labels)}건): {', '.join(labels)}")
+            else:
+                lines.append(f"- {cat_name}: 없음")
 
     lines.append("")
-    lines.append("[사전 산출: 차년도 제조검토대상 — 표준생약]")
-    lines.append(_format_candidate_lines(manufacture.get("표준생약") or []))
+    lines.append("[차년도 제조검토대상 — 표준생약]")
+    lines.append(_format_candidate_lines(manufacture.get("표준생약") or [], full=True))
     lines.append("")
-    lines.append("[사전 산출: 차년도 제조검토대상 — 지표성분]")
-    lines.append(_format_candidate_lines(manufacture.get("지표성분") or []))
+    lines.append("[차년도 제조검토대상 — 지표성분]")
+    lines.append(_format_candidate_lines(manufacture.get("지표성분") or [], full=True))
     lines.append("")
-    lines.append("[사전 산출: 모니터링 대상(분양 가속)]")
+    lines.append("[모니터링 대상(분양 가속)]")
     surge_mon = [r for r in monitoring if r.get("acceleration") == "급가속"]
     other_mon = [r for r in monitoring if r.get("acceleration") != "급가속"]
     if surge_mon:
@@ -1926,7 +2065,7 @@ def build_ai_prompt(
             )
 
     lines.append("")
-    lines.append("[사전 산출: 장기 저분양/과다재고 — 차기 제조 수량 하향 권고]")
+    lines.append("[장기 저분양/과다재고 — 차기 제조 수량 하향 권고]")
     if long_term_low:
         for i, r in enumerate(long_term_low[:25], 1):
             lines.append(
@@ -1937,7 +2076,7 @@ def build_ai_prompt(
         lines.append("없음")
 
     lines.append("")
-    lines.append("[사전 산출: 현 재고 기준 분양금액 환산액]")
+    lines.append("[현 재고 기준 분양금액 환산액]")
     lines.append(f"- 총액: {_fmt_money(valuation.get('total_value'))}")
     for tname, tval in (valuation.get("by_type") or {}).items():
         lines.append(f"- {tname}: {_fmt_money(tval)}")
@@ -2045,7 +2184,7 @@ def find_items_by_partial_query(
 def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
     """챗봇용 사전 산출 스냅샷 — 카테고리 전수 목록 포함(표준 리포트와 동일 수치)."""
     if not flags:
-        return "[사전 산출 스냅샷] 없음 (플래그 미제공)"
+        return "[재고 조사 스냅샷] 없음 (플래그 미제공)"
 
     by_code = flags.get("by_code") or {}
     dashboard = flags.get("dashboard") or {}
@@ -2060,10 +2199,13 @@ def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
     increase_only = [r for r in monitoring if r.get("acceleration") == "증가"]
 
     lines = [
-        "[사전 산출 스냅샷 — 표준 분석 리포트와 동일 수치. 이 스냅샷·실시간 조회 수치만 사용하세요]",
-        "[전수 목록 규칙] 아래 '전수 N건' 섹션은 요약·생략 없이 전부 수록되어 있습니다. "
-        "사용자가 전체/모두/전수/N건 목록을 요청하면 해당 섹션을 1~N번까지 그대로 출력하세요. "
-        "'등 N건'·일부만 나열·임의 생략·환각 추가를 금지합니다.",
+        "[재고 조사 스냅샷 — 특정 시점의 재고 조사 데이터(사전 산출 결과). "
+        "표준 분석 리포트와 동일 수치. 이 스냅샷·실시간 조회 수치만 사용하세요]",
+        "[용어] '스냅샷(Snapshot)' = 특정 시점의 재고 조사 데이터(코드로 산출된 정량 결과).",
+        "[전수 목록 규칙] 아래 마크다운 표는 요약·생략 없이 전부 수록되어 있습니다. "
+        "사용자가 전체/모두/전수/N건·미보유·1년 이내 소진 목록을 요청하면 "
+        "해당 표를 그대로 출력하세요. '등 N건'·일부만 나열·환각 추가를 금지합니다. "
+        "재고량은 정수, 소진 시점은 '소진예상일시(YYYY년 MM월 기준)' 형식을 유지하세요.",
         f"- by_code 품목 수: {len(by_code)}",
         f"- 5년 이내 소진 후보: {len(flags.get('deplete_codes') or [])}건",
         f"- 가속(급가속/증가) 후보: {len(flags.get('surge_codes') or [])}건",
@@ -2088,16 +2230,9 @@ def serialize_flags_snapshot(flags: dict[str, Any] | None) -> str:
         )
         lines.append(
             f"[스냅샷: 공정서 미보유 품목 전수] {len(missing_comp)}건 "
-            "(생략 없음 · 1~N 전부 출력 · '등 N건' 금지)"
+            "(마크다운 표 · 생략 없음)"
         )
-        for i, r in enumerate(missing_comp, 1):
-            lines.append(
-                f"{i}. {r.get('name_ko') or r.get('name_en') or '-'} | "
-                f"영문:{r.get('name_en') or '-'} | "
-                f"공정서:{r.get('pharmacopoeia_kind') or r.get('pharmacopoeia') or '-'} | "
-                f"태그:{r.get('pharmacopoeia_tag') or '-'} | "
-                f"기원:{r.get('origin_ko') or '-'}"
-            )
+        lines.extend(_missing_rows_to_markdown_table(list(missing_comp)))
 
     lines.append("")
     lines.append("[스냅샷: 소진 기간 카테고리 — 건수 요약]")
@@ -2358,16 +2493,9 @@ def query_live_inventory_context(
             f"필터 결과 {len(filtered_missing)}건 / 전체 미보유 {len(missing_all)}건."
         )
         lines.append(
-            f"[실시간: 공정서 미보유 필터 결과] {len(filtered_missing)}건 (생략 없음)"
+            f"[실시간: 공정서 미보유 필터 결과] {len(filtered_missing)}건 (마크다운 표)"
         )
-        for i, r in enumerate(filtered_missing, 1):
-            lines.append(
-                f"{i}. {r.get('name_ko') or r.get('name_en') or '-'} | "
-                f"영문:{r.get('name_en') or '-'} | "
-                f"공정서:{r.get('pharmacopoeia_kind') or r.get('pharmacopoeia') or '-'} | "
-                f"태그:{r.get('pharmacopoeia_tag') or '-'} | "
-                f"기원:{r.get('origin_ko') or '-'}"
-            )
+        lines.extend(_missing_rows_to_markdown_table(list(filtered_missing)))
         lines.append("")
 
     if full_intent.get("wants_full"):
@@ -2564,8 +2692,10 @@ def build_followup_prompt(
     lines = [
         "당신은 생약표준품 재고·분양 분석 전문가입니다.",
         "사용자의 후속 질문에는 초기 리포트 문구만 반복하지 말고, "
-        "아래 [사전 산출 스냅샷]과 [실시간 재고 데이터 재검토 결과]·공정서 DB를 우선 근거로 답하세요.",
+        "아래 [재고 조사 스냅샷]과 [실시간 재고 데이터 재검토 결과]·공정서 DB를 우선 근거로 답하세요.",
         "",
+        "[용어] '스냅샷(Snapshot)'은 특정 시점의 재고 조사 데이터(코드로 산출된 정량 결과)를 의미합니다. "
+        "답변에서 스냅샷이라고 말할 때 이 뜻을 명확히 하세요.",
         "[할루시네이션 금지] 제공된 스냅샷·실시간 수치·공정서 DB에 없는 내용을 단정하지 마세요. "
         "불확실하면 '확실하지 않음' 또는 '추측입니다'라고 밝히세요.",
         "[형식] '분석 전문가의 제언' 섹션은 작성하지 마세요.",
@@ -2575,14 +2705,14 @@ def build_followup_prompt(
         "[우선순위] 초기 리포트 문구와 스냅샷/실시간 수치가 다르면 스냅샷·실시간 수치를 사용하세요.",
         "아래는 코드로 계산된 정량 팩트만입니다. 이 수치 외 추론하지 마세요.",
         "",
-        "[전수 목록 요청 대응 — 필수]",
+        "[전수 목록·표 출력 — 필수]",
         "- 사용자가 '전체/모두/전수/전량/리스트/목록/N건 모두' 등을 요청하면, "
-        "초기 리포트의 '가스트로디게닌, 백출 … 등 N건' 요약만 반복하지 마세요.",
-        "- 스냅샷·실시간 전수 목록 섹션에 있는 품목을 1부터 N까지 번호 매김 또는 "
-        "마크다운 표/불릿으로 빠짐없이 한 번에 출력하세요.",
-        "- '등 N건', '일부만', '대표 예시'로 줄이지 말고, 없는 품목을 지어내지 마세요.",
+        "초기 리포트의 '… 등 N건' 요약만 반복하지 마세요.",
+        "- '공정서 수재 품목 중 미보유 표준품 목록/개수', '1년 이내 소진 예상 목록' 질문 시 "
+        "스냅샷·실시간의 해당 마크다운 표를 정수 재고량·소진예상일시 포함으로 누락 없이 출력하세요.",
+        "- 접기/토글 없이 마크다운 표로 1~N 전수 출력. '등 N건'·임의 생략·없는 품목 추가 금지.",
         "- 출력 건수는 해당 섹션의 '전수 N건'과 반드시 일치해야 합니다.",
-        "- 공정서 미보유/부재/없는 품목 질문·꼬리질문(KHP만, 키워드 포함 등)은 "
+        "- 공정서 미보유/부재 꼬리질문(KHP만, 키워드 포함 등)은 "
         "스냅샷·실시간의 '공정서 미보유' 필터 결과만 사용하세요.",
         f"- 이번 질문 전수 요청 감지: {full_intent}",
         "",
@@ -2592,7 +2722,7 @@ def build_followup_prompt(
         lines.append(serialize_flags_snapshot(flags))
         lines.append("")
     else:
-        lines.append("[사전 산출 스냅샷] 미제공 — 실시간 조회 결과만 사용")
+        lines.append("[재고 조사 스냅샷] 미제공 — 실시간 조회 결과만 사용")
         lines.append("")
 
     if items:
@@ -2752,33 +2882,19 @@ def markdown_report_to_collapsible_html(
     preview_n: int = 8,
     expanded_ids: set[str] | frozenset[str] | None = None,
 ) -> str:
-    """마크다운 리포트를 HTML로 변환하고, 긴 쉼표 품목 목록은 접기 UI로 감싼다."""
+    """마크다운 리포트를 HTML로 변환. 목록은 접기 없이 전수 표시(표 우선)."""
     if not md_text:
         return ""
-    expanded = set(expanded_ids or ())
     out: list[str] = []
     in_ul = False
-    section_i = 0
     lines = md_text.splitlines()
     i = 0
-
-    def _next_section() -> str:
-        nonlocal section_i
-        sid = f"c{section_i}"
-        section_i += 1
-        return sid
 
     def _close_ul() -> None:
         nonlocal in_ul
         if in_ul:
             out.append("</ul>")
             in_ul = False
-
-    def _maybe_collapse(body: str) -> str:
-        sid = _next_section()
-        return _collapse_comma_items_html(
-            body, preview_n, section_id=sid, expanded=sid in expanded
-        )
 
     while i < len(lines):
         line = lines[i].rstrip()
@@ -2788,7 +2904,7 @@ def markdown_report_to_collapsible_html(
             i += 1
             continue
 
-        # 마크다운 표 블록 → HTML table (파이프 raw 텍스트 방지)
+        # 마크다운 표 블록 → HTML table
         if _is_md_table_row(line):
             _close_ul()
             block: list[str] = []
@@ -2811,34 +2927,11 @@ def markdown_report_to_collapsible_html(
             if not in_ul:
                 out.append("<ul>")
                 in_ul = True
-            content = lm.group(2)
-            if ":" in content and content.count(",") >= preview_n:
-                prefix, _, rest = content.partition(":")
-                if rest.strip():
-                    inner = (
-                        f"{_md_inline_to_html(prefix)}: "
-                        f"{_maybe_collapse(rest.strip())}"
-                    )
-                else:
-                    inner = _md_inline_to_html(content)
-            elif content.count(",") >= max(preview_n, 8):
-                inner = _maybe_collapse(content)
-            else:
-                inner = _md_inline_to_html(content)
-            out.append(f"<li>{inner}</li>")
+            out.append(f"<li>{_md_inline_to_html(lm.group(2))}</li>")
             i += 1
             continue
 
         _close_ul()
-        if line.count(",") >= max(preview_n, 8) and ":" in line:
-            prefix, _, rest = line.partition(":")
-            if rest.strip() and rest.count(",") >= preview_n - 1:
-                out.append(
-                    f"<p>{_md_inline_to_html(prefix)}: "
-                    f"{_maybe_collapse(rest.strip())}</p>"
-                )
-                i += 1
-                continue
         out.append(f"<p>{_md_inline_to_html(line)}</p>")
         i += 1
 
@@ -3043,17 +3136,19 @@ def match_compendium_inventory(
     entries: list[CompendiumEntry],
     items: list[StockItem],
 ) -> dict[str, Any]:
-    """공정서 entries ↔ 재고 품목 매칭 (재고 엑셀 데이터는 변경하지 않음)."""
+    """공정서 entries ↔ 재고 품목 매칭.
+
+    동일성 기준: 한글 생약명 + 기원(한글/영문). 단순 영문명 단독 매칭은 사용하지 않음.
+    """
     corrections: list[dict[str, Any]] = []
     by_manage_no: dict[str, str] = {}
     by_label: dict[str, str] = {}
     matched_entry_ids: set[int] = set()
 
-    # 인덱스: exact ko / norm ko / norm en
     by_exact_ko: dict[str, list[CompendiumEntry]] = defaultdict(list)
     by_norm_ko: dict[str, list[CompendiumEntry]] = defaultdict(list)
-    by_norm_en: dict[str, list[CompendiumEntry]] = defaultdict(list)
     by_norm_origin_ko: dict[str, list[CompendiumEntry]] = defaultdict(list)
+    by_norm_origin_en: dict[str, list[CompendiumEntry]] = defaultdict(list)
 
     for e in entries:
         if e.name_ko:
@@ -3061,20 +3156,45 @@ def match_compendium_inventory(
             nk = _norm_key(e.name_ko)
             if nk:
                 by_norm_ko[nk].append(e)
-        if e.name_en:
-            ne = _norm_key(e.name_en)
-            if ne:
-                by_norm_en[ne].append(e)
         if e.origin_ko:
             no = _norm_key(e.origin_ko)
             if no:
                 by_norm_origin_ko[no].append(e)
+        if e.origin_en:
+            noe = _norm_key(e.origin_en)
+            if noe:
+                by_norm_origin_en[noe].append(e)
 
     def _pick_first(cands: list[CompendiumEntry]) -> Optional[CompendiumEntry]:
         for c in cands:
             if id(c) not in matched_entry_ids:
                 return c
         return cands[0] if cands else None
+
+    def _pick_by_origin(
+        cands: list[CompendiumEntry], stock_ko: str
+    ) -> Optional[CompendiumEntry]:
+        """동명 후보 중 기원 필드와 한글명이 교차 확인되는 항목 우선."""
+        nk = _norm_key(stock_ko)
+        scored: list[tuple[int, CompendiumEntry]] = []
+        for c in cands:
+            if id(c) in matched_entry_ids and len(cands) > 1:
+                continue
+            score = 0
+            ok = _norm_key(c.origin_ko)
+            oe = _norm_key(c.origin_en)
+            ck = _norm_key(c.name_ko)
+            if nk and ck and nk == ck:
+                score += 3
+            if nk and ok and (nk in ok or ok in nk):
+                score += 2
+            if nk and oe and (nk in oe or oe in nk):
+                score += 1
+            scored.append((score, c))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if scored and scored[0][0] > 0:
+            return scored[0][1]
+        return _pick_first(cands)
 
     for it in items:
         stock_ko = (it.name_ko or "").strip()
@@ -3083,30 +3203,36 @@ def match_compendium_inventory(
         match_type = ""
 
         if stock_ko and stock_ko in by_exact_ko:
-            hit = _pick_first(by_exact_ko[stock_ko])
+            cands = by_exact_ko[stock_ko]
+            hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
             match_type = "exact_ko"
         if hit is None and stock_ko:
             nk = _norm_key(stock_ko)
             if nk and nk in by_norm_ko:
-                hit = _pick_first(by_norm_ko[nk])
+                cands = by_norm_ko[nk]
+                hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
                 match_type = "fuzzy_ko"
-        if hit is None and stock_en:
-            ne = _norm_key(stock_en)
-            if ne and ne in by_norm_en:
-                hit = _pick_first(by_norm_en[ne])
-                match_type = "fuzzy_en"
         if hit is None and stock_ko:
-            # 기원 필드를 보조 신호로 사용 (한글명 일부가 기원에 포함되는 경우 등)
+            # 한글명 ↔ 기원(한글/영문) 교차 매칭 (영문명 단독 매칭 금지)
             nk = _norm_key(stock_ko)
             if nk and nk in by_norm_origin_ko:
                 hit = _pick_first(by_norm_origin_ko[nk])
-                match_type = "origin_ko"
+                match_type = "name_origin_ko"
+            elif nk and nk in by_norm_origin_en:
+                hit = _pick_first(by_norm_origin_en[nk])
+                match_type = "name_origin_en"
             else:
                 for ok, cands in by_norm_origin_ko.items():
                     if nk and (nk in ok or ok in nk) and len(nk) >= 2:
                         hit = _pick_first(cands)
-                        match_type = "origin_ko"
+                        match_type = "name_origin_ko"
                         break
+                if hit is None:
+                    for oe, cands in by_norm_origin_en.items():
+                        if nk and (nk in oe or oe in nk) and len(nk) >= 2:
+                            hit = _pick_first(cands)
+                            match_type = "name_origin_en"
+                            break
 
         if hit is None:
             continue
@@ -3115,7 +3241,6 @@ def match_compendium_inventory(
         tag = _pharmacopoeia_tag_from_text(hit.pharmacopoeia)
         short = ""
         if tag:
-            # "[KHP(생약규격집) 수재]" → "KHP(생약규격집)" (lookup이 다시 태그화 가능하도록)
             inners = re.findall(r"\[(.+?)\s*수재\]", tag)
             short = inners[0].strip() if inners else ""
             if not short:
@@ -3226,12 +3351,22 @@ def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str
         "",
         f"- 총 공정서 수재 품목 수: **{total}건**",
         f"- 재고 엑셀 보유 매칭 품목 수: **{held}건**",
-        f"- 기원/영문명 자동 보정 매칭 품목 수: **{auto_n}건**",
+        f"- 기원(한글/영문) 기반 자동 보정 매칭 품목 수: **{auto_n}건**",
         f"- 공정서 수재 품목 중 미보유(부재) 품목 총 건수: **{miss_n}건**",
         f"- 미보유 대표 예시: {ex_txt}",
-        "- 세부 전체 목록은 우측 챗봇에서 「공정서 미보유 품목 전체」로 조회 가능합니다.",
+        "",
+        f"### 공정서 미보유 표준품 전수 ({miss_n}건)",
         "",
     ]
+    if missing_items:
+        dict_rows = [
+            r if isinstance(r, dict) else _missing_compendium_row(r, i)
+            for i, r in enumerate(missing_items, 1)
+        ]
+        lines.extend(_missing_rows_to_markdown_table(dict_rows))
+    else:
+        lines.append("(해당 없음)")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -3248,9 +3383,8 @@ def format_compendium_match_report(match_result: dict[str, Any]) -> str:
     lines = [
         format_compendium_stats_markdown(match_result).rstrip(),
         "",
-        "[표준 리포트 작성 지시] 위 '공정서 DB 매칭 및 수재 현황' 마크다운을 "
-        "리포트 본문에 수치 변경 없이 그대로 포함하세요. "
-        "미보유 전수 목록은 챗봇 조회용이며, 리포트에는 건수·대표 예시·챗봇 안내만 둡니다.",
+        "[표준 리포트 작성 지시] 위 '공정서 DB 매칭 및 수재 현황'과 미보유 전수 마크다운 표를 "
+        "리포트 본문에 수치 변경 없이 그대로 포함하세요. 접기/토글 없이 표로 전수 나열합니다.",
         "",
         f"[공정서 매칭 보정 상세] 총 {len(corrections)}건",
     ]
@@ -3262,30 +3396,9 @@ def format_compendium_match_report(match_result: dict[str, Any]) -> str:
                 f"공정서:{c.get('pharmacopoeia') or '-'}"
             )
         if len(corrections) > 30:
-            lines.append(f"- … 보정 상세 외 {len(corrections) - 30}건 (스냅샷·챗봇 전수 참고)")
+            lines.append(f"- … 보정 상세 외 {len(corrections) - 30}건")
     else:
         lines.append("- 보정 매칭 없음")
-
-    lines.append("")
-    lines.append(
-        f"[미보유 공정서 표준품 전수] {len(missing_items)}건 "
-        "(챗봇 '전체/모두' 요청 시 1~N 전부 출력)"
-    )
-    if not missing_items:
-        lines.append("- 없음")
-    else:
-        for i, row in enumerate(missing_items, 1):
-            if isinstance(row, dict):
-                ko = row.get("name_ko") or "-"
-                en = row.get("name_en") or ""
-                kind = row.get("pharmacopoeia_kind") or row.get("pharmacopoeia") or "-"
-                lines.append(
-                    f"{i}. {ko}"
-                    + (f" / {en}" if en else "")
-                    + f" | 공정서:{kind}"
-                )
-            else:
-                lines.append(f"{i}. {getattr(row, 'name_ko', row)}")
 
     return "\n".join(lines)
 

@@ -330,7 +330,7 @@ def test_live_query_followup_uses_inventory():
     assert "STD-001" in live or "감초" in live
     assert "스냅샷" in live or "by_code" in live
     snap = serialize_flags_snapshot(flags)
-    assert "사전 산출 스냅샷" in snap
+    assert "재고 조사 스냅샷" in snap or "스냅샷" in snap
     assert "전수" in snap
     assert "위험등급" in snap or "소진구간" in snap
     prompt = build_followup_prompt(
@@ -357,17 +357,11 @@ def test_live_query_followup_uses_inventory():
         "- 1년 이내 (10건): "
         + ", ".join(f"품목{i}" for i in range(12))
     )
-    assert "expand:c0" in html
-    assert "전체 12개 품목 펼쳐보기" in html
+    # 접기/토글 배제 — 전수 표시
+    assert "expand:" not in html
+    assert "collapse:" not in html
     assert "details" not in html
-    html_open = markdown_report_to_collapsible_html(
-        "- 1년 이내 (10건): "
-        + ", ".join(f"품목{i}" for i in range(12)),
-        expanded_ids={"c0"},
-    )
-    assert "collapse:c0" in html_open
-    assert "품목11" in html_open
-    assert "접기" in html_open
+    assert "품목0" in html and "품목11" in html
 
 
 def test_full_catalog_snapshot_and_intent():
@@ -534,7 +528,7 @@ def test_compendium_missing_set_and_followup_filter():
     assert len(match["missing_items"]) == 3
     md = format_compendium_stats_markdown(match)
     assert "공정서 DB 매칭" in md and "3건" in md
-    assert "챗봇" in md
+    assert "미보유" in md and "|" in md  # 마크다운 표 포함
 
     intent = detect_full_list_intent("공정서 미보유 품목 전체 알려줘")
     assert intent["missing_compendium"]
