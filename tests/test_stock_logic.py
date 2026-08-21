@@ -436,10 +436,12 @@ def test_split_markdown_report_sections():
     assert len(secs) == 4
     assert secs[0]["short"] == "요약"
     assert secs[1]["short"] == "소진"
-    assert secs[2]["short"] == "제조"
+    assert secs[2]["short"] == "검토"
     assert secs[3]["short"] == "공정서"
     assert "내용A" in secs[1]["markdown"]
     assert _report_section_short_label("모니터링 대상") == "가속"
+    assert _report_section_short_label("재고 없음(미보유)") == "미보유"
+    assert _report_section_short_label("차년도 제조검토대상") == "검토"
 
 
 def test_markdown_report_renders_tables_as_html():
