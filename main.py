@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.47
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.48
 """
 
 from __future__ import annotations
@@ -110,20 +110,20 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.47"
+APP_VERSION = "v1.48"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
+# 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
 GEMINI_MODEL_PREFERENCES = [
-    "gemini-3.1-flash-lite",
-    "gemini-flash-latest",
-    "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
 ]
 _resolved_gemini_model: str | None = None
-_MAX_MODEL_PROBES = 4
+_MAX_MODEL_PROBES = 10
 
 APP_STYLE = """
 QMainWindow, QWidget {
@@ -409,7 +409,29 @@ def _is_model_unavailable_error(exc: BaseException) -> bool:
     return code in (404, 400, 429, 503, 504)
 
 
-def _candidate_models(prioritize: str | None = None) -> list[str]:
+def _discover_flash_models(client) -> list[str]:
+    """API에서 사용 가능한 Flash 계열 모델 ID를 조회 (실패 시 빈 목록)."""
+    found: list[str] = []
+    try:
+        pager = client.models.list()
+        for m in pager:
+            name = str(getattr(m, "name", "") or "")
+            mid = name.split("/")[-1].strip()
+            if not mid:
+                continue
+            low = mid.lower()
+            if "flash" not in low:
+                continue
+            if any(x in low for x in ("embed", "tts", "live", "image", "preview")):
+                continue
+            if mid not in found:
+                found.append(mid)
+    except Exception as exc:
+        log_gemini("WARN", f"모델 목록 조회 실패(고정 후보로 진행): {format_gemini_error(exc)}")
+    return found
+
+
+def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | None = None) -> list[str]:
     ordered: list[str] = []
     if prioritize:
         ordered.append(prioritize)
@@ -418,6 +440,9 @@ def _candidate_models(prioritize: str | None = None) -> list[str]:
     for preferred in GEMINI_MODEL_PREFERENCES:
         if preferred not in ordered:
             ordered.append(preferred)
+    for mid in discovered or []:
+        if mid not in ordered:
+            ordered.append(mid)
     return ordered[:_MAX_MODEL_PROBES]
 
 
@@ -429,15 +454,31 @@ def extract_response_text(response: Any) -> str | None:
 
 
 def _probe_model(client, model: str) -> bool:
+    """모델이 generate_content에 응답하는지 짧게 검증.
+
+    thinking 모델은 낮은 max_output_tokens에서 본문이 비는 경우가 있어
+    토큰 여유를 두고, 후보(candidates)만 있어도 가용으로 본다.
+    """
     from google.genai import types
 
     try:
+        try:
+            config = types.GenerateContentConfig(
+                max_output_tokens=64,
+                temperature=0,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            )
+        except Exception:
+            config = types.GenerateContentConfig(max_output_tokens=64, temperature=0)
         response = client.models.generate_content(
             model=model,
             contents="Reply with exactly one word: OK",
-            config=types.GenerateContentConfig(max_output_tokens=16, temperature=0),
+            config=config,
         )
-        return extract_response_text(response) is not None
+        if extract_response_text(response) is not None:
+            return True
+        candidates = getattr(response, "candidates", None) or []
+        return bool(candidates)
     except Exception as exc:
         if _is_auth_error(exc):
             raise
@@ -450,8 +491,14 @@ def resolve_gemini_model(client, force_refresh: bool = False) -> str:
     if _resolved_gemini_model and not force_refresh:
         return _resolved_gemini_model
 
+    discovered = _discover_flash_models(client)
+    if discovered:
+        log_gemini("INFO", f"API Flash 모델 목록: {', '.join(discovered[:12])}")
+
     errors: list[str] = []
-    for model in _candidate_models(prioritize=_resolved_gemini_model):
+    for model in _candidate_models(
+        prioritize=_resolved_gemini_model, discovered=discovered
+    ):
         log_gemini("INFO", f"모델 후보 검증: {model}")
         try:
             if _probe_model(client, model):
@@ -466,7 +513,12 @@ def resolve_gemini_model(client, force_refresh: bool = False) -> str:
             errors.append(f"{model}: {detail}")
             log_gemini("ERROR", f"모델 검증 실패: {model} — {detail}", exc)
 
-    raise RuntimeError("사용 가능한 Gemini Flash 모델을 찾지 못했습니다.\n" + "\n".join(errors[:8]))
+    detail = "\n".join(errors[:10]) if errors else "(후보 모델 없음)"
+    raise RuntimeError(
+        "사용 가능한 Gemini Flash 모델을 찾지 못했습니다.\n"
+        "API Key 권한·할당량과 네트워크를 확인한 뒤 다시 연결 테스트해 주세요.\n"
+        + detail
+    )
 
 
 def get_active_gemini_model() -> str:

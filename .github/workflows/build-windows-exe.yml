@@ -64,7 +64,7 @@ jobs:
           generate_release_notes: true
           body: |
             ## Summary
-            - KPI 요약(자동 종합 의견) 불필요한 면책 문구 제거
+            - Gemini 연결: 가용 Flash 모델 우선순위·탐색 범위 확대 (2.5 Flash 우선)
 
             ## Assets
             - `${{ steps.exe.outputs.name }}` (Windows one-file, Python 3.12 / PE VERSIONINFO 포함)
