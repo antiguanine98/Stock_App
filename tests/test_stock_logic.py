@@ -443,11 +443,86 @@ def test_split_markdown_report_sections():
     assert by_id["manufacture"]["short"] == "검토"
     assert "내용B" in by_id["manufacture"]["markdown"]
     assert by_id["compendium"]["short"] == "공정서"
-    # 고정 버튼용 섹션은 본문 없어도 항상 존재
+    # 고정 버튼용 섹션은 본문 없어도 항상 존재 — 가속은 빈 플레이스홀더 대신 표 본문
     assert by_id["accel"]["short"] == "가속"
+    assert "분양 가속 모니터링" in by_id["accel"]["markdown"]
+    assert "본문이 없습니다" not in by_id["accel"]["markdown"]
+    assert "| 가속도 |" in by_id["accel"]["markdown"]
     assert _report_section_short_label("모니터링 대상") == "가속"
     assert _report_section_short_label("재고 없음(미보유)") == "미보유"
     assert _report_section_short_label("차년도 제조검토대상") == "검토"
+
+
+def test_ensure_accel_monitoring_section_always_has_body():
+    """AI 리포트에 가속 섹션이 없거나 빈 표여도 정량 표를 항상 채운다."""
+    from stock_logic import (
+        ensure_accel_monitoring_in_report,
+        format_accel_monitoring_markdown,
+        split_markdown_report_sections,
+    )
+
+    monitoring = [
+        {
+            "label": "가속품A (A-001)",
+            "name_ko": "가속품A",
+            "manage_no": "A-001",
+            "std_type": "표준생약",
+            "last_qty": 120,
+            "acceleration": "급가속",
+            "acceleration_ratio": 2.5,
+            "annual_rate": 40.0,
+            "deplete_ym": "2027년 03월",
+            "reliability": "A(충분)",
+        },
+        {
+            "label": "증가품B (B-002)",
+            "name_ko": "증가품B",
+            "manage_no": "B-002",
+            "std_type": "지표성분",
+            "last_qty": 80,
+            "acceleration": "증가",
+            "acceleration_ratio": 1.4,
+            "annual_rate": 12.0,
+            "deplete_ym": "2029년 01월",
+            "reliability": "B(보통)",
+        },
+    ]
+
+    # 1) 섹션 자체가 없는 리포트
+    bare = "## 1페이지 요약 대시보드\n\n요약입니다.\n\n## 소진 예상\n\n소진 내용\n"
+    filled = ensure_accel_monitoring_in_report(bare, monitoring)
+    assert "## 분양 가속 모니터링" in filled
+    assert "가속품A" in filled and "급가속" in filled
+    assert "증가품B" in filled
+    secs = split_markdown_report_sections(filled, monitoring=monitoring)
+    accel = next(s for s in secs if s["id"] == "accel")
+    assert "본문이 없습니다" not in accel["markdown"]
+    assert "| 가속품A |" in accel["markdown"] or "가속품A" in accel["markdown"]
+    assert accel["markdown"].count("|") >= 10
+
+    # 2) 빈 헤딩만 있는 경우
+    empty_heading = bare + "\n## 분양 가속 모니터링\n\n"
+    filled2 = ensure_accel_monitoring_in_report(empty_heading, monitoring)
+    assert "가속품A" in filled2
+    assert filled2.count("## 분양 가속 모니터링") == 1
+
+    # 3) 빈 표만 있는 경우
+    empty_table = (
+        bare
+        + "\n## 분양 가속 모니터링\n\n"
+        + "| # | 한글명 | 가속도 |\n| --- | --- | --- |\n"
+    )
+    filled3 = ensure_accel_monitoring_in_report(empty_table, monitoring)
+    assert "A-001" in filled3 and "2.50" in filled3
+
+    # 4) 모니터링 0건이어도 본문(해당 없음)은 존재
+    zero = format_accel_monitoring_markdown([])
+    assert "해당 없음" in zero
+    assert "| 가속도 |" in zero
+    filled0 = ensure_accel_monitoring_in_report(bare, [])
+    assert "해당 없음" in filled0
+    assert "본문이 없습니다" not in filled0
+
 
 
 def test_markdown_report_renders_tables_as_html():
@@ -748,6 +823,7 @@ if __name__ == "__main__":
         test_full_catalog_snapshot_and_intent,
         test_markdown_report_renders_tables_as_html,
         test_split_markdown_report_sections,
+        test_ensure_accel_monitoring_section_always_has_body,
         test_manufacture_candidates_always_top10_by_score,
         test_compendium_missing_set_and_followup_filter,
         test_compendium_db_not_timeseries,
