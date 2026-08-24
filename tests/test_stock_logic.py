@@ -538,6 +538,66 @@ def test_ensure_mandatory_report_sections():
     assert build_mandatory_section_markdown("deplete", flags).startswith("## 소진 예상")
 
 
+def test_truncated_ai_tables_replaced_with_full_list():
+    """AI가 중략으로 줄인 표는 정량 전수 표로 교체한다."""
+    from stock_logic import (
+        ensure_mandatory_report_sections,
+        split_markdown_report_sections,
+        ZERO_STOCK_CATEGORY,
+    )
+
+    zero_rows = [
+        {
+            "name_ko": f"제로{i}",
+            "manage_no": f"Z-{i:03d}",
+            "std_type": "표준생약",
+            "last_qty": 0,
+            "deplete_ym": "-",
+            "depletion_category": ZERO_STOCK_CATEGORY,
+            "risk_grade": "재고없음",
+        }
+        for i in range(1, 24)
+    ]
+    miss_rows = [
+        {
+            "name_ko": f"미보유{i}",
+            "origin_ko": "한국",
+            "origin_en": "Korea",
+            "pharmacopoeia": "KP",
+        }
+        for i in range(1, 6)
+    ]
+    flags = {
+        "depletion_category_items": {ZERO_STOCK_CATEGORY: zero_rows},
+        "missing_compendium_items": miss_rows,
+        "manufacture_candidates": {},
+        "monitoring_targets": [],
+    }
+    truncated = (
+        "## 미보유(재고 없음·공정서 미보유)\n\n"
+        "### 재고 없음(미보유) (23건)\n\n"
+        "| # | 한글명 | 관리번호 | 유형 | 재고 | 소진예상일시 | 소진구간 | 위험등급 |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        "| 1 | 제로1 | Z-001 | 표준생약 | 0 | - | 재고 없음(미보유) | 재고없음 |\n"
+        "| ... | (중략) | ... | ... | ... | ... | ... | ... |\n"
+        "| 23 | 제로23 | Z-023 | 표준생약 | 0 | - | 재고 없음(미보유) | 재고없음 |\n\n"
+        "### 공정서 미보유 표준품 (5건)\n\n"
+        "| # | 한글명 | 기원(한글) | 기원(영문) | 공정서 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 1 | 미보유1 | 한국 | Korea | KP |\n"
+        "| ... | (중략) | ... | ... | ... |\n"
+        "| 5 | 미보유5 | 한국 | Korea | KP |\n"
+    )
+    filled = ensure_mandatory_report_sections(truncated, flags=flags)
+    assert "(중략)" not in filled
+    assert "제로12" in filled
+    assert "미보유3" in filled
+    secs = split_markdown_report_sections(filled, flags=flags)
+    missing = next(s for s in secs if s["id"] == "missing")
+    assert "(중략)" not in missing["markdown"]
+    assert missing["markdown"].count("| 제로") >= 23
+
+
 def test_ensure_accel_monitoring_section_always_has_body():
     """AI 리포트에 가속 섹션이 없거나 빈 표여도 정량 표를 항상 채운다."""
     from stock_logic import (
@@ -909,6 +969,7 @@ if __name__ == "__main__":
         test_markdown_report_renders_tables_as_html,
         test_split_markdown_report_sections,
         test_ensure_mandatory_report_sections,
+        test_truncated_ai_tables_replaced_with_full_list,
         test_ensure_accel_monitoring_section_always_has_body,
         test_manufacture_candidates_always_top10_by_score,
         test_compendium_missing_set_and_followup_filter,
