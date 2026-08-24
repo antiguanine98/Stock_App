@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.44
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.45
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ from stock_logic import (
     build_followup_prompt,
     build_scatter3d_records,
     collect_ai_analysis_flags,
+    ensure_accel_monitoring_in_report,
     extract_mentioned_codes_from_report,
     format_compendium_context,
     format_compendium_match_report,
@@ -109,7 +110,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.44"
+APP_VERSION = "v1.45"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -2296,6 +2297,11 @@ class MainWindow(QMainWindow):
             self._report_section_key = str(key)
             self._render_report_html()
 
+    def _monitoring_targets_for_report(self) -> list:
+        data = self.inventory_data or {}
+        flags = data.get("ai_flags") or {}
+        return list(flags.get("monitoring_targets") or [])
+
     def _render_report_html(self) -> None:
         """표준 리포트를 섹션 버튼 선택에 맞춰 HTML로 표시."""
         if not self._initial_report:
@@ -2304,8 +2310,11 @@ class MainWindow(QMainWindow):
             self._report_sections = []
             return
 
+        monitoring = self._monitoring_targets_for_report()
         if not self._report_sections:
-            self._report_sections = split_markdown_report_sections(self._initial_report)
+            self._report_sections = split_markdown_report_sections(
+                self._initial_report, monitoring=monitoring
+            )
             self._rebuild_report_nav()
 
         md = self._initial_report
@@ -2498,9 +2507,13 @@ class MainWindow(QMainWindow):
         self._set_ai_progress(None)
         self._chat_busy = False
         self._chat_history.clear()
+        monitoring = self._monitoring_targets_for_report()
+        text = ensure_accel_monitoring_in_report(text, monitoring)
         self._initial_report = text
         self._report_expanded_ids.clear()
-        self._report_sections = split_markdown_report_sections(text)
+        self._report_sections = split_markdown_report_sections(
+            text, monitoring=monitoring
+        )
         self._report_section_key = (
             "summary"
             if any(s["id"] == "summary" for s in self._report_sections)

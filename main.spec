@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Stock_App v1.44 (Windows one-file, Python 3.12)."""
+"""PyInstaller spec for Stock_App v1.45 (Windows one-file, Python 3.12)."""
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
@@ -57,7 +57,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="Stock_App_v1.44",
+    name="Stock_App_v1.45",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -1567,6 +1567,189 @@ def format_kpi_dashboard_markdown(dashboard: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _monitoring_rows_to_markdown_table(rows: list[dict[str, Any]]) -> list[str]:
+    """분양 가속 모니터링용 마크다운 표 (전수)."""
+    headers = [
+        "#",
+        "한글명",
+        "관리번호",
+        "유형",
+        "가속도",
+        "비율",
+        "연평균",
+        "재고",
+        "소진예상일시",
+        "신뢰도",
+    ]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for i, r in enumerate(rows, 1):
+        ratio = r.get("acceleration_ratio")
+        ratio_txt = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "-"
+        ar = r.get("annual_rate")
+        ar_txt = f"{ar:.2f}" if isinstance(ar, (int, float)) else "-"
+        cells = [
+            str(i),
+            str(r.get("name_ko") or r.get("label") or "-").replace("|", "/"),
+            str(r.get("manage_no") or "-").replace("|", "/"),
+            str(r.get("std_type") or "-").replace("|", "/"),
+            str(r.get("acceleration") or "-").replace("|", "/"),
+            ratio_txt,
+            ar_txt,
+            format_qty_int(r.get("last_qty")),
+            str(r.get("deplete_ym") or "-").replace("|", "/"),
+            str(r.get("reliability") or "-").replace("|", "/"),
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
+def format_accel_monitoring_markdown(monitoring: list[dict[str, Any]] | None) -> str:
+    """표준 리포트 '분양 가속 모니터링' 섹션 — 항상 본문(표 또는 해당없음)을 포함."""
+    rows = list(monitoring or [])
+    surge_n = sum(1 for r in rows if r.get("acceleration") == "급가속")
+    increase_n = sum(1 for r in rows if r.get("acceleration") == "증가")
+    lines = [
+        "## 분양 가속 모니터링",
+        "",
+        f"{ACCELERATION_FORMULA_KO}",
+        "",
+        f"급가속 {surge_n}건 · 증가 {increase_n}건 · 합계 {len(rows)}건 "
+        "(마크다운 표 · 생략 없음)",
+        "",
+    ]
+    if not rows:
+        lines.append("해당 없음 (급가속·증가 품목 0건).")
+        lines.append("")
+        lines.extend(_monitoring_rows_to_markdown_table([]))
+        return "\n".join(lines)
+    lines.extend(_monitoring_rows_to_markdown_table(rows))
+    return "\n".join(lines)
+
+
+def _accel_section_has_item_rows(markdown: str) -> bool:
+    """표 데이터 행 또는 번호 목록 품목이 있는지."""
+    for line in (markdown or "").splitlines():
+        s = line.strip()
+        if re.match(r"^\d+\.\s+\S", s):
+            return True
+        if not s.startswith("|") or _is_md_table_sep(s):
+            continue
+        cells = _parse_md_table_cells(s)
+        if not cells:
+            continue
+        if cells[0] in ("#", "번호", "한글명"):
+            continue
+        if cells[0].isdigit():
+            return True
+        if any(c in ("급가속", "증가") for c in cells):
+            return True
+    return False
+
+
+def _accel_section_body_is_empty(markdown: str) -> bool:
+    """가속 섹션에 헤딩 외 본문이 사실상 없는지(플레이스홀더·빈 표) 판별."""
+    body = (markdown or "").strip()
+    if not body:
+        return True
+    if "본문이 없습니다" in body:
+        return True
+    content_lines: list[str] = []
+    for line in body.splitlines():
+        s = line.strip()
+        if not s or re.match(r"^#{1,4}\s+", s):
+            continue
+        content_lines.append(s)
+    if not content_lines:
+        return True
+    if _accel_section_has_item_rows(body):
+        return False
+    non_table = [ln for ln in content_lines if not ln.startswith("|")]
+    if any("해당 없음" in ln or re.search(r"0\s*건", ln) or ln == "없음" for ln in non_table):
+        return False
+    # 산식·건수 요약/빈 표 헤더만 있으면 채움 대상
+    return True
+
+
+def _extract_raw_accel_section(md_text: str) -> str | None:
+    """원문 마크다운에서 가속/모니터링 ##·### 블록을 추출. 없으면 None."""
+    if not (md_text or "").strip():
+        return None
+    lines = md_text.splitlines()
+    collecting = False
+    buf: list[str] = []
+    found = False
+    for line in lines:
+        hm = re.match(r"^(#{2,3})\s+(.+)$", line.strip())
+        if hm:
+            title = hm.group(2).strip()
+            if _canonical_section_key(title) == "accel":
+                collecting = True
+                found = True
+                buf = [line]
+                continue
+            if collecting:
+                break
+            continue
+        if collecting:
+            buf.append(line)
+    if not found:
+        return None
+    return "\n".join(buf).strip()
+
+
+def _strip_accel_heading_blocks(md_text: str) -> str:
+    """마크다운에서 가속/모니터링 관련 ##/### 블록을 제거."""
+    if not (md_text or "").strip():
+        return ""
+    out: list[str] = []
+    skipping = False
+    for line in md_text.splitlines():
+        hm = re.match(r"^(#{2,3})\s+(.+)$", line.strip())
+        if hm:
+            title = hm.group(2).strip()
+            if _canonical_section_key(title) == "accel":
+                skipping = True
+                continue
+            skipping = False
+            out.append(line)
+            continue
+        if not skipping:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def ensure_accel_monitoring_in_report(
+    md_text: str,
+    monitoring: list[dict[str, Any]] | None = None,
+) -> str:
+    """리포트에 '분양 가속 모니터링' 섹션 본문이 항상 있도록 보정.
+
+    AI 출력이 섹션을 빠뜨리거나 빈 표만 남긴 경우 정량 산출 표로 채운다.
+    """
+    mon = list(monitoring or [])
+    section = format_accel_monitoring_markdown(mon)
+    text = (md_text or "").strip()
+    if not text:
+        return section
+
+    raw_accel = _extract_raw_accel_section(text)
+    need_inject = raw_accel is None or _accel_section_body_is_empty(raw_accel)
+    if not need_inject and mon and not _accel_section_has_item_rows(raw_accel or ""):
+        # '해당 없음'만 있는데 실제 모니터링 대상이 있으면 정량 표로 교체
+        need_inject = True
+
+    if not need_inject:
+        return text
+
+    cleaned = _strip_accel_heading_blocks(text)
+    if cleaned:
+        return cleaned.rstrip() + "\n\n" + section + "\n"
+    return section + "\n"
+
+
 def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
     """AI 프롬프트와 동일한 기준으로 고갈·가속·우선순위·환산액 플래그를 산출."""
     deplete_codes: list[str] = []
@@ -1995,7 +2178,8 @@ def build_ai_prompt(
         "소진 시점은 'YYYY년 MM월' 형식만 사용하세요 (예: 2027년 03월). "
         "'소진예상일시', '기준' 등 부가 문구는 붙이지 마세요. "
         "섹션 제목은 반드시 ## 헤딩으로 분리하세요: "
-        "'## 소진 예상', '## 미보유', '## 차년도 제조검토', '## 공정서 DB 매칭' 등.",
+        "'## 소진 예상', '## 미보유', '## 차년도 제조검토', "
+        "'## 분양 가속 모니터링', '## 공정서 DB 매칭' 등.",
         "",
         "[분석 요청 항목]",
         "1. 품목별 분양 속도(빠름/보통/느림) — 증가 구간 제외 속도 사용",
@@ -2011,7 +2195,9 @@ def build_ai_prompt(
         "(마크다운 표, 재고 0 제외, 항상 상위 10건; 해당 유형이 10건 미만이면 전량)",
         "   ※ 제조 우선순위 섹션 서두에 아래 산출 공식·가중치를 그대로 인용해 명시할 것:",
         f"   {PRIORITY_FORMULA_KO}",
-        "6. 모니터링 대상: 분양 가속도 급증 품목 + 정량 지표",
+        "6. '## 분양 가속 모니터링' 섹션을 반드시 포함하세요. "
+        "아래 사전 산출 마크다운 표를 그대로 전수 수록하고, 빈 표·섹션 생략을 금지합니다. "
+        "대상이 0건이면 '해당 없음 (급가속·증가 품목 0건)'을 본문에 명시하세요.",
         "7. 현 재고 기준 분양금액 환산액(현재재고×가격): 전체·유형별·TOP20",
         "8. 공정서 DB가 제공된 경우: '공정서 DB 매칭 및 수재 현황'과 "
         "미보유 표준품 전수 마크다운 표를 포함하세요.",
@@ -2060,33 +2246,8 @@ def build_ai_prompt(
     lines.append("[차년도 제조검토대상 — 지표성분]")
     lines.append(_format_candidate_lines(manufacture.get("지표성분") or [], full=True))
     lines.append("")
-    lines.append("[모니터링 대상(분양 가속)]")
-    surge_mon = [r for r in monitoring if r.get("acceleration") == "급가속"]
-    other_mon = [r for r in monitoring if r.get("acceleration") != "급가속"]
-    if surge_mon:
-        lines.append(f"- 급가속 전량 ({len(surge_mon)}건):")
-        for i, r in enumerate(surge_mon, 1):
-            ar = r.get("annual_rate")
-            ar_txt = f"{ar:.2f}" if isinstance(ar, (int, float)) else "-"
-            ratio = r.get("acceleration_ratio")
-            ratio_txt = f"{ratio:.2f}" if isinstance(ratio, (int, float)) else "-"
-            lines.append(
-                f"{i}. {r['label']} | 가속도:급가속 | 비율:{ratio_txt} | "
-                f"연평균:{ar_txt} | 소진:{r.get('deplete_ym') or '-'} | "
-                f"{r.get('reliability')}"
-            )
-    else:
-        lines.append("- 급가속: 없음")
-    if other_mon:
-        lines.append(f"- 증가 등 ({len(other_mon)}건):")
-        for i, r in enumerate(other_mon, 1):
-            ar = r.get("annual_rate")
-            ar_txt = f"{ar:.2f}" if isinstance(ar, (int, float)) else "-"
-            lines.append(
-                f"{i}. {r['label']} | {r.get('indicators')} | "
-                f"연평균:{ar_txt} | 소진:{r.get('deplete_ym') or '-'} | "
-                f"{r.get('reliability')}"
-            )
+    lines.append("[분양 가속 모니터링 — 마크다운 표 전수 · 리포트에 그대로 수록]")
+    lines.append(format_accel_monitoring_markdown(monitoring))
 
     lines.append("")
     lines.append("[장기 저분양/과다재고 — 차기 제조 수량 하향 권고]")
@@ -2908,15 +3069,20 @@ CANONICAL_REPORT_NAV = (
     ("deplete", "소진", ("소진 예상", "소진기간", "소진 기간", "소진구간", "소진")),
     ("missing", "미보유", ("미보유", "재고 없음", "재고없음", "부재")),
     ("manufacture", "검토", ("제조검토", "제조 검토", "우선검토", "제조")),
-    ("accel", "가속", ("모니터링", "급가속", "분양 가속", "가속")),
+    ("accel", "가속", ("분양 가속 모니터링", "모니터링", "급가속", "분양 가속", "가속")),
     ("compendium", "공정서", ("공정서", "수재", "매칭")),
 )
 
 
-def split_markdown_report_sections(md_text: str) -> list[dict[str, str]]:
+def split_markdown_report_sections(
+    md_text: str,
+    *,
+    monitoring: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
     """마크다운 리포트를 고정 사이드 버튼(요약·소진·미보유·검토 등) 기준으로 묶음.
 
     ## / ### 헤딩을 모두 수집해 키워드로 분류하고, 버튼용 섹션은 항상 반환한다.
+    가속 섹션은 본문이 비어 있으면 정량 산출 모니터링 표로 채운다.
     """
     text = (md_text or "").strip()
     buckets: dict[str, list[str]] = {key: [] for key, _, _ in CANONICAL_REPORT_NAV}
@@ -2958,15 +3124,26 @@ def split_markdown_report_sections(md_text: str) -> list[dict[str, str]]:
             "deplete": "소진 예상",
             "missing": "미보유(재고 없음·공정서 미보유)",
             "manufacture": "차년도 제조 검토",
-            "accel": "분양 가속·모니터링",
+            "accel": "분양 가속 모니터링",
             "compendium": "공정서 DB 매칭",
         }.get(key, short)
         if parts:
             body = "\n\n".join(parts).strip()
             if not body.lstrip().startswith("#"):
                 body = f"## {title}\n\n{body}"
+            if key == "accel" and (
+                _accel_section_body_is_empty(body)
+                or (
+                    monitoring
+                    and not _accel_section_has_item_rows(body)
+                )
+            ):
+                body = format_accel_monitoring_markdown(monitoring)
         else:
-            body = f"## {title}\n\n_(이 리포트에 해당 섹션 본문이 없습니다.)_"
+            if key == "accel":
+                body = format_accel_monitoring_markdown(monitoring)
+            else:
+                body = f"## {title}\n\n_(이 리포트에 해당 섹션 본문이 없습니다.)_"
         sections.append(
             {
                 "id": key,
