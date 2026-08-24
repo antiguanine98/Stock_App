@@ -453,6 +453,91 @@ def test_split_markdown_report_sections():
     assert _report_section_short_label("차년도 제조검토대상") == "검토"
 
 
+def test_ensure_mandatory_report_sections():
+    """소진·제조검토·미보유·가속 등 필수 섹션이 항상 본문을 갖는다."""
+    from stock_logic import (
+        build_mandatory_section_markdown,
+        ensure_mandatory_report_sections,
+        split_markdown_report_sections,
+        ZERO_STOCK_CATEGORY,
+    )
+
+    flags = {
+        "dashboard": {
+            "kpis": [{"label": "대상품목 수", "display": "3종"}],
+            "summary_lines": ["요약"],
+        },
+        "depletion_category_items": {
+            "1년 이내": [
+                {
+                    "name_ko": "소진품A",
+                    "manage_no": "D-001",
+                    "std_type": "표준생약",
+                    "last_qty": 10,
+                    "deplete_ym": "2026년 12월",
+                    "depletion_category": "1년 이내",
+                    "risk_grade": "위험",
+                }
+            ],
+            ZERO_STOCK_CATEGORY: [
+                {
+                    "name_ko": "제로품",
+                    "manage_no": "Z-001",
+                    "std_type": "표준생약",
+                    "last_qty": 0,
+                    "deplete_ym": "-",
+                    "depletion_category": ZERO_STOCK_CATEGORY,
+                    "risk_grade": "재고없음",
+                }
+            ],
+        },
+        "manufacture_candidates": {
+            "표준생약": [
+                {
+                    "name_ko": "검토품",
+                    "manage_no": "M-001",
+                    "std_type": "표준생약",
+                    "last_qty": 50,
+                    "priority_score": 0.82,
+                    "deplete_ym": "2028년 01월",
+                    "depletion_category": "3년 이내",
+                    "risk_grade": "경계",
+                }
+            ],
+            "지표성분": [],
+        },
+        "monitoring_targets": [],
+        "missing_compendium_items": [
+            {
+                "name_ko": "미보유품",
+                "origin_ko": "한국",
+                "origin_en": "Korea",
+                "pharmacopoeia": "KP",
+            }
+        ],
+    }
+    match = {"stats": {"compendium_total": 1, "inventory_matched": 0, "auto_corrected": 0, "missing_count": 1}}
+
+    bare = "## 기타 분석\n\nAI가 쓴 본문만 있음.\n"
+    filled = ensure_mandatory_report_sections(bare, flags=flags, match_result=match)
+    assert "소진품A" in filled
+    assert "검토품" in filled
+    assert "제로품" in filled
+    assert "미보유품" in filled
+    assert "대상품목 수" in filled
+    assert "본문이 없습니다" not in filled
+
+    secs = split_markdown_report_sections(filled, flags=flags, match_result=match)
+    by_id = {s["id"]: s for s in secs}
+    for key in ("summary", "deplete", "missing", "manufacture", "accel", "compendium"):
+        assert key in by_id, key
+        assert "본문이 없습니다" not in by_id[key]["markdown"], key
+    assert "소진품A" in by_id["deplete"]["markdown"]
+    assert "검토품" in by_id["manufacture"]["markdown"]
+    assert "제로품" in by_id["missing"]["markdown"] or "미보유품" in by_id["missing"]["markdown"]
+    assert build_mandatory_section_markdown("deplete", flags).startswith("## 소진 예상")
+
+
 def test_ensure_accel_monitoring_section_always_has_body():
     """AI 리포트에 가속 섹션이 없거나 빈 표여도 정량 표를 항상 채운다."""
     from stock_logic import (
@@ -823,6 +908,7 @@ if __name__ == "__main__":
         test_full_catalog_snapshot_and_intent,
         test_markdown_report_renders_tables_as_html,
         test_split_markdown_report_sections,
+        test_ensure_mandatory_report_sections,
         test_ensure_accel_monitoring_section_always_has_body,
         test_manufacture_candidates_always_top10_by_score,
         test_compendium_missing_set_and_followup_filter,
