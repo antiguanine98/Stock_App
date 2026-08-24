@@ -1540,7 +1540,6 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
             if by_type
             else "."
         ),
-        "아래 수치는 정량 산출 결과이며, 데이터에 없는 원인 단정은 하지 않습니다.",
     ]
 
     return {
