@@ -64,7 +64,7 @@ jobs:
           generate_release_notes: true
           body: |
             ## Summary
-            - 가속 탭「분양 가속 모니터링」섹션: 정량 산출 표를 리포트에 항상 수록(빈 본문·빈 표 방지)
+            - KPI 요약(자동 종합 의견) 불필요한 면책 문구 제거
 
             ## Assets
             - `${{ steps.exe.outputs.name }}` (Windows one-file, Python 3.12 / PE VERSIONINFO 포함)
