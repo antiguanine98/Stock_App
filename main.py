@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.45
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.46
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ from stock_logic import (
     build_followup_prompt,
     build_scatter3d_records,
     collect_ai_analysis_flags,
-    ensure_accel_monitoring_in_report,
+    ensure_mandatory_report_sections,
     extract_mentioned_codes_from_report,
     format_compendium_context,
     format_compendium_match_report,
@@ -110,7 +110,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.45"
+APP_VERSION = "v1.46"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 GEMINI_MODEL_PREFERENCES = [
@@ -2297,10 +2297,13 @@ class MainWindow(QMainWindow):
             self._report_section_key = str(key)
             self._render_report_html()
 
-    def _monitoring_targets_for_report(self) -> list:
+    def _report_context_for_sections(self) -> tuple[dict, dict | None]:
         data = self.inventory_data or {}
-        flags = data.get("ai_flags") or {}
-        return list(flags.get("monitoring_targets") or [])
+        flags = dict(data.get("ai_flags") or {})
+        match = data.get("compendium_match")
+        if match:
+            flags = attach_compendium_match_to_flags(flags, match)
+        return flags, match
 
     def _render_report_html(self) -> None:
         """표준 리포트를 섹션 버튼 선택에 맞춰 HTML로 표시."""
@@ -2310,10 +2313,10 @@ class MainWindow(QMainWindow):
             self._report_sections = []
             return
 
-        monitoring = self._monitoring_targets_for_report()
+        flags, match = self._report_context_for_sections()
         if not self._report_sections:
             self._report_sections = split_markdown_report_sections(
-                self._initial_report, monitoring=monitoring
+                self._initial_report, flags=flags, match_result=match
             )
             self._rebuild_report_nav()
 
@@ -2507,12 +2510,12 @@ class MainWindow(QMainWindow):
         self._set_ai_progress(None)
         self._chat_busy = False
         self._chat_history.clear()
-        monitoring = self._monitoring_targets_for_report()
-        text = ensure_accel_monitoring_in_report(text, monitoring)
+        flags, match = self._report_context_for_sections()
+        text = ensure_mandatory_report_sections(text, flags=flags, match_result=match)
         self._initial_report = text
         self._report_expanded_ids.clear()
         self._report_sections = split_markdown_report_sections(
-            text, monitoring=monitoring
+            text, flags=flags, match_result=match
         )
         self._report_section_key = (
             "summary"

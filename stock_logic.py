@@ -1629,7 +1629,17 @@ def format_accel_monitoring_markdown(monitoring: list[dict[str, Any]] | None) ->
     return "\n".join(lines)
 
 
-def _accel_section_has_item_rows(markdown: str) -> bool:
+MANDATORY_REPORT_SECTION_ORDER = (
+    "summary",
+    "deplete",
+    "missing",
+    "manufacture",
+    "accel",
+    "compendium",
+)
+
+
+def _report_section_has_item_rows(markdown: str) -> bool:
     """표 데이터 행 또는 번호 목록 품목이 있는지."""
     for line in (markdown or "").splitlines():
         s = line.strip()
@@ -1644,13 +1654,13 @@ def _accel_section_has_item_rows(markdown: str) -> bool:
             continue
         if cells[0].isdigit():
             return True
-        if any(c in ("급가속", "증가") for c in cells):
+        if any(c in ("급가속", "증가", "표준생약", "지표성분") for c in cells):
             return True
     return False
 
 
-def _accel_section_body_is_empty(markdown: str) -> bool:
-    """가속 섹션에 헤딩 외 본문이 사실상 없는지(플레이스홀더·빈 표) 판별."""
+def _report_section_body_is_empty(markdown: str) -> bool:
+    """리포트 섹션에 헤딩 외 본문이 사실상 없는지(플레이스홀더·빈 표) 판별."""
     body = (markdown or "").strip()
     if not body:
         return True
@@ -1664,17 +1674,34 @@ def _accel_section_body_is_empty(markdown: str) -> bool:
         content_lines.append(s)
     if not content_lines:
         return True
-    if _accel_section_has_item_rows(body):
+    if _report_section_has_item_rows(body):
         return False
-    non_table = [ln for ln in content_lines if not ln.startswith("|")]
-    if any("해당 없음" in ln or re.search(r"0\s*건", ln) or ln == "없음" for ln in non_table):
+    non_table = [
+        ln for ln in content_lines if not ln.startswith("|") and not _is_md_table_sep(ln)
+    ]
+    if any(
+        "해당 없음" in ln
+        or re.search(r"0\s*건", ln)
+        or ln == "없음"
+        or ln == "(해당 없음)"
+        for ln in non_table
+    ):
         return False
-    # 산식·건수 요약/빈 표 헤더만 있으면 채움 대상
+    if non_table:
+        only_meta = all(
+            re.search(
+                r"마크다운 표|÷|합계\s*\d+건|급가속\s*\d+건|증가\s*\d+건|건 ·|산출|우선순위점수",
+                ln,
+            )
+            for ln in non_table
+        )
+        if not only_meta:
+            return False
     return True
 
 
-def _extract_raw_accel_section(md_text: str) -> str | None:
-    """원문 마크다운에서 가속/모니터링 ##·### 블록을 추출. 없으면 None."""
+def _extract_raw_section(md_text: str, section_key: str) -> str | None:
+    """원문 마크다운에서 지정 섹션 ##·### 블록을 추출. 없으면 None."""
     if not (md_text or "").strip():
         return None
     lines = md_text.splitlines()
@@ -1685,7 +1712,8 @@ def _extract_raw_accel_section(md_text: str) -> str | None:
         hm = re.match(r"^(#{2,3})\s+(.+)$", line.strip())
         if hm:
             title = hm.group(2).strip()
-            if _canonical_section_key(title) == "accel":
+            key = _canonical_section_key(title)
+            if key == section_key:
                 collecting = True
                 found = True
                 buf = [line]
@@ -1700,8 +1728,8 @@ def _extract_raw_accel_section(md_text: str) -> str | None:
     return "\n".join(buf).strip()
 
 
-def _strip_accel_heading_blocks(md_text: str) -> str:
-    """마크다운에서 가속/모니터링 관련 ##/### 블록을 제거."""
+def _strip_section_blocks(md_text: str, section_key: str) -> str:
+    """마크다운에서 지정 섹션 ##/### 블록을 제거."""
     if not (md_text or "").strip():
         return ""
     out: list[str] = []
@@ -1710,7 +1738,7 @@ def _strip_accel_heading_blocks(md_text: str) -> str:
         hm = re.match(r"^(#{2,3})\s+(.+)$", line.strip())
         if hm:
             title = hm.group(2).strip()
-            if _canonical_section_key(title) == "accel":
+            if _canonical_section_key(title) == section_key:
                 skipping = True
                 continue
             skipping = False
@@ -1721,33 +1749,240 @@ def _strip_accel_heading_blocks(md_text: str) -> str:
     return "\n".join(out).strip()
 
 
+def _manufacture_rows_to_markdown_table(rows: list[dict[str, Any]]) -> list[str]:
+    headers = [
+        "#",
+        "한글명",
+        "관리번호",
+        "유형",
+        "재고",
+        "우선순위",
+        "소진예상일시",
+        "소진구간",
+        "위험등급",
+    ]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for i, r in enumerate(rows, 1):
+        score = r.get("priority_score")
+        score_txt = f"{score:.3f}" if isinstance(score, (int, float)) else str(score or "-")
+        cells = [
+            str(i),
+            str(r.get("name_ko") or r.get("label") or "-").replace("|", "/"),
+            str(r.get("manage_no") or "-").replace("|", "/"),
+            str(r.get("std_type") or "-").replace("|", "/"),
+            format_qty_int(r.get("last_qty")),
+            score_txt,
+            str(r.get("deplete_ym") or "-").replace("|", "/"),
+            str(r.get("depletion_category") or "-").replace("|", "/"),
+            str(r.get("risk_grade") or "-").replace("|", "/"),
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
+def format_depletion_markdown(category_items: dict[str, list[dict[str, Any]]] | None) -> str:
+    """표준 리포트 '소진 예상' 섹션 — 구간별 전수 표."""
+    items = category_items or {}
+    lines = [
+        "## 소진 예상",
+        "",
+        "소진 예상 구간별 전수 목록 (마크다운 표 · 생략 없음)",
+        "",
+    ]
+    total = 0
+    for cat_name in DEPLETION_CATEGORY_ORDER:
+        if cat_name == ZERO_STOCK_CATEGORY:
+            continue
+        rows = items.get(cat_name) or []
+        total += len(rows)
+        lines.append(f"### 소진구간 {cat_name} ({len(rows)}건)")
+        lines.append("")
+        if rows:
+            lines.extend(_rows_to_markdown_table(rows))
+        else:
+            lines.append("(해당 없음)")
+        lines.append("")
+    if total == 0:
+        lines.insert(3, "소진 예상 대상 0건 (재고 없음 품목은 미보유 섹션 참조).")
+        lines.insert(4, "")
+    return "\n".join(lines).strip()
+
+
+def format_missing_markdown(
+    zero_stock_rows: list[dict[str, Any]] | None,
+    missing_compendium_rows: list[dict[str, Any]] | None,
+) -> str:
+    """표준 리포트 '미보유' 섹션 — 재고 0 + 공정서 미보유 전수 표."""
+    zero_rows = list(zero_stock_rows or [])
+    miss_rows = list(missing_compendium_rows or [])
+    lines = [
+        "## 미보유(재고 없음·공정서 미보유)",
+        "",
+        f"재고 없음 {len(zero_rows)}건 · 공정서 미보유 {len(miss_rows)}건 (마크다운 표 · 생략 없음)",
+        "",
+        f"### 재고 없음(미보유) ({len(zero_rows)}건)",
+        "",
+    ]
+    if zero_rows:
+        lines.extend(_rows_to_markdown_table(zero_rows))
+    else:
+        lines.append("(해당 없음)")
+    lines.extend(
+        [
+            "",
+            f"### 공정서 미보유 표준품 ({len(miss_rows)}건)",
+            "",
+        ]
+    )
+    if miss_rows:
+        lines.extend(_missing_rows_to_markdown_table(miss_rows))
+    else:
+        lines.append("(해당 없음)")
+    return "\n".join(lines)
+
+
+def format_manufacture_review_markdown(manufacture: dict[str, list[dict[str, Any]]] | None) -> str:
+    """표준 리포트 '차년도 제조 검토' 섹션 — 유형별 우선순위 상위 전수 표."""
+    mfg = manufacture or {}
+    std_rows = list(mfg.get("표준생약") or [])
+    ind_rows = list(mfg.get("지표성분") or [])
+    lines = [
+        "## 차년도 제조 검토",
+        "",
+        PRIORITY_FORMULA_KO,
+        "",
+        f"표준생약 {len(std_rows)}건 · 지표성분 {len(ind_rows)}건 (마크다운 표 · 생략 없음)",
+        "",
+        f"### 표준생약 ({len(std_rows)}건)",
+        "",
+    ]
+    if std_rows:
+        lines.extend(_manufacture_rows_to_markdown_table(std_rows))
+    else:
+        lines.append("(해당 없음)")
+    lines.extend(["", f"### 지표성분 ({len(ind_rows)}건)", ""])
+    if ind_rows:
+        lines.extend(_manufacture_rows_to_markdown_table(ind_rows))
+    else:
+        lines.append("(해당 없음)")
+    return "\n".join(lines)
+
+
+def build_mandatory_section_markdown(
+    section_key: str,
+    flags: dict[str, Any] | None = None,
+    match_result: dict[str, Any] | None = None,
+) -> str:
+    """고정 리포트 탭용 섹션 본문을 ai_flags·공정서 매칭에서 생성."""
+    f = flags or {}
+    if section_key == "summary":
+        dashboard = f.get("dashboard") or {}
+        if dashboard.get("kpis"):
+            return format_kpi_dashboard_markdown(dashboard)
+        return "## 1페이지 요약 대시보드 (핵심 KPI)\n\n(요약 KPI 데이터 없음)"
+    if section_key == "deplete":
+        return format_depletion_markdown(f.get("depletion_category_items"))
+    if section_key == "missing":
+        cat = f.get("depletion_category_items") or {}
+        zero_rows = cat.get(ZERO_STOCK_CATEGORY) or []
+        miss_rows = f.get("missing_compendium_items") or []
+        return format_missing_markdown(zero_rows, miss_rows)
+    if section_key == "manufacture":
+        return format_manufacture_review_markdown(f.get("manufacture_candidates"))
+    if section_key == "accel":
+        return format_accel_monitoring_markdown(f.get("monitoring_targets"))
+    if section_key == "compendium":
+        return format_compendium_stats_markdown(match_result)
+    return ""
+
+
+def _mandatory_section_has_source_data(
+    section_key: str,
+    flags: dict[str, Any] | None,
+    match_result: dict[str, Any] | None,
+) -> bool:
+    f = flags or {}
+    if section_key == "summary":
+        return bool((f.get("dashboard") or {}).get("kpis"))
+    if section_key == "deplete":
+        cat = f.get("depletion_category_items") or {}
+        return any(len(cat.get(c) or []) for c in DEPLETION_CATEGORY_ORDER if c != ZERO_STOCK_CATEGORY)
+    if section_key == "missing":
+        cat = f.get("depletion_category_items") or {}
+        return bool(cat.get(ZERO_STOCK_CATEGORY)) or bool(f.get("missing_compendium_items"))
+    if section_key == "manufacture":
+        mfg = f.get("manufacture_candidates") or {}
+        return bool(mfg.get("표준생약")) or bool(mfg.get("지표성분"))
+    if section_key == "accel":
+        return bool(f.get("monitoring_targets"))
+    if section_key == "compendium":
+        return match_result is not None
+    return False
+
+
+def _section_needs_mandatory_inject(
+    section_key: str,
+    raw_section: str | None,
+    flags: dict[str, Any] | None,
+    match_result: dict[str, Any] | None,
+) -> bool:
+    if raw_section is None or _report_section_body_is_empty(raw_section):
+        return True
+    if _mandatory_section_has_source_data(section_key, flags, match_result):
+        if not _report_section_has_item_rows(raw_section or ""):
+            return True
+    return False
+
+
+def ensure_mandatory_report_sections(
+    md_text: str,
+    flags: dict[str, Any] | None = None,
+    match_result: dict[str, Any] | None = None,
+) -> str:
+    """리포트 필수 섹션(요약·소진·미보유·제조검토·가속·공정서) 본문을 항상 채운다."""
+    text = (md_text or "").strip()
+    to_inject: list[tuple[str, str]] = []
+    for key in MANDATORY_REPORT_SECTION_ORDER:
+        built = build_mandatory_section_markdown(key, flags, match_result)
+        raw = _extract_raw_section(text, key) if text else None
+        if _section_needs_mandatory_inject(key, raw, flags, match_result):
+            to_inject.append((key, built))
+
+    if not to_inject:
+        return text
+
+    cleaned = text
+    for key, _ in to_inject:
+        cleaned = _strip_section_blocks(cleaned, key)
+
+    summary_blocks = [body for key, body in to_inject if key == "summary"]
+    tail_blocks = [body for key, body in to_inject if key != "summary"]
+
+    parts: list[str] = []
+    if summary_blocks:
+        parts.extend(summary_blocks)
+    if cleaned:
+        parts.append(cleaned.rstrip())
+    if tail_blocks:
+        parts.extend(tail_blocks)
+    return "\n\n".join(parts).rstrip() + "\n"
+
+
 def ensure_accel_monitoring_in_report(
     md_text: str,
     monitoring: list[dict[str, Any]] | None = None,
 ) -> str:
-    """리포트에 '분양 가속 모니터링' 섹션 본문이 항상 있도록 보정.
+    """(호환) 가속 섹션만 보정 — ensure_mandatory_report_sections 사용 권장."""
+    flags = {"monitoring_targets": list(monitoring or [])}
+    return ensure_mandatory_report_sections(md_text, flags=flags)
 
-    AI 출력이 섹션을 빠뜨리거나 빈 표만 남긴 경우 정량 산출 표로 채운다.
-    """
-    mon = list(monitoring or [])
-    section = format_accel_monitoring_markdown(mon)
-    text = (md_text or "").strip()
-    if not text:
-        return section
 
-    raw_accel = _extract_raw_accel_section(text)
-    need_inject = raw_accel is None or _accel_section_body_is_empty(raw_accel)
-    if not need_inject and mon and not _accel_section_has_item_rows(raw_accel or ""):
-        # '해당 없음'만 있는데 실제 모니터링 대상이 있으면 정량 표로 교체
-        need_inject = True
-
-    if not need_inject:
-        return text
-
-    cleaned = _strip_accel_heading_blocks(text)
-    if cleaned:
-        return cleaned.rstrip() + "\n\n" + section + "\n"
-    return section + "\n"
+# 하위 호환 별칭
+_accel_section_has_item_rows = _report_section_has_item_rows
+_accel_section_body_is_empty = _report_section_body_is_empty
 
 
 def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
@@ -2195,11 +2430,13 @@ def build_ai_prompt(
         "(마크다운 표, 재고 0 제외, 항상 상위 10건; 해당 유형이 10건 미만이면 전량)",
         "   ※ 제조 우선순위 섹션 서두에 아래 산출 공식·가중치를 그대로 인용해 명시할 것:",
         f"   {PRIORITY_FORMULA_KO}",
-        "6. '## 분양 가속 모니터링' 섹션을 반드시 포함하세요. "
-        "아래 사전 산출 마크다운 표를 그대로 전수 수록하고, 빈 표·섹션 생략을 금지합니다. "
-        "대상이 0건이면 '해당 없음 (급가속·증가 품목 0건)'을 본문에 명시하세요.",
+        "6. 아래 사전 산출 마크다운 표·헤딩을 반드시 그대로 전수 수록하세요. "
+        "빈 표·섹션 생략 금지: "
+        "'## 1페이지 요약 대시보드', '## 소진 예상', '## 미보유', "
+        "'## 차년도 제조 검토', '## 분양 가속 모니터링', '## 공정서 DB 매칭 및 수재 현황'. "
+        "대상 0건이면 '(해당 없음)'을 본문에 명시하세요.",
         "7. 현 재고 기준 분양금액 환산액(현재재고×가격): 전체·유형별·TOP20",
-        "8. 공정서 DB가 제공된 경우: '공정서 DB 매칭 및 수재 현황'과 "
+        "8. 공정서 DB가 제공된 경우 위 '## 공정서 DB 매칭 및 수재 현황' 섹션에 "
         "미보유 표준품 전수 마크다운 표를 포함하세요.",
         "",
         f"[연구과제 대량출고로 제외할 날짜] {', '.join(bulk_dates) if bulk_dates else '해당 없음'}",
@@ -2239,14 +2476,20 @@ def build_ai_prompt(
             else:
                 lines.append(f"- {cat_name}: 없음")
 
+    cat_items = flags.get("depletion_category_items") or category_items
+    zero_rows = (cat_items.get(ZERO_STOCK_CATEGORY) or []) if cat_items else []
+    miss_rows = flags.get("missing_compendium_items") or []
     lines.append("")
-    lines.append("[차년도 제조검토대상 — 표준생약]")
-    lines.append(_format_candidate_lines(manufacture.get("표준생약") or [], full=True))
+    lines.append("[소진 예상 — 리포트에 ## 소진 예상 으로 그대로 수록]")
+    lines.append(format_depletion_markdown(cat_items))
     lines.append("")
-    lines.append("[차년도 제조검토대상 — 지표성분]")
-    lines.append(_format_candidate_lines(manufacture.get("지표성분") or [], full=True))
+    lines.append("[미보유 — 리포트에 ## 미보유 로 그대로 수록]")
+    lines.append(format_missing_markdown(zero_rows, miss_rows))
     lines.append("")
-    lines.append("[분양 가속 모니터링 — 마크다운 표 전수 · 리포트에 그대로 수록]")
+    lines.append("[차년도 제조 검토 — 리포트에 ## 차년도 제조 검토 로 그대로 수록]")
+    lines.append(format_manufacture_review_markdown(manufacture))
+    lines.append("")
+    lines.append("[분양 가속 모니터링 — 리포트에 그대로 수록]")
     lines.append(format_accel_monitoring_markdown(monitoring))
 
     lines.append("")
@@ -3077,13 +3320,17 @@ CANONICAL_REPORT_NAV = (
 def split_markdown_report_sections(
     md_text: str,
     *,
+    flags: dict[str, Any] | None = None,
+    match_result: dict[str, Any] | None = None,
     monitoring: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
     """마크다운 리포트를 고정 사이드 버튼(요약·소진·미보유·검토 등) 기준으로 묶음.
 
     ## / ### 헤딩을 모두 수집해 키워드로 분류하고, 버튼용 섹션은 항상 반환한다.
-    가속 섹션은 본문이 비어 있으면 정량 산출 모니터링 표로 채운다.
+    본문이 비어 있으면 ai_flags·공정서 매칭 정량 산출 표로 채운다.
     """
+    if flags is None and monitoring is not None:
+        flags = {"monitoring_targets": monitoring}
     text = (md_text or "").strip()
     buckets: dict[str, list[str]] = {key: [] for key, _, _ in CANONICAL_REPORT_NAV}
     other: list[str] = []
@@ -3127,23 +3374,15 @@ def split_markdown_report_sections(
             "accel": "분양 가속 모니터링",
             "compendium": "공정서 DB 매칭",
         }.get(key, short)
+        built = build_mandatory_section_markdown(key, flags, match_result)
         if parts:
             body = "\n\n".join(parts).strip()
             if not body.lstrip().startswith("#"):
                 body = f"## {title}\n\n{body}"
-            if key == "accel" and (
-                _accel_section_body_is_empty(body)
-                or (
-                    monitoring
-                    and not _accel_section_has_item_rows(body)
-                )
-            ):
-                body = format_accel_monitoring_markdown(monitoring)
+            if _section_needs_mandatory_inject(key, body, flags, match_result):
+                body = built
         else:
-            if key == "accel":
-                body = format_accel_monitoring_markdown(monitoring)
-            else:
-                body = f"## {title}\n\n_(이 리포트에 해당 섹션 본문이 없습니다.)_"
+            body = built
         sections.append(
             {
                 "id": key,
