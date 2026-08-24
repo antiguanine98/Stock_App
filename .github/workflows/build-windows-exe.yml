@@ -64,7 +64,7 @@ jobs:
           generate_release_notes: true
           body: |
             ## Summary
-            - Gemini 연결: 가용 Flash 모델 우선순위·탐색 범위 확대 (2.5 Flash 우선)
+            - Gemini 503/429/504 서버 과부하 자동 재시도(exponential backoff)
 
             ## Assets
             - `${{ steps.exe.outputs.name }}` (Windows one-file, Python 3.12 / PE VERSIONINFO 포함)

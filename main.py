@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.48
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.49
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.48"
+APP_VERSION = "v1.49"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
@@ -397,6 +397,23 @@ def _is_auth_error(exc: BaseException) -> bool:
     return any(k in text for k in ("api key", "api_key", "permission denied", "unauthenticated"))
 
 
+_RETRYABLE_CODES = (429, 503, 504)
+_MAX_RETRIES = 4
+_RETRY_BASE_SECONDS = 4
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    code = _api_error_code(exc)
+    if code in _RETRYABLE_CODES:
+        return True
+    text = str(exc).lower()
+    return any(
+        m in text
+        for m in ("resource_exhausted", "rate limit", "quota", "unavailable",
+                  "high demand", "overloaded", "deadline", "timed out", "timeout")
+    )
+
+
 def _is_model_unavailable_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     markers = (
@@ -552,18 +569,48 @@ def test_gemini_connection(api_key: str) -> tuple[bool, str]:
     return True, f"연결됨 ({model})"
 
 
+_retry_stage_callback: Callable[[str], None] | None = None
+
+
+def _call_with_retry(client, model: str, prompt: str) -> Any:
+    """generate_content를 exponential backoff로 재시도 (429/503/504)."""
+    import time
+
+    last_exc: BaseException | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return client.models.generate_content(model=model, contents=prompt)
+        except Exception as exc:
+            if _is_auth_error(exc):
+                raise
+            if not _is_retryable_error(exc):
+                raise
+            last_exc = exc
+            if attempt < _MAX_RETRIES:
+                wait = _RETRY_BASE_SECONDS * (2 ** attempt)
+                msg = (
+                    f"서버 과부하 — {wait}초 후 자동 재시도 "
+                    f"({attempt + 1}/{_MAX_RETRIES})..."
+                )
+                log_gemini("WARN", msg)
+                if _retry_stage_callback:
+                    _retry_stage_callback(msg)
+                time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
+
+
 def generate_gemini_report(api_key: str, prompt: str) -> str:
     global _resolved_gemini_model
     client = create_gemini_client(api_key)
     model = resolve_gemini_model(client)
     log_gemini("INFO", f"AI 분석 요청 시작 (model={model})")
     try:
-        response = client.models.generate_content(model=model, contents=prompt)
+        response = _call_with_retry(client, model, prompt)
     except Exception as exc:
-        if _is_model_unavailable_error(exc):
+        if _is_model_unavailable_error(exc) and not _is_retryable_error(exc):
             _resolved_gemini_model = None
             model = resolve_gemini_model(client, force_refresh=True)
-            response = client.models.generate_content(model=model, contents=prompt)
+            response = _call_with_retry(client, model, prompt)
         else:
             raise
     text = extract_response_text(response)
@@ -635,6 +682,8 @@ class GeminiWorker(QThread):
         self.followup = followup
 
     def run(self) -> None:
+        global _retry_stage_callback
+        _retry_stage_callback = lambda msg: self.stage.emit(msg)
         try:
             if self.build_prompt is not None:
                 self.stage.emit("재고 및 공정서 DB 분석 중...")
@@ -650,6 +699,8 @@ class GeminiWorker(QThread):
             kind = "후속 질문" if self.followup else "AI 분석"
             log_gemini("ERROR", f"{kind} 실패: {detail}", e)
             self.error.emit(detail)
+        finally:
+            _retry_stage_callback = None
 
 
 class CompendiumWorker(QThread):
