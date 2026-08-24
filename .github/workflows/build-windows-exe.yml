@@ -64,7 +64,7 @@ jobs:
           generate_release_notes: true
           body: |
             ## Summary
-            - Gemini 503/429/504 서버 과부하 자동 재시도(exponential backoff)
+            - 리포트 목록 표 `(중략)` 생략 제거(전수 정량 표)
 
             ## Assets
             - `${{ steps.exe.outputs.name }}` (Windows one-file, Python 3.12 / PE VERSIONINFO 포함)

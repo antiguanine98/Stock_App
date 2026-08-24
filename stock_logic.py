@@ -1638,6 +1638,29 @@ MANDATORY_REPORT_SECTION_ORDER = (
 )
 
 
+_CATALOG_SECTION_KEYS = frozenset(
+    {"deplete", "missing", "manufacture", "accel", "compendium"}
+)
+_TRUNCATION_CELL_MARKERS = ("...", "…", "(중략)", "중략", "(생략)", "생략")
+
+
+def _report_section_is_truncated(markdown: str) -> bool:
+    """AI가 목록 중간을 줄인 경우(중략·생략 행)인지 판별."""
+    text = markdown or ""
+    if "중략" in text or "이하 생략" in text or "생략됨" in text:
+        return True
+    if re.search(r"등\s*\d+\s*건", text):
+        return True
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("|") or _is_md_table_sep(s):
+            continue
+        cells = _parse_md_table_cells(s)
+        if any((c or "").strip() in _TRUNCATION_CELL_MARKERS for c in cells):
+            return True
+    return False
+
+
 def _report_section_has_item_rows(markdown: str) -> bool:
     """표 데이터 행 또는 번호 목록 품목이 있는지."""
     for line in (markdown or "").splitlines():
@@ -1928,10 +1951,18 @@ def _section_needs_mandatory_inject(
     flags: dict[str, Any] | None,
     match_result: dict[str, Any] | None,
 ) -> bool:
-    if raw_section is None or _report_section_body_is_empty(raw_section):
+    """빈 본문·중략 표이거나, 목록 섹션은 정량 전수 표로 항상 교체."""
+    raw = raw_section or ""
+    if raw_section is None or _report_section_body_is_empty(raw):
+        return True
+    if _report_section_is_truncated(raw):
+        return True
+    if section_key in _CATALOG_SECTION_KEYS and _mandatory_section_has_source_data(
+        section_key, flags, match_result
+    ):
         return True
     if _mandatory_section_has_source_data(section_key, flags, match_result):
-        if not _report_section_has_item_rows(raw_section or ""):
+        if not _report_section_has_item_rows(raw):
             return True
     return False
 
@@ -2411,6 +2442,7 @@ def build_ai_prompt(
         "접기/토글 없이 마크다운 표로 전수 나열하세요. 재고량은 정수만 표기하고, "
         "소진 시점은 'YYYY년 MM월' 형식만 사용하세요 (예: 2027년 03월). "
         "'소진예상일시', '기준' 등 부가 문구는 붙이지 마세요. "
+        "표 중간에 '(중략)', '...', '등 N건'으로 생략하지 마세요. "
         "섹션 제목은 반드시 ## 헤딩으로 분리하세요: "
         "'## 소진 예상', '## 미보유', '## 차년도 제조검토', "
         "'## 분양 가속 모니터링', '## 공정서 DB 매칭' 등.",
