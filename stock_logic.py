@@ -1162,6 +1162,29 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
     }
 
 
+def _stock_item_stats_key(item: StockItem) -> str:
+    """estimate_depletion 캐시 키 (관리번호 우선)."""
+    if item.manage_no:
+        return item.manage_no
+    return f"@{id(item)}:{item.label}"
+
+
+def get_depletion_stats(
+    item: StockItem,
+    stats_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """품목별 estimate_depletion — stats_cache가 있으면 동일 품목 재계산 생략."""
+    if stats_cache is None:
+        return estimate_depletion(item)
+    key = _stock_item_stats_key(item)
+    cached = stats_cache.get(key)
+    if cached is not None:
+        return cached
+    stats = estimate_depletion(item)
+    stats_cache[key] = stats
+    return stats
+
+
 def _catalog_item_row(it: StockItem, stats: dict[str, Any]) -> dict[str, Any]:
     """챗봇 전수 목록용 품목 행(한글명·관리번호·세부 수치)."""
     rel = stats.get("reliability") or {}
@@ -1215,11 +1238,14 @@ def _display_risk_grade(row: dict[str, Any]) -> str:
     return risk_grade_from_years(row.get("years_left"))
 
 
-def group_by_depletion_category(items: list[StockItem]) -> dict[str, list[str]]:
+def group_by_depletion_category(
+    items: list[StockItem],
+    stats_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, list[str]]:
     """소진 기간 카테고리별 품목 라벨 목록(리포트 요약용)."""
     buckets: dict[str, list[str]] = {k: [] for k in DEPLETION_CATEGORY_ORDER}
     for it in items_for_ai_analysis(items):
-        stats = estimate_depletion(it)
+        stats = get_depletion_stats(it, stats_cache)
         key = stats["depletion_category"]
         if key not in buckets:
             buckets[key] = []
@@ -1230,11 +1256,12 @@ def group_by_depletion_category(items: list[StockItem]) -> dict[str, list[str]]:
 
 def group_by_depletion_category_items(
     items: list[StockItem],
+    stats_cache: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """소진 예상 구간별 전수 품목 리스트(챗봇·리포트 표용)."""
     buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in DEPLETION_CATEGORY_ORDER}
     for it in items_for_ai_analysis(items):
-        stats = estimate_depletion(it)
+        stats = get_depletion_stats(it, stats_cache)
         key = stats["depletion_category"]
         if key not in buckets:
             buckets[key] = []
@@ -1242,12 +1269,15 @@ def group_by_depletion_category_items(
     return buckets
 
 
-def group_by_risk_grade(items: list[StockItem]) -> dict[str, list[dict[str, Any]]]:
+def group_by_risk_grade(
+    items: list[StockItem],
+    stats_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     """위험등급(위험/경계/주의/안정)별 전수 — 재고 0은 제외."""
     order = ["위험", "경계", "주의", "안정"]
     buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in order}
     for it in items_for_ai_analysis(items):
-        stats = estimate_depletion(it)
+        stats = get_depletion_stats(it, stats_cache)
         if stats.get("stock_zero") or is_zero_stock(it):
             continue
         row = _catalog_item_row(it, stats)
@@ -1268,6 +1298,7 @@ def group_by_risk_grade(items: list[StockItem]) -> dict[str, list[dict[str, Any]
 def select_manufacture_candidates(
     items: list[StockItem],
     limit_per_type: int = MANUFACTURE_CANDIDATE_LIMIT,
+    stats_cache: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """차년도 제조검토대상: 표준생약·지표성분 각각 제조우선순위점수 상위 N건(기본 10).
 
@@ -1281,7 +1312,7 @@ def select_manufacture_candidates(
             continue
         if is_zero_stock(it):
             continue
-        stats = estimate_depletion(it)
+        stats = get_depletion_stats(it, stats_cache)
         if stats.get("stock_zero"):
             continue
         scored.append((float(stats["priority_score"]), it, stats))
@@ -1330,7 +1361,11 @@ def select_manufacture_candidates(
     return result
 
 
-def select_monitoring_targets(items: list[StockItem], limit: int = 30) -> list[dict[str, Any]]:
+def select_monitoring_targets(
+    items: list[StockItem],
+    limit: int = 30,
+    stats_cache: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """분양 가속도 급증(급가속/증가) 모니터링 대상.
 
     급가속은 전량 반환(limit 미적용). 증가 항목은 급가속 뒤에 이어서 포함
@@ -1341,7 +1376,7 @@ def select_monitoring_targets(items: list[StockItem], limit: int = 30) -> list[d
     for it in items:
         if is_zero_stock(it):
             continue
-        stats = estimate_depletion(it)
+        stats = get_depletion_stats(it, stats_cache)
         if stats.get("stock_zero"):
             continue
         accel = stats.get("acceleration")
@@ -1390,11 +1425,15 @@ def select_monitoring_targets(items: list[StockItem], limit: int = 30) -> list[d
     return surge_rows + increase_rows
 
 
-def select_long_term_low_items(items: list[StockItem], limit: int = 40) -> list[dict[str, Any]]:
+def select_long_term_low_items(
+    items: list[StockItem],
+    limit: int = 40,
+    stats_cache: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """장기 저분양/과다재고 — 차기 제조 시 수량 하향 조정 권고."""
     rows: list[dict[str, Any]] = []
     for it in items:
-        stats = estimate_depletion(it)
+        stats = get_depletion_stats(it, stats_cache)
         if not stats.get("long_term_low"):
             continue
         rows.append(
@@ -1468,6 +1507,13 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
     valuation = flags.get("valuation") or compute_inventory_valuation(items)
     by_code = flags.get("by_code") or {}
     category_items = flags.get("depletion_category_items") or {}
+    stats_cache = flags.get("_depletion_stats_cache")
+
+    def _stats_for(it: StockItem) -> dict[str, Any]:
+        cached = by_code.get(it.manage_no) if it.manage_no else None
+        if cached is not None:
+            return cached
+        return get_depletion_stats(it, stats_cache)
 
     managed = len(items)
     # 소진 예상: 1년 내 / 1~3년 / 3~5년 (상호 배타 구간, 재고 0 제외)
@@ -1484,7 +1530,7 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
         )
     else:
         for it in items:
-            stats = by_code.get(it.manage_no) or estimate_depletion(it)
+            stats = _stats_for(it)
             if stats.get("stock_zero") or is_zero_stock(it):
                 continue
             yl = stats.get("years_left")
@@ -1501,7 +1547,7 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
     low_n = 0
     grade_ab = 0
     for it in items:
-        stats = by_code.get(it.manage_no) or estimate_depletion(it)
+        stats = _stats_for(it)
         if stats.get("stock_zero") or is_zero_stock(it):
             continue
         if stats.get("acceleration") in ("급가속", "증가"):
@@ -2132,16 +2178,17 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
     deplete_codes: list[str] = []
     surge_codes: list[str] = []
     by_code: dict[str, dict[str, Any]] = {}
-    manufacture = select_manufacture_candidates(items)
-    monitoring = select_monitoring_targets(items)
-    long_term_low = select_long_term_low_items(items)
-    categories = group_by_depletion_category(items)
-    category_items = group_by_depletion_category_items(items)
-    risk_grade_items = group_by_risk_grade(items)
+    stats_cache: dict[str, dict[str, Any]] = {}
+    manufacture = select_manufacture_candidates(items, stats_cache=stats_cache)
+    monitoring = select_monitoring_targets(items, stats_cache=stats_cache)
+    long_term_low = select_long_term_low_items(items, stats_cache=stats_cache)
+    categories = group_by_depletion_category(items, stats_cache=stats_cache)
+    category_items = group_by_depletion_category_items(items, stats_cache=stats_cache)
+    risk_grade_items = group_by_risk_grade(items, stats_cache=stats_cache)
     valuation = compute_inventory_valuation(items)
 
     for it in items_for_ai_analysis(items):
-        stats = estimate_depletion(it)
+        stats = get_depletion_stats(it, stats_cache)
         stock_zero = bool(stats.get("stock_zero")) or is_zero_stock(it)
         flag = {
             "label": it.label,
@@ -2194,8 +2241,10 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
         "depletion_category_items": category_items,
         "risk_grade_items": risk_grade_items,
         "valuation": valuation,
+        "_depletion_stats_cache": stats_cache,
     }
     flags["dashboard"] = build_kpi_dashboard(items, flags)
+    flags.pop("_depletion_stats_cache", None)
     return flags
 
 
@@ -4257,16 +4306,14 @@ def build_scatter3d_record(
         return None
 
     flag = (ai_flags or {}).get(item.manage_no) if ai_flags else None
-    stats = estimate_depletion(item)
     if flag is not None:
         deplete = bool(flag.get("deplete_within_5y"))
         surge = bool(flag.get("recent_surge"))
-        speed = flag.get("speed") or stats.get("speed")
+        speed = flag.get("speed") or ""
         years_left = flag.get("years_left")
-        if years_left is None:
-            years_left = stats.get("years_left")
-        annual_rate = stats.get("annual_rate")
+        annual_rate = flag.get("annual_rate")
     else:
+        stats = estimate_depletion(item)
         deplete = bool(stats.get("deplete_within_5y"))
         surge = bool(stats.get("recent_surge"))
         speed = stats.get("speed")
