@@ -46,7 +46,12 @@ def _sample_path() -> str:
 
 def main() -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
     from PyQt6.QtCore import Qt
+
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
 
     try:
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
@@ -86,6 +91,7 @@ def main() -> int:
         assert not win._settings_body.isHidden()
         assert hasattr(win, "compendium_dropzone")
         assert hasattr(win, "compendium_status")
+        assert hasattr(win, "stock_status")
         assert hasattr(win, "report_fixed")
         assert hasattr(win, "chat_view")
         assert hasattr(win.chart3d, "point_picked")

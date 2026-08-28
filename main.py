@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.50
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.51
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.50"
+APP_VERSION = "v1.51"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
@@ -765,6 +765,7 @@ class DropZone(QFrame):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setMinimumHeight(min_height)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setObjectName("dropZone")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -1311,7 +1312,7 @@ class MainWindow(QMainWindow):
         api_hint.setStyleSheet("color: #64748b; font-size: 11px;")
         top_layout.addWidget(api_hint)
 
-        # --- STEP 2: 데이터 파일 (재고 | 공정서 나란히) ---
+        # --- STEP 2: 데이터 파일 (재고 | 공정서 1:1 반응형) ---
         step2 = QLabel("STEP 2 · 데이터 파일 등록")
         step2.setObjectName("stepLabel")
         top_layout.addWidget(step2)
@@ -1319,37 +1320,54 @@ class MainWindow(QMainWindow):
         files_row = QHBoxLayout()
         files_row.setSpacing(12)
 
-        stock_col = QVBoxLayout()
+        stock_panel = QWidget()
+        stock_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        stock_col = QVBoxLayout(stock_panel)
+        stock_col.setContentsMargins(0, 0, 0, 0)
         stock_col.setSpacing(6)
         file_label = QLabel("재고 엑셀 업로드")
         file_label.setObjectName("sectionLabel")
         stock_col.addWidget(file_label)
         stock_inner = QHBoxLayout()
+        stock_inner.setSpacing(8)
         self.dropzone = DropZone(min_height=78)
         self.dropzone.files_dropped.connect(self._load_excels)
         stock_inner.addWidget(self.dropzone, stretch=1)
         btn_col = QVBoxLayout()
+        btn_col.setSpacing(6)
         btn_select = QPushButton("파일 선택")
         btn_select.setObjectName("secondaryBtn")
         btn_select.setMinimumWidth(100)
         btn_select.setMinimumHeight(42)
+        btn_select.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_select.clicked.connect(self._browse_file)
         btn_clear = QPushButton("목록 초기화")
         btn_clear.setObjectName("secondaryBtn")
         btn_clear.setMinimumWidth(100)
+        btn_clear.setMinimumHeight(42)
+        btn_clear.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_clear.clicked.connect(self._clear_loaded_files)
         btn_col.addWidget(btn_select)
         btn_col.addWidget(btn_clear)
-        stock_inner.addLayout(btn_col)
-        stock_col.addLayout(stock_inner)
-        files_row.addLayout(stock_col, stretch=1)
+        btn_col.addStretch(1)
+        stock_inner.addLayout(btn_col, stretch=0)
+        stock_col.addLayout(stock_inner, stretch=1)
+        self.stock_status = QLabel("재고 엑셀: 미등록")
+        self.stock_status.setWordWrap(True)
+        self.stock_status.setStyleSheet("color: #64748b; font-size: 12px;")
+        stock_col.addWidget(self.stock_status, stretch=0)
+        files_row.addWidget(stock_panel, stretch=1)
 
-        comp_col = QVBoxLayout()
+        comp_panel = QWidget()
+        comp_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        comp_col = QVBoxLayout(comp_panel)
+        comp_col.setContentsMargins(0, 0, 0, 0)
         comp_col.setSpacing(6)
         comp_label = QLabel("공정서 DB 업로드 (규격 참조)")
         comp_label.setObjectName("sectionLabel")
         comp_col.addWidget(comp_label)
         comp_inner = QHBoxLayout()
+        comp_inner.setSpacing(8)
         self.compendium_dropzone = DropZone(
             title="공정서 DB 엑셀을 드래그 앤 드롭",
             subtitle=".xlsx / .xls · AI 규격/기준 참조 전용",
@@ -1358,24 +1376,31 @@ class MainWindow(QMainWindow):
         self.compendium_dropzone.files_dropped.connect(self._on_compendium_dropped)
         comp_inner.addWidget(self.compendium_dropzone, stretch=1)
         comp_btn_col = QVBoxLayout()
+        comp_btn_col.setSpacing(6)
         btn_comp_select = QPushButton("공정서 선택")
         btn_comp_select.setObjectName("secondaryBtn")
         btn_comp_select.setMinimumWidth(100)
+        btn_comp_select.setMinimumHeight(42)
+        btn_comp_select.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_comp_select.clicked.connect(self._browse_compendium)
         btn_comp_clear = QPushButton("공정서 해제")
         btn_comp_clear.setObjectName("secondaryBtn")
         btn_comp_clear.setMinimumWidth(100)
+        btn_comp_clear.setMinimumHeight(42)
+        btn_comp_clear.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         btn_comp_clear.clicked.connect(self._clear_compendium)
         comp_btn_col.addWidget(btn_comp_select)
         comp_btn_col.addWidget(btn_comp_clear)
-        comp_inner.addLayout(comp_btn_col)
-        comp_col.addLayout(comp_inner)
-        files_row.addLayout(comp_col, stretch=1)
+        comp_btn_col.addStretch(1)
+        comp_inner.addLayout(comp_btn_col, stretch=0)
+        comp_col.addLayout(comp_inner, stretch=1)
+        self.compendium_status = QLabel("공정서 DB: 미등록")
+        self.compendium_status.setWordWrap(True)
+        self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
+        comp_col.addWidget(self.compendium_status, stretch=0)
+        files_row.addWidget(comp_panel, stretch=1)
 
         top_layout.addLayout(files_row)
-        self.compendium_status = QLabel("공정서 DB: 미등록")
-        self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
-        top_layout.addWidget(self.compendium_status)
 
         analyze_row = QHBoxLayout()
         analyze_row.addStretch(1)
@@ -1973,6 +1998,9 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self.status_excel.setText("파일: 미업로드")
+        self.stock_status.setText("재고 엑셀: 미등록")
+        self.stock_status.setStyleSheet("color: #64748b; font-size: 12px;")
+        self.stock_status.setToolTip("")
         self.status_correction.setText("소급 보정: 0건")
         self.chart._show_placeholder("품목 또는 표준품구분을 선택하면 재고 추이 차트가 표시됩니다.")
         self.chart3d.show_message("엑셀을 다시 업로드해 주세요.")
@@ -1991,6 +2019,8 @@ class MainWindow(QMainWindow):
         names = [Path(p).name for p in combined]
         label = names[0] if len(names) == 1 else f"{len(names)}개 파일"
         self.status_excel.setText(f"파일: 처리 중... ({label})")
+        self.stock_status.setText(f"재고 엑셀: 처리 중... ({label})")
+        self.stock_status.setStyleSheet("color: #64748b; font-size: 12px;")
         self._show_busy("재고 엑셀 처리", f"재고 데이터를 통합·보정하는 중...\n{label}")
 
         def _start() -> None:
@@ -2004,6 +2034,8 @@ class MainWindow(QMainWindow):
     def _on_excel_error(self, message: str) -> None:
         self._close_busy()
         self.status_excel.setText("파일: 오류")
+        self.stock_status.setText("재고 엑셀: 오류")
+        self.stock_status.setStyleSheet("color: #b91c1c; font-size: 12px; font-weight: 600;")
         QMessageBox.critical(self, "파일 처리 오류", message)
 
     def _on_excel_loaded(self, data: dict[str, Any]) -> None:
@@ -2045,6 +2077,9 @@ class MainWindow(QMainWindow):
         match_txt = f" · 공정서 {'/'.join(match_bits)}" if match_bits else ""
         self.status_excel.setText(f"파일: {file_label} ({data['row_count']}품목)")
         self.status_excel.setToolTip("\n".join(names))
+        self.stock_status.setText(f"재고 엑셀: {file_label} ({data['row_count']}품목)")
+        self.stock_status.setStyleSheet("color: #15803d; font-size: 12px; font-weight: 600;")
+        self.stock_status.setToolTip("\n".join(names))
         self.status_correction.setText(
             f"소급 보정: {data['correction_count']:,}건 · 변동 {changed}건 · "
             f"소진후보 {deplete_n} · 가속 {surge_n}{val_txt}{match_txt}"
@@ -2876,6 +2911,11 @@ def create_splash(app: QApplication) -> tuple[QWidget, QProgressBar, QLabel]:
 
 
 def main() -> None:
+    # High DPI 지원 활성화 (QApplication 생성 전)
+    os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     # QWebEngineView 사용 시 QApplication 생성 전에 필요
     try:
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
