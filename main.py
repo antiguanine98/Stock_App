@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.50
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.52
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.50"
+APP_VERSION = "v1.52"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
@@ -1416,6 +1416,27 @@ class MainWindow(QMainWindow):
         )
         hint.setStyleSheet("color: #64748b; font-size: 12px;")
         table_layout.addWidget(hint)
+        self._table_find_matches: list[tuple[int, int]] = []
+        self._table_find_index = -1
+        self.table_find_bar = QWidget()
+        table_find_row = QHBoxLayout(self.table_find_bar)
+        table_find_row.setContentsMargins(0, 0, 0, 4)
+        table_find_row.setSpacing(6)
+        self.table_find_input = QLineEdit()
+        self.table_find_input.setPlaceholderText("관리번호·생약명·성분명 검색…")
+        self.table_find_input.returnPressed.connect(lambda: self._find_in_table(forward=True))
+        table_find_row.addWidget(self.table_find_input, stretch=1)
+        self.btn_table_find_prev = QPushButton("이전")
+        self.btn_table_find_prev.clicked.connect(lambda: self._find_in_table(forward=False))
+        table_find_row.addWidget(self.btn_table_find_prev)
+        self.btn_table_find_next = QPushButton("다음")
+        self.btn_table_find_next.clicked.connect(lambda: self._find_in_table(forward=True))
+        table_find_row.addWidget(self.btn_table_find_next)
+        self.btn_table_find_close = QPushButton("닫기")
+        self.btn_table_find_close.clicked.connect(self._hide_table_find_bar)
+        table_find_row.addWidget(self.btn_table_find_close)
+        self.table_find_bar.hide()
+        table_layout.addWidget(self.table_find_bar)
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -1427,6 +1448,10 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.cellDoubleClicked.connect(self._on_table_double_clicked)
         table_layout.addWidget(self.table, stretch=1)
+        self._table_find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        self._table_find_shortcut.activated.connect(self._on_global_find_shortcut)
+        self._table_find_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.table_find_bar)
+        self._table_find_esc.activated.connect(self._hide_table_find_bar)
         self.tabs.addTab(table_wrap, "분양현황")
 
         # Tab 2 chart
@@ -2326,6 +2351,79 @@ class MainWindow(QMainWindow):
             sb = self.chat_view.verticalScrollBar()
             sb.setValue(sb.maximum())
         QTimer.singleShot(0, _go)
+
+    def _on_global_find_shortcut(self) -> None:
+        idx = self.tabs.currentIndex()
+        if idx == 0:
+            self._show_table_find_bar()
+        elif idx == 2:
+            self._show_report_find_bar()
+
+    def _show_table_find_bar(self) -> None:
+        self.table_find_bar.show()
+        self.table_find_input.setFocus()
+        self.table_find_input.selectAll()
+
+    def _hide_table_find_bar(self) -> None:
+        self.table_find_bar.hide()
+        self.table.clearSelection()
+        self.table.setFocus()
+
+    def _table_searchable_columns(self) -> list[int]:
+        cols: list[int] = []
+        for i in range(self.table.columnCount()):
+            header_item = self.table.horizontalHeaderItem(i)
+            header = header_item.text() if header_item is not None else ""
+            if any(k in header for k in ("관리번호", "한글", "영문", "성분", "표준품")):
+                cols.append(i)
+        if cols:
+            return cols
+        meta_n = len((self.inventory_data or {}).get("meta_cols") or [])
+        return list(range(min(meta_n, self.table.columnCount())))
+
+    def _rebuild_table_find_matches(self, query: str) -> None:
+        q = query.strip().lower()
+        self._table_find_matches = []
+        self._table_find_index = -1
+        if not q:
+            return
+        for row in range(self.table.rowCount()):
+            for col in self._table_searchable_columns():
+                item = self.table.item(row, col)
+                if item is not None and q in item.text().lower():
+                    self._table_find_matches.append((row, col))
+
+    def _focus_table_match(self, row: int, col: int) -> None:
+        self.table.setCurrentCell(row, col)
+        self.table.selectRow(row)
+        item = self.table.item(row, col)
+        if item is not None:
+            self.table.scrollToItem(item)
+
+    def _find_in_table(self, forward: bool = True) -> None:
+        query = self.table_find_input.text()
+        if not query.strip():
+            return
+        if not self._table_find_matches or query.strip().lower() != getattr(
+            self, "_table_find_last_query", ""
+        ):
+            self._rebuild_table_find_matches(query)
+            self._table_find_last_query = query.strip().lower()
+        if not self._table_find_matches:
+            self.statusBar().showMessage(f"검색 결과 없음: {query}", 3000)
+            return
+        if forward:
+            self._table_find_index = (self._table_find_index + 1) % len(self._table_find_matches)
+        else:
+            self._table_find_index = (
+                self._table_find_index - 1
+            ) % len(self._table_find_matches)
+        row, col = self._table_find_matches[self._table_find_index]
+        self._focus_table_match(row, col)
+        self.statusBar().showMessage(
+            f"검색 {self._table_find_index + 1}/{len(self._table_find_matches)}: {query}",
+            4000,
+        )
 
     def _show_report_find_bar(self) -> None:
         self.report_find_bar.show()

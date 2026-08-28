@@ -86,6 +86,8 @@ def main() -> int:
         assert not win._settings_body.isHidden()
         assert hasattr(win, "compendium_dropzone")
         assert hasattr(win, "compendium_status")
+        assert hasattr(win, "table_find_bar")
+        assert hasattr(win, "table_find_input")
         assert hasattr(win, "report_fixed")
         assert hasattr(win, "chat_view")
         assert hasattr(win.chart3d, "point_picked")

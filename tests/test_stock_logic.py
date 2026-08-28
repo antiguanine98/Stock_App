@@ -747,6 +747,7 @@ def test_manufacture_candidates_always_top10_by_score():
     scores = [r["priority_score"] for r in result["표준생약"]]
     assert scores == sorted(scores, reverse=True)
     assert all(not r.get("deplete_within_5y") for r in result["표준생약"])
+    assert all(r.get("risk_grade") for r in result["표준생약"])
     assert "C01" not in {r["manage_no"] for r in result["표준생약"]}
 
 
@@ -953,6 +954,73 @@ def test_scatter3d_records_from_sample():
         os.remove(path)
 
 
+def test_deplete_ym_uses_today_not_past_survey_date():
+    """소진 예상일시는 마지막 조사일이 아닌 분석 기준일(오늘)부터 산출."""
+    item = StockItem(
+        manage_no="OLD-01",
+        name_ko="과거조사",
+        std_type="표준생약",
+        corrected_points=[
+            StockPoint(date(2015, 1, 1), 300),
+            StockPoint(date(2018, 6, 1), 120),
+            StockPoint(date(2020, 1, 1), 100),
+        ],
+    )
+    stats = estimate_depletion(item)
+    assert stats["years_left"] is not None
+    assert stats["deplete_ym"] is not None
+    year = int(str(stats["deplete_ym"]).split("년")[0])
+    month = int(str(stats["deplete_ym"]).split("년")[1].replace("월", "").strip())
+    target = date(year, month, 1)
+    today = date.today().replace(day=1)
+    assert target >= today
+
+
+def test_strip_duplicate_auto_summary_opinion():
+    from stock_logic import _strip_auto_summary_opinion_blocks, ensure_mandatory_report_sections
+
+    raw = (
+        "## 1페이지 요약 대시보드\n\n### 자동 종합 의견\n- 중복 A\n\n"
+        "## 기타\n\n### 자동 종합 의견\n- 중복 B\n"
+    )
+    stripped = _strip_auto_summary_opinion_blocks(raw)
+    assert "자동 종합 의견" not in stripped
+    assert "중복 A" not in stripped
+    assert "## 기타" in stripped
+
+    flags = {
+        "dashboard": {
+            "kpis": [{"label": "대상품목 수", "display": "1종"}],
+            "summary_lines": ["단일 요약"],
+        },
+        "depletion_category_items": {},
+        "manufacture_candidates": {"표준생약": [], "지표성분": []},
+        "monitoring_targets": [],
+    }
+    filled = ensure_mandatory_report_sections(raw, flags=flags)
+    assert filled.count("### 자동 종합 의견") == 1
+    assert "단일 요약" in filled
+
+
+def test_manufacture_section_always_has_priority_formula():
+    from stock_logic import PRIORITY_FORMULA_KO, format_manufacture_review_markdown
+
+    md = format_manufacture_review_markdown({"표준생약": [], "지표성분": []})
+    assert "제조 우선순위" in md
+    assert PRIORITY_FORMULA_KO.splitlines()[0] in md
+
+
+def test_unique_missing_compendium_examples():
+    from stock_logic import _unique_missing_compendium_examples
+
+    rows = [
+        {"name_ko": "감초", "pharmacopoeia_kind": "KP"},
+        {"name_ko": "감초", "pharmacopoeia_kind": "KHP"},
+        {"name_ko": "당귀"},
+    ]
+    assert _unique_missing_compendium_examples(rows) == ["감초(KP)", "당귀"]
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -978,6 +1046,10 @@ if __name__ == "__main__":
         test_multi_file_merge,
         test_scatter_cat_label,
         test_scatter3d_records_from_sample,
+        test_deplete_ym_uses_today_not_past_survey_date,
+        test_strip_duplicate_auto_summary_opinion,
+        test_manufacture_section_always_has_priority_formula,
+        test_unique_missing_compendium_examples,
     ]
     failed = 0
     for fn in tests:

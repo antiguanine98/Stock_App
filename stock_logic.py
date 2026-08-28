@@ -945,10 +945,18 @@ def depletion_bucket(years_left: Optional[float], *, stock_zero: bool = False) -
     return "5년 초과/안정"
 
 
-def format_deplete_ym(last_date: date, years_left: float) -> str:
-    """현재 추세 기준 예상 소진 시점 — YYYY년 MM월."""
-    days = max(0, int(round(years_left * 365.25)))
-    target = last_date + timedelta(days=days)
+def format_deplete_ym(
+    years_left: float,
+    *,
+    reference_date: date | None = None,
+) -> str:
+    """분석 기준일(오늘)부터 잔여수명만큼 더한 예상 소진 시점 — YYYY년 MM월."""
+    ref = reference_date or date.today()
+    days = max(0, int(round(float(years_left) * 365.25)))
+    target = ref + timedelta(days=days)
+    today = date.today()
+    if target < today:
+        target = today
     return f"{target.year}년 {target.month:02d}월"
 
 
@@ -1087,27 +1095,31 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
     accel = acceleration_from_rates(early_rate, late_rate)
     rate_change_ratio = accel["ratio"]
     recent_surge = bool(accel["label"] == "급가속")
+    # 소진 잔여수명: 최종 잔고 ÷ 최근 연평균 분양속도 (없으면 전체 감소구간 평균)
+    recent_annual_rate = late_rate if late_rate is not None and late_rate > 1e-9 else annual_rate
+    analysis_ref = date.today()
 
-    if annual_rate is None or annual_rate <= 1e-9:
+    if recent_annual_rate is None or recent_annual_rate <= 1e-9:
         speed = "느림"
         years_left = None
         deplete_5 = False
         deplete_2 = False
         deplete_ym = None
     else:
-        years_left = item.last_qty / annual_rate if item.last_qty > 0 else 0.0
-        if annual_rate >= 40:
+        years_left = item.last_qty / recent_annual_rate if item.last_qty > 0 else 0.0
+        if recent_annual_rate >= 40:
             speed = "빠름"
-        elif annual_rate >= 10:
+        elif recent_annual_rate >= 10:
             speed = "보통"
         else:
             speed = "느림"
         deplete_5 = years_left is not None and years_left <= 5.0
         deplete_2 = years_left is not None and years_left <= 2.0
-        deplete_ym = format_deplete_ym(pts[-1].change_date, float(years_left))
+        deplete_ym = format_deplete_ym(float(years_left), reference_date=analysis_ref)
 
     category = depletion_bucket(years_left, stock_zero=False)
     long_term_low = is_long_term_low_distribution(item, annual_rate)
+    risk = risk_grade_from_years(years_left)
     comps = _priority_components(
         years_left=years_left,
         annual_rate=annual_rate,
@@ -1143,7 +1155,10 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
         "priority_score": priority,
         "unit_price": item.unit_price,
         "stock_value": item.stock_value,
-        "as_of_year": date.today().year,
+        "as_of_year": analysis_ref.year,
+        "analysis_reference_date": analysis_ref.isoformat(),
+        "recent_annual_rate": recent_annual_rate,
+        "risk_grade": risk,
     }
 
 
@@ -1189,6 +1204,15 @@ def risk_grade_from_years(years_left: Optional[float]) -> str:
     if years_left <= 10:
         return "주의"
     return "안정"
+
+
+def _display_risk_grade(row: dict[str, Any]) -> str:
+    grade = row.get("risk_grade")
+    if grade:
+        return str(grade)
+    if row.get("stock_zero"):
+        return "재고없음"
+    return risk_grade_from_years(row.get("years_left"))
 
 
 def group_by_depletion_category(items: list[StockItem]) -> dict[str, list[str]]:
@@ -1300,6 +1324,7 @@ def select_manufacture_candidates(
                 "deplete_within_5y": bool(stats.get("deplete_within_5y")),
                 "last_qty": to_qty_int(it.last_qty),
                 "acceleration": stats["acceleration"],
+                "risk_grade": risk_grade_from_years(stats.get("years_left")),
             }
         )
     return result
@@ -1722,6 +1747,83 @@ def _report_section_body_is_empty(markdown: str) -> bool:
     return True
 
 
+def _strip_auto_summary_opinion_blocks(md_text: str) -> str:
+    """마크다운에서 '자동 종합 의견' 블록을 제거 (KPI 대시보드 주입 시 중복 방지)."""
+    if not (md_text or "").strip():
+        return ""
+    out: list[str] = []
+    skipping = False
+    for line in md_text.splitlines():
+        hm = re.match(r"^(#{2,4})\s+(.+)$", line.strip())
+        if hm:
+            title = re.sub(r"[*_`]", "", hm.group(2)).strip()
+            if "자동 종합 의견" in title or title in ("종합 의견", "핵심 요약"):
+                skipping = True
+                continue
+            skipping = False
+            out.append(line)
+            continue
+        if not skipping:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def _ensure_manufacture_priority_formula(md_text: str) -> str:
+    """제조 검토 섹션에 우선순위 산출 공식이 없으면 상단에 고정 삽입."""
+    body = (md_text or "").strip()
+    if not body:
+        return body
+    if PRIORITY_FORMULA_KO.splitlines()[0] in body or "제조우선순위점수 f" in body:
+        return body
+    lines = body.splitlines()
+    if lines and lines[0].startswith("##"):
+        return "\n".join(
+            [
+                lines[0],
+                "",
+                "### 제조 우선순위 점수 산정 공식",
+                "",
+                PRIORITY_FORMULA_KO,
+                "",
+                *lines[1:],
+            ]
+        )
+    return "\n".join(
+        [
+            "### 제조 우선순위 점수 산정 공식",
+            "",
+            PRIORITY_FORMULA_KO,
+            "",
+            body,
+        ]
+    )
+
+
+def _unique_missing_compendium_examples(
+    missing_items: list[Any],
+    *,
+    limit: int = 8,
+) -> list[str]:
+    """공정서 미보유 대표 예시 — 생약명(한글명) 기준 고유."""
+    seen: set[str] = set()
+    examples: list[str] = []
+    for row in missing_items:
+        if isinstance(row, dict):
+            name = row.get("name_ko") or row.get("name_en") or row.get("label")
+            kind = row.get("pharmacopoeia_kind") or ""
+        else:
+            name = getattr(row, "name_ko", None) or str(row)
+            kind = getattr(row, "pharmacopoeia_kind", "") or ""
+        key = str(name or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        examples.append(f"{key}" + (f"({kind})" if kind else ""))
+        if len(examples) >= limit:
+            break
+    return examples
+
+
 def _extract_raw_section(md_text: str, section_key: str) -> str | None:
     """원문 마크다운에서 지정 섹션 ##·### 블록을 추출. 없으면 None."""
     if not (md_text or "").strip():
@@ -1799,7 +1901,7 @@ def _manufacture_rows_to_markdown_table(rows: list[dict[str, Any]]) -> list[str]
             score_txt,
             str(r.get("deplete_ym") or "-").replace("|", "/"),
             str(r.get("depletion_category") or "-").replace("|", "/"),
-            str(r.get("risk_grade") or "-").replace("|", "/"),
+            _display_risk_grade(r).replace("|", "/"),
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return lines
@@ -1874,6 +1976,8 @@ def format_manufacture_review_markdown(manufacture: dict[str, list[dict[str, Any
     lines = [
         "## 차년도 제조 검토",
         "",
+        "### 제조 우선순위 점수 산정 공식",
+        "",
         PRIORITY_FORMULA_KO,
         "",
         f"표준생약 {len(std_rows)}건 · 지표성분 {len(ind_rows)}건 (마크다운 표 · 생략 없음)",
@@ -1913,7 +2017,9 @@ def build_mandatory_section_markdown(
         miss_rows = f.get("missing_compendium_items") or []
         return format_missing_markdown(zero_rows, miss_rows)
     if section_key == "manufacture":
-        return format_manufacture_review_markdown(f.get("manufacture_candidates"))
+        return _ensure_manufacture_priority_formula(
+            format_manufacture_review_markdown(f.get("manufacture_candidates"))
+        )
     if section_key == "accel":
         return format_accel_monitoring_markdown(f.get("monitoring_targets"))
     if section_key == "compendium":
@@ -1987,9 +2093,15 @@ def ensure_mandatory_report_sections(
     cleaned = text
     for key, _ in to_inject:
         cleaned = _strip_section_blocks(cleaned, key)
+    if any(key == "summary" for key, _ in to_inject):
+        cleaned = _strip_auto_summary_opinion_blocks(cleaned)
 
     summary_blocks = [body for key, body in to_inject if key == "summary"]
-    tail_blocks = [body for key, body in to_inject if key != "summary"]
+    tail_blocks = [
+        _ensure_manufacture_priority_formula(body) if key == "manufacture" else body
+        for key, body in to_inject
+        if key != "summary"
+    ]
 
     parts: list[str] = []
     if summary_blocks:
@@ -2150,7 +2262,7 @@ def _rows_to_markdown_table(
             [
                 str(r.get("deplete_ym") or "-").replace("|", "/"),
                 str(r.get("depletion_category") or "-").replace("|", "/"),
-                str(r.get("risk_grade") or "-").replace("|", "/"),
+                _display_risk_grade(r).replace("|", "/"),
             ]
         )
         lines.append("| " + " | ".join(cells) + " |")
@@ -2434,7 +2546,8 @@ def build_ai_prompt(
         "",
         "[출력 형식 — 필수]",
         "1. 리포트 맨 최상단에 아래 '1페이지 요약 대시보드(핵심 KPI)' 마크다운 표를 그대로 포함하고, "
-        "자동 종합 의견을 5줄 내외로 다듬어 제시하세요. "
+        "자동 종합 의견을 5줄 내외로 다듬어 **대시보드 섹션에만 1회** 제시하세요. "
+        "다른 섹션(기타·권고 등)에 자동 종합 의견을 반복하지 마세요. "
         "('사전산출'·'사전 산출' 문구는 사용하지 마세요.)",
         "2. '분석 전문가의 제언', '전문가 제언', '제언' 섹션은 작성하지 마세요.",
         "3. 사전 산출 목록·수치를 임의로 바꾸지 마세요.",
@@ -3410,8 +3523,12 @@ def split_markdown_report_sections(
             body = "\n\n".join(parts).strip()
             if not body.lstrip().startswith("#"):
                 body = f"## {title}\n\n{body}"
+            if key == "summary":
+                body = _strip_auto_summary_opinion_blocks(body)
             if _section_needs_mandatory_inject(key, body, flags, match_result):
                 body = built
+            elif key == "manufacture":
+                body = _ensure_manufacture_priority_formula(body)
         else:
             body = built
         sections.append(
@@ -3424,7 +3541,7 @@ def split_markdown_report_sections(
         )
 
     if other:
-        body = "\n\n".join(other).strip()
+        body = _strip_auto_summary_opinion_blocks("\n\n".join(other).strip())
         sections.append(
             {
                 "id": "other",
@@ -3919,15 +4036,7 @@ def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str
     held = int(stats.get("inventory_matched") or 0)
     auto_n = int(stats.get("auto_corrected") or 0)
     miss_n = int(stats.get("missing_count") or len(missing_items))
-    examples = []
-    for row in missing_items[:8]:
-        if isinstance(row, dict):
-            name = row.get("name_ko") or row.get("name_en") or row.get("label")
-            kind = row.get("pharmacopoeia_kind") or ""
-            if name:
-                examples.append(f"{name}" + (f"({kind})" if kind else ""))
-        else:
-            examples.append(getattr(row, "name_ko", None) or str(row))
+    examples = _unique_missing_compendium_examples(missing_items, limit=8)
     ex_txt = ", ".join(examples) if examples else "(해당 없음)"
 
     lines = [
