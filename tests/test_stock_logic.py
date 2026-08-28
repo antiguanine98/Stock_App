@@ -1021,6 +1021,31 @@ def test_unique_missing_compendium_examples():
     assert _unique_missing_compendium_examples(rows) == ["감초(KP)", "당귀"]
 
 
+def test_depletion_stats_cache_deduplicates():
+    """collect_ai_analysis_flags가 품목당 estimate_depletion을 1회만 호출."""
+    import stock_logic
+    from unittest.mock import patch
+
+    path = _make_sample_xlsx()
+    try:
+        _, items = stock_logic.load_stock_excel(path)
+        calls: list[str] = []
+        orig = stock_logic.estimate_depletion
+
+        def spy(it):
+            calls.append(stock_logic._stock_item_stats_key(it))
+            return orig(it)
+
+        with patch.object(stock_logic, "estimate_depletion", spy):
+            flags = stock_logic.collect_ai_analysis_flags(items)
+
+        assert len(calls) == len(set(calls))
+        assert flags["by_code"]
+        assert flags["dashboard"]["kpis"]
+    finally:
+        os.remove(path)
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -1050,6 +1075,7 @@ if __name__ == "__main__":
         test_strip_duplicate_auto_summary_opinion,
         test_manufacture_section_always_has_priority_formula,
         test_unique_missing_compendium_examples,
+        test_depletion_stats_cache_deduplicates,
     ]
     failed = 0
     for fn in tests:
