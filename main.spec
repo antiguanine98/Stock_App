@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Stock_App v1.53 (Windows one-file, Python 3.12)."""
+"""PyInstaller spec for Stock_App v1.54 (Windows one-file, Python 3.12)."""
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
@@ -14,6 +14,7 @@ hiddenimports = [
     "matplotlib.backends.backend_qtagg",
     "mplcursors",
     "openpyxl",
+    "xlrd",
     "pandas",
     "google.genai",
 ]
@@ -57,7 +58,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="Stock_App_v1.53",
+    name="Stock_App_v1.54",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

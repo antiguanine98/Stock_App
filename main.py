@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.53
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.54
 """
 
 from __future__ import annotations
@@ -76,6 +76,7 @@ from stock_logic import (
     lookup_pharmacopoeia_tag,
     markdown_report_to_collapsible_html,
     match_compendium_inventory,
+    normalize_excel_path,
     process_excel,
     process_excels,
     split_markdown_report_sections,
@@ -110,7 +111,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.53"
+APP_VERSION = "v1.54"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
@@ -652,10 +653,7 @@ class ExcelWorker(QThread):
 
     def run(self) -> None:
         try:
-            if len(self.file_paths) == 1:
-                self.finished.emit(process_excel(self.file_paths[0]))
-            else:
-                self.finished.emit(process_excels(self.file_paths))
+            self.finished.emit(process_excels(self.file_paths))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -789,8 +787,9 @@ class DropZone(QFrame):
     def _excel_paths_from_urls(urls) -> list[str]:
         paths: list[str] = []
         for url in urls:
-            path = url.toLocalFile()
-            if path.lower().endswith((".xlsx", ".xls")):
+            raw = url.toLocalFile() if hasattr(url, "toLocalFile") else url
+            path = normalize_excel_path(raw)
+            if path:
                 paths.append(path)
         return paths
 
@@ -1188,6 +1187,7 @@ class MainWindow(QMainWindow):
         self._item_by_label: dict[str, dict[str, Any]] = {}
         self._updating_combo = False
         self._loaded_paths: list[str] = []
+        self._pending_excel_paths: list[str] = []
         self._chat_history: list[dict[str, str]] = []
         self._initial_report: str = ""
         self._report_sections: list[dict[str, str]] = []
@@ -1839,12 +1839,20 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self, "공정서 DB 엑셀 선택", "", "Excel Files (*.xlsx *.xls)"
         )
-        if path:
-            self._load_compendium(path)
+        cleaned = normalize_excel_path(path)
+        if cleaned:
+            self._load_compendium(cleaned)
 
     def _on_compendium_dropped(self, paths: list[str]) -> None:
-        if paths:
-            self._load_compendium(paths[0])
+        cleaned = [p for p in (normalize_excel_path(x) for x in (paths or [])) if p]
+        if cleaned:
+            self._load_compendium(cleaned[0])
+        else:
+            QMessageBox.warning(
+                self,
+                "공정서 DB",
+                "유효한 엑셀 파일(.xlsx / .xls)이 없습니다.",
+            )
 
     def _clear_compendium(self) -> None:
         self.compendium_df = None
@@ -1953,9 +1961,15 @@ class MainWindow(QMainWindow):
 
     def _on_compendium_error(self, message: str) -> None:
         self._close_busy()
-        self.compendium_status.setText("공정서 DB: 오류")
-        self.compendium_status.setStyleSheet("color: #b91c1c; font-size: 12px; font-weight: 600;")
-        QMessageBox.critical(self, "공정서 DB 오류", message)
+        if self.compendium_df is not None:
+            name = (self.compendium_meta or {}).get("file_name") or "등록됨"
+            self.compendium_status.setText(f"공정서 DB: {name} (이전 데이터 유지)")
+            self.compendium_status.setStyleSheet("color: #15803d; font-size: 12px; font-weight: 600;")
+        else:
+            self.compendium_status.setText("공정서 DB: 미등록")
+            self.compendium_status.setStyleSheet("color: #64748b; font-size: 12px;")
+        self._update_analyze_button()
+        QMessageBox.warning(self, "공정서 DB 오류", message)
 
     def _compendium_prompt_context(self, stock_items: list | None = None) -> str | None:
         if self.compendium_df is None:
@@ -1976,12 +1990,20 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "엑셀 파일 선택 (다중 가능)", "", "Excel Files (*.xlsx *.xls)"
         )
-        if paths:
-            self._load_excels(list(paths))
+        cleaned = [p for p in (normalize_excel_path(x) for x in (paths or [])) if p]
+        if cleaned:
+            self._load_excels(cleaned)
 
     def _clear_loaded_files(self) -> None:
         self._close_busy()
         self._set_ai_progress(None)
+        if self.excel_worker is not None:
+            try:
+                self.excel_worker.error.disconnect(self._on_excel_error)
+                self.excel_worker.finished.disconnect(self._on_excel_loaded)
+            except (TypeError, RuntimeError):
+                pass
+            self.excel_worker = None
         self._loaded_paths = []
         self.inventory_data = None
         self._chat_history.clear()
@@ -1998,21 +2020,52 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self.status_excel.setText("파일: 미업로드")
+        self.status_excel.setToolTip("")
         self.status_correction.setText("소급 보정: 0건")
         self.chart._show_placeholder("품목 또는 표준품구분을 선택하면 재고 추이 차트가 표시됩니다.")
         self.chart3d.show_message("엑셀을 다시 업로드해 주세요.")
         self._set_settings_collapsed(False)
         self._update_analyze_button()
+        self.statusBar().showMessage("파일 목록이 초기화되었습니다.", 4000)
 
     def _load_excel(self, file_path: str) -> None:
         self._load_excels([file_path])
 
+    def _restore_excel_ready_status(self) -> None:
+        """오류 후에도 UI를 Ready로 유지 (이전 성공 데이터 있으면 복원)."""
+        data = self.inventory_data
+        if data:
+            names = data.get("file_names") or [data.get("file_name", "")]
+            if len(names) <= 2:
+                file_label = ", ".join(str(n) for n in names if n)
+            else:
+                file_label = f"{names[0]} 외 {len(names) - 1}개"
+            row_n = data.get("row_count")
+            suffix = f" ({row_n}품목)" if row_n is not None else ""
+            self.status_excel.setText(f"파일: {file_label}{suffix}")
+            self.status_excel.setToolTip("\n".join(str(n) for n in names if n))
+            self._loaded_paths = list(data.get("file_paths") or self._loaded_paths)
+        else:
+            self._loaded_paths = []
+            self.status_excel.setText("파일: 미업로드")
+            self.status_excel.setToolTip("")
+        self._update_analyze_button()
+
     def _load_excels(self, file_paths: list[str]) -> None:
-        if not file_paths:
+        cleaned = [p for p in (normalize_excel_path(x) for x in (file_paths or [])) if p]
+        if not cleaned:
+            QMessageBox.warning(
+                self,
+                "파일 선택",
+                "유효한 엑셀 파일(.xlsx / .xls)이 없습니다.\n"
+                "(임시 파일 ~$…, 0바이트, 손상 경로는 자동 제외됩니다.)",
+            )
+            self._restore_excel_ready_status()
             return
         # 순차 업로드: 기존 목록에 합치고 중복 제거
-        combined = list(dict.fromkeys(self._loaded_paths + list(file_paths)))
-        self._loaded_paths = combined
+        combined = list(dict.fromkeys(self._loaded_paths + cleaned))
+        # 실패 시 롤백을 위해 시도 목록만 임시 보관 (성공 시에만 확정)
+        self._pending_excel_paths = list(combined)
         names = [Path(p).name for p in combined]
         label = names[0] if len(names) == 1 else f"{len(names)}개 파일"
         self.status_excel.setText(f"파일: 처리 중... ({label})")
@@ -2028,11 +2081,32 @@ class MainWindow(QMainWindow):
 
     def _on_excel_error(self, message: str) -> None:
         self._close_busy()
-        self.status_excel.setText("파일: 오류")
-        QMessageBox.critical(self, "파일 처리 오류", message)
+        # 실패 파일을 pending에서 discard — 이전 성공 목록만 유지
+        pending = getattr(self, "_pending_excel_paths", None) or []
+        good = set((self.inventory_data or {}).get("file_paths") or [])
+        failed_names = [
+            Path(p).name for p in pending if p not in good
+        ] or [Path(p).name for p in pending]
+        self._pending_excel_paths = []
+        self._restore_excel_ready_status()
+        detail = "\n".join(f"- {n}" for n in failed_names[:12])
+        if len(failed_names) > 12:
+            detail += f"\n- … 외 {len(failed_names) - 12}개"
+        QMessageBox.warning(
+            self,
+            "파일 처리 오류",
+            f"일부/전체 엑셀 로드에 실패했습니다.\n"
+            f"실패한 파일은 목록에서 제외했고, 시스템은 사용 가능한 상태입니다.\n\n"
+            f"{message}\n\n{detail}".strip(),
+        )
 
     def _on_excel_loaded(self, data: dict[str, Any]) -> None:
         self._close_busy()
+        # 성공 경로만 목록에 확정 (실패 파일은 discard)
+        loaded = list(data.get("file_paths") or [])
+        self._loaded_paths = loaded
+        self._pending_excel_paths = []
+        failed = list(data.get("failed_files") or [])
         stock_items = list(data.get("stock_items") or [])
         data["ai_flags"] = collect_ai_analysis_flags(stock_items)
         data["ai_mentioned_codes"] = []
@@ -2080,10 +2154,21 @@ class MainWindow(QMainWindow):
         self._update_analyze_button()
         self.tabs.setCurrentIndex(0)
         # 파일 로드만 수행 — AI 분석은 [🚀 분석 시작]에서 실행
-        self.statusBar().showMessage(
-            "재고 파일 로드 완료. 공정서 DB 등록 후 [🚀 분석 시작]을 눌러 주세요.",
-            8000,
-        )
+        msg = "재고 파일 로드 완료. 공정서 DB 등록 후 [🚀 분석 시작]을 눌러 주세요."
+        if failed:
+            fail_txt = "\n".join(
+                f"- {f.get('name')}: {f.get('error')}" for f in failed[:8]
+            )
+            if len(failed) > 8:
+                fail_txt += f"\n- … 외 {len(failed) - 8}개"
+            QMessageBox.warning(
+                self,
+                "일부 파일 로드 실패",
+                f"{len(failed)}개 파일은 제외하고 나머지 {len(loaded)}개를 로드했습니다.\n\n"
+                f"{fail_txt}",
+            )
+            msg = f"일부 파일 제외 후 로드 완료 ({len(loaded)}개 성공 · {len(failed)}개 실패)."
+        self.statusBar().showMessage(msg, 8000)
 
     def _update_analyze_button(self) -> None:
         has_stock = self.inventory_data is not None
