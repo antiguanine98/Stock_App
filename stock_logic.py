@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -61,6 +62,84 @@ PRIORITY_FORMULA_KO = (
 )
 PathLike = Union[str, Path]
 PathList = Sequence[PathLike]
+
+
+def _excel_engine_for_path(path: PathLike) -> str:
+    """확장자 기준 pandas 엔진: .xls → xlrd, 그 외(xlsx 등) → openpyxl."""
+    ext = Path(str(path)).suffix.lower()
+    if ext == ".xls":
+        return "xlrd"
+    return "openpyxl"
+
+
+def _is_zip_or_openpyxl_failure(exc: BaseException) -> bool:
+    """openpyxl이 zip(.xlsx)이 아닌 파일을 만났을 때 나는 오류 판별."""
+    if isinstance(exc, zipfile.BadZipFile):
+        return True
+    name = type(exc).__name__
+    if "BadZipFile" in name or "BadZipfile" in name:
+        return True
+    msg = str(exc).lower()
+    return "not a zip file" in msg or "file is not a zip file" in msg
+
+
+def read_excel_dataframe(path: PathLike, **kwargs: Any) -> pd.DataFrame:
+    """엑셀 DataFrame 로드 — .xls=xlrd, .xlsx=openpyxl, BadZipFile 시 xlrd fallback."""
+    path_s = str(path)
+    engine = _excel_engine_for_path(path_s)
+    try:
+        return pd.read_excel(path_s, engine=engine, **kwargs)
+    except Exception as e:
+        if engine == "openpyxl" and _is_zip_or_openpyxl_failure(e):
+            return pd.read_excel(path_s, engine="xlrd", **kwargs)
+        raise
+
+
+def open_excel_file(path: PathLike) -> pd.ExcelFile:
+    """다중 시트용 ExcelFile — 엔진 분기 + BadZipFile → xlrd fallback."""
+    path_s = str(path)
+    engine = _excel_engine_for_path(path_s)
+    try:
+        return pd.ExcelFile(path_s, engine=engine)
+    except Exception as e:
+        if engine == "openpyxl" and _is_zip_or_openpyxl_failure(e):
+            return pd.ExcelFile(path_s, engine="xlrd")
+        raise
+
+
+def normalize_excel_path(path: Any) -> Optional[str]:
+    """엑셀 경로 정규화. QUrl/튜플→str, ~$·0바이트·비엑셀은 None."""
+    if path is None:
+        return None
+    if hasattr(path, "toLocalFile") and callable(getattr(path, "toLocalFile")):
+        try:
+            path = path.toLocalFile()
+        except Exception:
+            return None
+    if isinstance(path, (tuple, list)):
+        path = path[0] if path else None
+    if path is None:
+        return None
+    if not isinstance(path, str):
+        path = str(path)
+    path = path.strip()
+    if not path:
+        return None
+    name = Path(path).name
+    if name.startswith("~$"):
+        return None
+    if not path.lower().endswith((".xlsx", ".xls")):
+        return None
+    try:
+        p = Path(path)
+        if not p.is_file() or p.stat().st_size <= 0:
+            return None
+    except OSError:
+        return None
+    try:
+        return str(p.resolve())
+    except OSError:
+        return path
 
 
 def _is_empty(value: Any) -> bool:
@@ -614,7 +693,7 @@ def load_stock_excel(path: str) -> tuple[pd.DataFrame, list[StockItem]]:
 def load_stock_items(path: PathLike) -> list[StockItem]:
     """단일 엑셀에서 StockItem 목록만 로드."""
     path = str(path)
-    df = pd.read_excel(path, engine="openpyxl")
+    df = read_excel_dataframe(path)
     df.columns = [str(c).strip() for c in df.columns]
 
     missing = [c for c in ("관리번호", "한글명") if c not in df.columns]
@@ -677,12 +756,40 @@ def process_excel(file_path: PathLike) -> dict[str, Any]:
 
 
 def process_excels(file_paths: PathList) -> dict[str, Any]:
-    """하나 이상의 엑셀을 통합 데이터셋으로 결합해 GUI용 결과를 반환."""
+    """하나 이상의 엑셀을 통합 데이터셋으로 결합해 GUI용 결과를 반환.
+
+    파일별 try-except로 처리해 단일 실패가 전체를 망가뜨리지 않는다.
+    실패한 파일은 failed_files에 남기고, 성공 파일만 병합한다.
+    """
     paths = [str(p) for p in file_paths]
     if not paths:
         raise ValueError("업로드할 엑셀 파일이 없습니다.")
 
-    groups = [load_stock_items(p) for p in paths]
+    groups: list[list[StockItem]] = []
+    loaded_paths: list[str] = []
+    failed_files: list[dict[str, str]] = []
+    for p in paths:
+        try:
+            groups.append(load_stock_items(p))
+            loaded_paths.append(p)
+        except Exception as e:
+            failed_files.append(
+                {
+                    "path": p,
+                    "name": Path(p).name,
+                    "error": str(e),
+                }
+            )
+
+    if not groups:
+        details = "\n".join(
+            f"- {f['name']}: {f['error']}" for f in failed_files
+        ) or "(상세 없음)"
+        raise ValueError(
+            "로드에 성공한 엑셀 파일이 없습니다.\n"
+            f"실패한 파일:\n{details}"
+        )
+
     items = merge_stock_items(groups) if len(groups) > 1 else list(groups[0])
     meta_cols = _unify_meta_cols(items)
     table_df = build_corrected_dataframe(items, meta_cols)
@@ -736,10 +843,10 @@ def process_excels(file_paths: PathList) -> dict[str, Any]:
             }
         )
 
-    names = [Path(p).name for p in paths]
+    names = [Path(p).name for p in loaded_paths]
     return {
-        "file_path": paths[0],
-        "file_paths": paths,
+        "file_path": loaded_paths[0],
+        "file_paths": loaded_paths,
         "file_name": names[0] if len(names) == 1 else f"{len(names)}개 파일",
         "file_names": names,
         "meta_cols": meta_cols,
@@ -751,6 +858,7 @@ def process_excels(file_paths: PathList) -> dict[str, Any]:
         "row_count": len(items),
         "max_pair_count": max_pairs,
         "categories": categories,
+        "failed_files": failed_files,
     }
 
 
@@ -3823,7 +3931,7 @@ def load_compendium_excel(path: PathLike) -> dict[str, Any]:
     """공정서/규격 DB 엑셀을 DataFrame + 구조화 entries로 로드 (시계열·소급보정 없음)."""
     path = str(path)
     frames: list[pd.DataFrame] = []
-    with pd.ExcelFile(path, engine="openpyxl") as xls:
+    with open_excel_file(path) as xls:
         for sheet in xls.sheet_names:
             part = pd.read_excel(xls, sheet_name=sheet)
             part.columns = [str(c).strip() for c in part.columns]

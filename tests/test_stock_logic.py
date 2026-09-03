@@ -1046,6 +1046,83 @@ def test_depletion_stats_cache_deduplicates():
         os.remove(path)
 
 
+def test_excel_engine_branch_and_badzip_fallback():
+    import zipfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from stock_logic import _excel_engine_for_path, read_excel_dataframe
+
+    assert _excel_engine_for_path("a.xls") == "xlrd"
+    assert _excel_engine_for_path("a.XLS") == "xlrd"
+    assert _excel_engine_for_path("a.xlsx") == "openpyxl"
+
+    path = _make_sample_xlsx()
+    try:
+        df = read_excel_dataframe(path)
+        assert "관리번호" in df.columns
+
+        # openpyxl이 BadZipFile을 내면 xlrd로 재시도
+        calls: list[str] = []
+
+        def fake_read(p, engine=None, **kwargs):
+            calls.append(engine or "")
+            if engine == "openpyxl":
+                raise zipfile.BadZipFile("File is not a zip file")
+            if engine == "xlrd":
+                return pd.DataFrame([{"관리번호": "X", "한글명": "테스트"}])
+            raise AssertionError(f"unexpected engine {engine}")
+
+        with patch("stock_logic.pd.read_excel", side_effect=fake_read):
+            out = read_excel_dataframe("/tmp/fake.xlsx")
+        assert calls == ["openpyxl", "xlrd"]
+        assert list(out.columns) == ["관리번호", "한글명"]
+    finally:
+        os.remove(path)
+
+
+def test_process_excels_skips_failed_file():
+    from pathlib import Path
+
+    from stock_logic import process_excels
+
+    good = _make_sample_xlsx()
+    bad = tempfile.mkstemp(suffix=".xlsx")[1]
+    try:
+        with open(bad, "wb") as f:
+            f.write(b"not-an-excel")
+        result = process_excels([good, bad])
+        assert result["row_count"] >= 1
+        assert len(result["file_paths"]) == 1
+        assert Path(result["file_paths"][0]).name == Path(good).name
+        assert len(result["failed_files"]) == 1
+        assert result["failed_files"][0]["name"] == Path(bad).name
+    finally:
+        os.remove(good)
+        os.remove(bad)
+
+
+def test_normalize_excel_path_filters_temp_and_empty():
+    from stock_logic import normalize_excel_path
+
+    assert normalize_excel_path(None) is None
+    assert normalize_excel_path(("/tmp/a.xlsx",)) is None  # missing file
+    fd, empty = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    try:
+        assert os.path.getsize(empty) == 0
+        assert normalize_excel_path(empty) is None
+        assert normalize_excel_path(os.path.join(os.path.dirname(empty), "~$book.xlsx")) is None
+    finally:
+        os.remove(empty)
+    good = _make_sample_xlsx()
+    try:
+        assert normalize_excel_path(good) is not None
+        assert isinstance(normalize_excel_path(good), str)
+    finally:
+        os.remove(good)
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -1076,6 +1153,9 @@ if __name__ == "__main__":
         test_manufacture_section_always_has_priority_formula,
         test_unique_missing_compendium_examples,
         test_depletion_stats_cache_deduplicates,
+        test_excel_engine_branch_and_badzip_fallback,
+        test_process_excels_skips_failed_file,
+        test_normalize_excel_path_filters_temp_and_empty,
     ]
     failed = 0
     for fn in tests:
