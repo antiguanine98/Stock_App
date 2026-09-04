@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.65
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.66
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.65"
+APP_VERSION = "v1.66"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 서버 확인 최신 Flash — 탐색 실패 시에도 이 기본값으로 연결

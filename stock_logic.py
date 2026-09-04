@@ -4585,12 +4585,16 @@ def format_chat_analysis_maps_json(flags: dict[str, Any] | None) -> str:
 
 
 def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
-    """AI 리포트 → Word(.docx) 경량 변환 (무한루프·복잡한 표 파서 없음).
+    """AI 리포트 → Word(.docx): 맑은 고딕 + 마크다운 표→Table Grid.
 
-    헤딩·글머리·일반 문단만 처리. 마크다운 표는 한 줄 문단으로 안전하게 기록.
+    표 블록은 버퍼로 모아 격자 표로 생성하고, 구분선(|---|---|)은 건너뛴다.
+    행 상한으로 UI 프리징을 방지한다.
     """
     try:
         from docx import Document
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
+        from docx.shared import Pt
     except ImportError as exc:
         raise RuntimeError(
             "Word 내보내기에 python-docx가 필요합니다. pip install python-docx"
@@ -4600,35 +4604,154 @@ def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
     if not text:
         raise ValueError("내보낼 리포트 본문이 비어 있습니다.")
 
-    doc = Document()
-    doc.add_heading("생약표준품 재고 분석 및 소진 예측 AI 리포트", level=1)
+    FONT_KO = "맑은 고딕"
+    MAX_LINES = 8000
+    MAX_TABLE_ROWS = 1500
 
-    # UI 프리징 방지: 과도한 행 수 상한
+    doc = Document()
+
+    def _set_run_font(run, *, bold: bool | None = None, size_pt: float | None = None) -> None:
+        run.font.name = FONT_KO
+        if bold is not None:
+            run.bold = bold
+        if size_pt is not None:
+            run.font.size = Pt(size_pt)
+        try:
+            r = run._element
+            rPr = r.get_or_add_rPr()
+            rFonts = rPr.get_or_add_rFonts()
+            rFonts.set(qn("w:ascii"), FONT_KO)
+            rFonts.set(qn("w:hAnsi"), FONT_KO)
+            rFonts.set(qn("w:eastAsia"), FONT_KO)
+        except Exception:
+            try:
+                run._element.rPr.rFonts.set(qn("w:eastAsia"), FONT_KO)
+            except Exception:
+                pass
+
+    def _apply_paragraph_font(paragraph, *, bold: bool | None = None) -> None:
+        for run in paragraph.runs:
+            _set_run_font(run, bold=bold)
+
+    # Normal 스타일 — 한글 기본 폰트
+    style = doc.styles["Normal"]
+    style.font.name = FONT_KO
+    style.font.size = Pt(10)
+    try:
+        style._element.rPr.rFonts.set(qn("w:eastAsia"), FONT_KO)
+        style._element.rPr.rFonts.set(qn("w:ascii"), FONT_KO)
+        style._element.rPr.rFonts.set(qn("w:hAnsi"), FONT_KO)
+    except Exception:
+        pass
+
+    title = doc.add_heading("생약표준품 재고 분석 및 소진 예측 AI 리포트", level=1)
+    _apply_paragraph_font(title)
+
     lines = text.splitlines()
-    max_lines = 8000
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
+    if len(lines) > MAX_LINES:
+        lines = lines[:MAX_LINES]
         lines.append("… (이하 생략 — 내보내기 안전 상한)")
 
+    table_buffer: list[list[str]] = []
+
+    def _is_separator_row(cells: list[str]) -> bool:
+        if not cells:
+            return False
+        for c in cells:
+            s = (c or "").strip().replace(":", "").replace("-", "").replace(" ", "")
+            if s != "":
+                return False
+        return True
+
+    def _set_cell_shading(cell, fill_hex: str = "D9E2F3") -> None:
+        try:
+            from docx.oxml import OxmlElement
+
+            tc = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            shd = OxmlElement("w:shd")
+            shd.set(qn("w:fill"), fill_hex)
+            shd.set(qn("w:val"), "clear")
+            tcPr.append(shd)
+        except Exception:
+            pass
+
+    def flush_table(buffer: list[list[str]]) -> None:
+        if not buffer:
+            return
+        parsed: list[list[str]] = []
+        for row in buffer:
+            if _is_separator_row(row):
+                continue
+            parsed.append([(c or "").strip().replace("**", "") for c in row])
+        if not parsed:
+            return
+        if len(parsed) > MAX_TABLE_ROWS:
+            parsed = parsed[:MAX_TABLE_ROWS]
+            parsed.append(["… (표 행 상한으로 이하 생략)"] + [""] * (max(len(r) for r in parsed) - 1))
+
+        max_cols = max(len(r) for r in parsed)
+        if max_cols <= 0:
+            return
+        # 열 수 맞추기
+        normalized = [r + [""] * (max_cols - len(r)) for r in parsed]
+        tbl = doc.add_table(rows=len(normalized), cols=max_cols)
+        try:
+            tbl.style = "Table Grid"
+        except Exception:
+            pass
+
+        for i, row_data in enumerate(normalized):
+            for j, cell_text in enumerate(row_data):
+                cell = tbl.cell(i, j)
+                cell.text = ""
+                p = cell.paragraphs[0]
+                run = p.add_run(str(cell_text))
+                _set_run_font(run, bold=(i == 0), size_pt=9)
+                if i == 0:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    _set_cell_shading(cell)
+        doc.add_paragraph("")  # 표 다음 여백
+
     for line in lines:
-        clean = line.strip()
-        if not clean:
+        stripped = line.strip()
+        if stripped.startswith("|") and "|" in stripped[1:]:
+            # |a|b| 또는 |a|b 형태 모두 허용
+            raw = stripped
+            if raw.endswith("|"):
+                cols = [c.strip() for c in raw.strip("|").split("|")]
+            else:
+                parts = raw.split("|")
+                cols = [c.strip() for c in parts[1:]] if parts[0] == "" else [c.strip() for c in parts]
+            table_buffer.append(cols)
             continue
-        # HTML 잔여 태그 제거(간단)
-        if clean.startswith("<") and clean.endswith(">"):
+
+        if table_buffer:
+            flush_table(table_buffer)
+            table_buffer = []
+
+        if not stripped:
             continue
-        if clean.startswith("### "):
-            doc.add_heading(clean[4:].strip(), level=3)
-        elif clean.startswith("## "):
-            doc.add_heading(clean[3:].strip(), level=2)
-        elif clean.startswith("# "):
-            doc.add_heading(clean[2:].strip(), level=1)
-        elif clean.startswith(("- ", "* ", "• ")):
-            doc.add_paragraph(clean[2:].strip(), style="List Bullet")
+        if stripped.startswith("<") and stripped.endswith(">"):
+            continue
+        if stripped.startswith("### "):
+            h = doc.add_heading(stripped[4:].strip().replace("**", ""), level=3)
+            _apply_paragraph_font(h)
+        elif stripped.startswith("## "):
+            h = doc.add_heading(stripped[3:].strip().replace("**", ""), level=2)
+            _apply_paragraph_font(h)
+        elif stripped.startswith("# "):
+            h = doc.add_heading(stripped[2:].strip().replace("**", ""), level=1)
+            _apply_paragraph_font(h)
+        elif stripped.startswith(("- ", "* ", "• ")):
+            p = doc.add_paragraph(stripped[2:].strip().replace("**", ""), style="List Bullet")
+            _apply_paragraph_font(p)
         else:
-            # 굵게(**…**) 표시는 평문으로 (정규식 재귀 파싱 회피)
-            plain = clean.replace("**", "")
-            doc.add_paragraph(plain)
+            p = doc.add_paragraph(stripped.replace("**", ""))
+            _apply_paragraph_font(p)
+
+    if table_buffer:
+        flush_table(table_buffer)
 
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)

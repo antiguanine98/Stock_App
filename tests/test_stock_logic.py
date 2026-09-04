@@ -1244,6 +1244,7 @@ def test_chatbot_prompt_persona_and_maps_json():
 def test_export_markdown_report_to_docx(tmp_path=None):
     import tempfile
     from pathlib import Path
+    from docx import Document
     from stock_logic import export_markdown_report_to_docx
 
     md = (
@@ -1256,6 +1257,12 @@ def test_export_markdown_report_to_docx(tmp_path=None):
         out = Path(td) / "report.docx"
         export_markdown_report_to_docx(md, out)
         assert out.exists() and out.stat().st_size > 500
+        doc = Document(str(out))
+        assert len(doc.tables) >= 1
+        tbl = doc.tables[0]
+        assert tbl.cell(0, 0).text.strip() == "이름"
+        assert "감초" in tbl.cell(1, 0).text
+        assert doc.styles["Normal"].font.name == "맑은 고딕"
 
     with tempfile.TemporaryDirectory() as td2:
         try:
@@ -1265,10 +1272,40 @@ def test_export_markdown_report_to_docx(tmp_path=None):
             pass
 
 
-def test_export_docx_handles_large_table_as_plain_lines():
-    """표 파서 없이 대량 | 행도 무한루프 없이 저장."""
+def test_export_docx_markdown_table_as_grid():
+    """마크다운 표가 Word Table Grid로 생성되고 구분선은 제외."""
     import tempfile
     from pathlib import Path
+    from docx import Document
+    from stock_logic import export_markdown_report_to_docx
+
+    md = (
+        "### 소진\n\n"
+        "| 한글명 | 관리번호 | 재고 |\n"
+        "| --- | --- | --- |\n"
+        "| 감초 | STD-001 | 10 |\n"
+        "| 황기 | STD-002 | 5 |\n\n"
+        "본문 이어짐.\n"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "tbl.docx"
+        export_markdown_report_to_docx(md, out)
+        doc = Document(str(out))
+        assert len(doc.tables) == 1
+        t = doc.tables[0]
+        assert len(t.rows) == 3  # header + 2 data (separator skipped)
+        assert t.cell(0, 0).text.strip() == "한글명"
+        assert t.cell(1, 0).text.strip() == "감초"
+        assert t.cell(2, 1).text.strip() == "STD-002"
+        # 헤더 bold
+        assert any(r.bold for r in t.cell(0, 0).paragraphs[0].runs)
+
+
+def test_export_docx_handles_large_table_as_plain_lines():
+    """대량 표도 무한루프 없이 Table로 저장."""
+    import tempfile
+    from pathlib import Path
+    from docx import Document
     from stock_logic import export_markdown_report_to_docx
 
     rows = ["| a | b |", "| --- | --- |"] + [f"| r{i} | v{i} |" for i in range(500)]
@@ -1276,7 +1313,9 @@ def test_export_docx_handles_large_table_as_plain_lines():
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "big.docx"
         export_markdown_report_to_docx(md, out)
-        assert out.exists() and out.stat().st_size > 1000
+        doc = Document(str(out))
+        assert len(doc.tables) == 1
+        assert len(doc.tables[0].rows) == 501  # header + 500 data
 
 
 if __name__ == "__main__":
@@ -1317,6 +1356,7 @@ if __name__ == "__main__":
         test_report_nav_has_no_other_tab,
         test_chatbot_prompt_persona_and_maps_json,
         test_export_markdown_report_to_docx,
+        test_export_docx_markdown_table_as_grid,
         test_export_docx_handles_large_table_as_plain_lines,
     ]
     failed = 0
