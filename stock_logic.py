@@ -2726,8 +2726,10 @@ def _format_full_catalog_block(title: str, rows: list[dict[str, Any]]) -> list[s
     return lines
 
 
-# AI 프롬프트에 넣는 카테고리별 핵심 행 수 (전수는 앱이 리포트에 주입)
-AI_PROMPT_TOP_N = 15
+# AI 프롬프트 Token Diet — 전수 금지, 요약·TOP만
+AI_PROMPT_TOP_DEPLETION = 20
+AI_PROMPT_TOP_MISSING = 15
+AI_PROMPT_TOP_N = 15  # 하위 호환
 
 
 def _format_top_catalog_block(
@@ -2736,7 +2738,7 @@ def _format_top_catalog_block(
     *,
     n: int = AI_PROMPT_TOP_N,
 ) -> list[str]:
-    """AI 프롬프트용 — 전체 건수만 알리고 핵심 TOP N만 표로 전달."""
+    """(호환) 카탈로그 TOP N — 챗봇 스냅샷 등에서 사용."""
     total = len(rows)
     top = list(rows[: max(0, n)])
     lines = [
@@ -2748,11 +2750,163 @@ def _format_top_catalog_block(
         return lines
     lines.extend(_rows_to_markdown_table(top))
     if total > len(top):
-        lines.append(
-            f"(나머지 {total - len(top)}건 전수 표는 앱이 리포트에 자동 수록 — "
-            "모델이 목록을 지어내지 말 것)"
-        )
+        lines.append(f"(외 {total - len(top)}건 생략)")
     return lines
+
+
+def _compact_item_summary_line(i: int, r: dict[str, Any]) -> str:
+    name = r.get("name_ko") or r.get("label") or "-"
+    code = r.get("manage_no") or "-"
+    qty = r.get("last_qty")
+    qty_txt = format_qty_int(qty) if qty is not None else "-"
+    years = r.get("years_left")
+    years_txt = f"{years:.1f}" if isinstance(years, (int, float)) else "-"
+    return (
+        f"{i}. {name} | {code} | 유형:{r.get('std_type') or '-'} | "
+        f"재고:{qty_txt} | 등급:{r.get('risk_grade') or _display_risk_grade(r)} | "
+        f"잔여:{years_txt}년 | 소진:{r.get('deplete_ym') or '-'} | "
+        f"우선:{r.get('priority_score') if r.get('priority_score') is not None else '-'}"
+    )
+
+
+def build_ai_token_diet_block(flags: dict[str, Any], items: list[StockItem] | None = None) -> str:
+    """AI 분석용 초경량 요약 — 통계 + 제조/소진 TOP20 + 미보유 15개만.
+
+    478품목 전수·추이 시계열·카테고리 전수 표는 절대 포함하지 않는다.
+    """
+    maps = flags.get("chat_analysis_maps") or {}
+    risk_items = flags.get("risk_grade_items") or {}
+    category_items = flags.get("depletion_category_items") or {}
+    manufacture = flags.get("manufacture_candidates") or {}
+    miss_rows = list(flags.get("missing_compendium_items") or [])
+    zero_rows = list(category_items.get(ZERO_STOCK_CATEGORY) or [])
+    dashboard = flags.get("dashboard") or {}
+
+    danger_n = len(risk_items.get("위험") or [])
+    caution_n = len(risk_items.get("경계") or []) + len(risk_items.get("주의") or [])
+    stable_n = len(risk_items.get("안정") or [])
+    total_n = len(items) if items is not None else sum(
+        len(v or []) for v in (category_items.values() if category_items else [])
+    )
+    if not total_n and dashboard.get("kpis"):
+        for kpi in dashboard["kpis"]:
+            if kpi.get("key") == "managed":
+                total_n = int(kpi.get("value") or 0)
+                break
+    normal_n = max(0, total_n - danger_n - caution_n) if total_n else stable_n
+
+    match_stats = maps.get("compendium_match_stats") or {}
+    matched = match_stats.get("inventory_matched_groups")
+    missing_c = match_stats.get("missing_count")
+    if missing_c is None:
+        missing_c = len(miss_rows)
+    zero_n = len(zero_rows)
+
+    dep_sum = maps.get("depletion_summary") or {
+        k: len(category_items.get(k) or []) for k in DEPLETION_CATEGORY_ORDER
+    }
+
+    # 소진 임박 + 제조 우선순위 통합 TOP20
+    scored: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for grade in ("위험", "경계", "주의"):
+        for r in risk_items.get(grade) or []:
+            key = str(r.get("manage_no") or r.get("label") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            scored.append({**r, "risk_grade": r.get("risk_grade") or grade})
+    for cat in ("1년 이내", "2년 이내", "3년 이내"):
+        for r in category_items.get(cat) or []:
+            key = str(r.get("manage_no") or r.get("label") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            scored.append(dict(r))
+    for bucket in (manufacture.get("표준생약") or []) + (manufacture.get("지표성분") or []):
+        key = str(bucket.get("manage_no") or bucket.get("label") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        scored.append(dict(bucket))
+
+    def _sort_key(r: dict[str, Any]) -> tuple:
+        yl = r.get("years_left")
+        yl_v = float(yl) if isinstance(yl, (int, float)) else 999.0
+        pr = float(r.get("priority_score") or 0)
+        return (yl_v, -pr)
+
+    scored.sort(key=_sort_key)
+    top20 = scored[:AI_PROMPT_TOP_DEPLETION]
+
+    missing_pool = miss_rows if miss_rows else zero_rows
+    missing_top = missing_pool[:AI_PROMPT_TOP_MISSING]
+
+    payload = {
+        "stats": {
+            "total_items": total_n,
+            "normal_or_stable": normal_n,
+            "caution_boundary": caution_n,
+            "danger": danger_n,
+            "zero_stock_missing_inventory": zero_n,
+            "compendium_matched_groups": matched,
+            "compendium_missing_count": missing_c,
+            "depletion_counts": {k: int(dep_sum.get(k) or 0) for k in DEPLETION_CATEGORY_ORDER},
+        },
+        "manufacture_or_depletion_top20": [
+            {
+                "name_ko": r.get("name_ko") or r.get("label"),
+                "manage_no": r.get("manage_no"),
+                "std_type": r.get("std_type"),
+                "last_qty": r.get("last_qty"),
+                "risk_grade": r.get("risk_grade") or _display_risk_grade(r),
+                "years_left": r.get("years_left"),
+                "deplete_ym": r.get("deplete_ym"),
+                "priority_score": r.get("priority_score"),
+            }
+            for r in top20
+        ],
+        "missing_sample_15": [
+            {
+                "name_ko": r.get("name_ko") or r.get("label") or r.get("name"),
+                "manage_no": r.get("manage_no"),
+                "compendium": r.get("compendium") or r.get("source") or r.get("std_type"),
+            }
+            for r in missing_top
+        ],
+    }
+    try:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        body = str(payload)
+    # 안전 상한 (~수 천 토큰)
+    if len(body) > 8000:
+        body = body[:7950] + "...(truncated)"
+
+    lines = [
+        "[Token Diet 요약 JSON — 전수/추이 금지, 이 JSON만 근거]",
+        "```json",
+        body,
+        "```",
+        "",
+        f"[제조 우선·소진 임박 TOP{len(top20)}]",
+    ]
+    if top20:
+        lines.extend(_compact_item_summary_line(i, r) for i, r in enumerate(top20, 1))
+    else:
+        lines.append("(해당 없음)")
+    lines.append("")
+    lines.append(f"[미보유 대표 {len(missing_top)}건]")
+    if missing_top:
+        for i, r in enumerate(missing_top, 1):
+            lines.append(
+                f"{i}. {r.get('name_ko') or r.get('label') or r.get('name') or '-'} | "
+                f"{r.get('manage_no') or '-'} | "
+                f"{r.get('compendium') or r.get('source') or r.get('std_type') or '-'}"
+            )
+    else:
+        lines.append("(해당 없음)")
+    return "\n".join(lines)
 
 
 def _build_ai_risk_summary_block(
@@ -2760,65 +2914,8 @@ def _build_ai_risk_summary_block(
     *,
     n: int = AI_PROMPT_TOP_N,
 ) -> list[str]:
-    """위험·모니터링·통계 중심의 경량 요약 블록 (원본 추이 시계열 제외)."""
-    lines: list[str] = [
-        "[위험 품목·통계 요약 — 정제 데이터만 사용, 원본 엑셀 행/추이 시계열 금지]",
-        "",
-    ]
-    maps = flags.get("chat_analysis_maps") or {}
-    dep_sum = maps.get("depletion_summary") or {}
-    if not dep_sum:
-        cat_items = flags.get("depletion_category_items") or {}
-        dep_sum = {k: len(cat_items.get(k) or []) for k in DEPLETION_CATEGORY_ORDER}
-    lines.append("### 소진구간 건수 통계")
-    for cat_name in DEPLETION_CATEGORY_ORDER:
-        lines.append(f"- {cat_name}: {int(dep_sum.get(cat_name) or 0)}건")
-    lines.append("")
-
-    risk_items = flags.get("risk_grade_items") or {}
-    lines.append("### 위험등급별 핵심 목록")
-    for grade in ("위험", "경계", "주의"):
-        rows = list(risk_items.get(grade) or [])
-        lines.extend(_format_top_catalog_block(f"위험등급 {grade}", rows, n=n))
-        lines.append("")
-
-    category_items = flags.get("depletion_category_items") or {}
-    # 단기·중기 소진 구간 (안정·미보유 제외) — 핵심 TOP만
-    priority_cats = [
-        c
-        for c in DEPLETION_CATEGORY_ORDER
-        if c != ZERO_STOCK_CATEGORY and "초과" not in c
-    ]
-    lines.append("### 주요 소진구간 핵심 목록")
-    for cat_name in priority_cats:
-        rows = list(category_items.get(cat_name) or [])
-        lines.extend(_format_top_catalog_block(f"소진구간 {cat_name}", rows, n=n))
-        lines.append("")
-
-    zero_rows = list(category_items.get(ZERO_STOCK_CATEGORY) or [])
-    lines.extend(_format_top_catalog_block("미보유(재고0)", zero_rows, n=n))
-    lines.append("")
-
-    monitoring = list(flags.get("monitoring_targets") or [])
-    surge = [r for r in monitoring if r.get("acceleration") == "급가속"]
-    increase = [r for r in monitoring if r.get("acceleration") == "증가"]
-    lines.extend(_format_top_catalog_block("모니터링 급가속", surge, n=n))
-    lines.append("")
-    lines.extend(_format_top_catalog_block("모니터링 증가", increase, n=n))
-    lines.append("")
-
-    risk_top = list(maps.get("risk_top10") or [])
-    if risk_top:
-        lines.append("### 위험 TOP10 (사전 산출)")
-        for i, r in enumerate(risk_top[:10], 1):
-            lines.append(
-                f"{i}. {r.get('name_ko') or r.get('label') or '-'} | "
-                f"{r.get('manage_no') or '-'} | 등급:{r.get('risk_grade') or '-'} | "
-                f"잔여:{r.get('years_left') if r.get('years_left') is not None else '-'}년 | "
-                f"소진:{r.get('deplete_ym') or '-'} | 우선:{r.get('priority_score')}"
-            )
-        lines.append("")
-    return lines
+    """하위 호환 — Token Diet 블록을 줄 목록으로 반환."""
+    return build_ai_token_diet_block(flags).splitlines()
 
 
 def _format_candidate_lines(rows: list[dict[str, Any]], *, full: bool = False) -> str:
@@ -3055,149 +3152,43 @@ def build_ai_prompt(
     compendium_match_report: str | None = None,
     flags: dict[str, Any] | None = None,
 ) -> str:
-    targets = items_for_ai_analysis(items)
-    bulk_dates = detect_bulk_decrease_dates(items)
+    """AI 분석 프롬프트 — Token Diet (통계·TOP20·미보유15만, 전수 직렬화 금지)."""
     if flags is None:
         flags = collect_ai_analysis_flags(items)
     as_of = date.today()
-    manufacture = flags.get("manufacture_candidates") or {}
-    long_term_low = flags.get("long_term_low_items") or []
-    valuation = flags.get("valuation") or {}
     dashboard = flags.get("dashboard") or build_kpi_dashboard(items, flags)
+    # compendium_* 원문 장문은 토큰 폭주 원인 — 통계는 diet JSON에만 반영
+    _ = (compendium_context, compendium_match_report)
 
     lines = [
-        "너는 대한민국 약전(KP) 및 생약규격집(KHP) 생약표준품 관리 분야의 "
-        "최고 수석 데이터 분석가이다.",
-        "아래는 연도별 최종 재고량 기준으로 소급 보정이 완료된 데이터와 사전 정량 산출 결과입니다.",
-        f"기준일(오늘): {as_of.isoformat()} ({as_of.year}년)",
+        "너는 대한민국 약전(KP)·생약규격집(KHP) 생약표준품 수석 데이터 분석가이다.",
+        f"기준일: {as_of.isoformat()}",
         "",
-        "[답변·서술 논리 구조 — 필수]",
-        "각 분석 섹션과 종합 의견은 가능한 한 "
-        "① 현황 수치 → ② 원인 분석 → ③ 권고 액션 플랜 순서로 서술하세요. "
-        "단순 단답·나열만으로 끝내지 마세요.",
+        "[규칙]",
+        "- 아래 Token Diet 요약만 근거로 분석하세요. 전수 목록·엑셀 원행·추이는 제공되지 않습니다.",
+        "- 수치를 임의로 바꾸거나 없는 품목을 지어내지 마세요.",
+        "- 서술: ①현황 수치 → ②원인 → ③권고. '제언' 섹션 금지.",
+        "- 전수 표(소진·미보유·모니터링)는 앱이 리포트에 자동 주입하므로 모델은 요약 해석만 작성.",
         "",
-        "[기본 전제]",
-        "1. 생약표준품은 민간 분양에 따라 지속적으로 감소하는 것이 정상이므로, 일반적인 감소 추이는 정상으로 간주합니다.",
-        "2. 재고량이 증가한 구간(전수조사/추가제조/반납 등) 및 소급 보정 증가는 정상 분양속도 계산에서 제외·보정합니다.",
-        "3. 동일 날짜에 100개 이상 품목이 동시 감소한 기록은 연구 과제 목적의 대량 출고이므로 민간 분양 분석에서 제외합니다.",
+        "[출력]",
+        "1. 최상단 ## 1페이지 요약 대시보드 (아래 KPI 표를 그대로 포함, 종합의견 5줄 내외 1회)",
+        "2. ## 소진 예상 / ## 미보유 / ## 차년도 제조 검토 / ## 분양 가속 모니터링 / "
+        "## 공정서 DB 매칭 및 수재 현황 헤딩으로 핵심 이슈만 서술",
+        f"3. 제조우선순위 공식 인용: {PRIORITY_FORMULA_KO}",
         "",
-        "[할루시네이션(억측) 금지 — 반드시 준수]",
-        "- 제공된 재고/분양 수치·사전 산출 지표에 근거하지 않은 자의적 추측·원인 단정을 하지 마세요.",
-        "- 데이터로 확인되지 않은 내용은 '확실하지 않음' 또는 '추측입니다'라고 명시하세요.",
-        "- 오직 수집된 재고/분양 데이터·사전 산출 결과·(있으면) 공정서 DB만으로 객관적 사실 위주로 보고하세요.",
-        "- 공정서 DB는 규격/기준 참조용이며 재고·분양 수치 산출에 사용하지 마세요.",
+        "[1페이지 요약 대시보드(핵심 KPI)]",
+        format_kpi_dashboard_markdown(dashboard),
         "",
-        "[출력 형식 — 필수]",
-        "1. 리포트 맨 최상단에 아래 '1페이지 요약 대시보드(핵심 KPI)' 마크다운 표를 그대로 포함하고, "
-        "자동 종합 의견을 5줄 내외로 다듬어 **대시보드 섹션에만 1회** 제시하세요. "
-        "다른 섹션(기타·권고 등)에 자동 종합 의견을 반복하지 마세요. "
-        "('사전산출'·'사전 산출' 문구는 사용하지 마세요.)",
-        "2. '분석 전문가의 제언', '전문가 제언', '제언' 섹션은 작성하지 마세요.",
-        "3. 사전 산출 목록·수치를 임의로 바꾸지 마세요.",
-        "4. 소진·미보유·모니터링 등 전수 표는 앱이 리포트에 자동 주입합니다. "
-        "모델은 제공된 요약·TOP 목록·KPI만으로 분석 서술하세요. "
-        "엑셀 원본 행·전수 목록을 재구성·추정하지 마세요. "
-        "섹션 제목은 반드시 ## 헤딩으로 분리하세요: "
-        "'## 소진 예상', '## 미보유', '## 차년도 제조검토', "
-        "'## 분양 가속 모니터링', '## 공정서 DB 매칭' 등.",
+        build_ai_token_diet_block(flags, items),
         "",
-        "[분석 요청 항목]",
-        "1. 분양 속도·소진 위험·가속도 관점의 핵심 이슈 요약 (TOP 목록 근거)",
-        "2. 소진 구간별 건수 통계와 위험·경계 품목 중심 해석 "
-        "(전수 표는 앱이 수록 — 모델이 전수를 지어내지 말 것)",
-        "3. 데이터 신뢰도(A~D)가 낮은 품목이 TOP에 있으면 명시",
-        "4. 분양 가속도(급가속/증가) 모니터링 핵심과 장기 저분양 권고",
-        f"   ({ACCELERATION_FORMULA_KO})",
-        "5. 차년도 제조검토: 사전 산출 상위 10종 표를 반영한 해석",
-        "   ※ 제조 우선순위 섹션 서두에 아래 산출 공식·가중치를 그대로 인용:",
-        f"   {PRIORITY_FORMULA_KO}",
-        "6. 섹션 헤딩을 유지하세요: "
-        "'## 1페이지 요약 대시보드', '## 소진 예상', '## 미보유', "
-        "'## 차년도 제조 검토', '## 분양 가속 모니터링', '## 공정서 DB 매칭 및 수재 현황'.",
-        "7. 현 재고 기준 분양금액 환산액(전체·유형별·TOP20) 해석",
-        "8. 공정서 DB 통계가 있으면 매칭/미보유 요약을 서술하세요.",
-        "",
-        f"[연구과제 대량출고로 제외할 날짜] {', '.join(bulk_dates) if bulk_dates else '해당 없음'}",
-        "",
-        f"[분양 가속도 산출식] {ACCELERATION_FORMULA_KO}",
-        "",
-        "[제조우선순위점수 산출식·가중치]",
-        PRIORITY_FORMULA_KO,
-        "",
-        f"[분석 대상 품목 수] 재고변동 관측 {len(targets)}종 (원본 추이 시계열은 프롬프트에 넣지 않음)",
-        "",
+        "위 요약만으로 한국어 마크다운 분석 리포트를 작성하세요. "
+        "전수 표·원본 행을 재구성하지 마세요.",
     ]
-
-    chat_json = format_chat_analysis_maps_json(flags)
-    if chat_json:
-        lines.append(chat_json)
-        lines.append("")
-
-    # 공정서 컨텍스트는 통계·요약만 — 과도한 전문은 잘라 토큰 절약
-    if compendium_context and compendium_context.strip():
-        ctx = compendium_context.strip()
-        if len(ctx) > 6000:
-            ctx = ctx[:5950] + "\n... (공정서 컨텍스트 요약 절단)"
-        lines.append(ctx)
-        lines.append("")
-
-    if compendium_match_report and compendium_match_report.strip():
-        rep = compendium_match_report.strip()
-        if len(rep) > 4000:
-            rep = rep[:3950] + "\n... (공정서 매칭 리포트 요약 절단)"
-        lines.append(rep)
-        lines.append("")
-
-    lines.extend(
-        [
-            "[1페이지 요약 대시보드(핵심 KPI)]",
-            format_kpi_dashboard_markdown(dashboard),
-            "",
-        ]
-    )
-    lines.extend(_build_ai_risk_summary_block(flags, n=AI_PROMPT_TOP_N))
-
-    lines.append("[차년도 제조 검토 — 사전 산출 상위권]")
-    lines.append(format_manufacture_review_markdown(manufacture))
-    lines.append("")
-
-    lines.append("[장기 저분양/과다재고 — 차기 제조 수량 하향 권고 (최대 20건)]")
-    if long_term_low:
-        for i, r in enumerate(long_term_low[:20], 1):
-            lines.append(
-                f"{i}. {r['label']} | 연평균:{r['annual_rate'] if r['annual_rate'] is not None else '-'} | "
-                f"환산:{_fmt_money(r.get('stock_value'))} | {r['recommendation']}"
-            )
-    else:
-        lines.append("없음")
-
-    lines.append("")
-    lines.append("[현 재고 기준 분양금액 환산액]")
-    lines.append(f"- 총액: {_fmt_money(valuation.get('total_value'))}")
-    for tname, tval in (valuation.get("by_type") or {}).items():
-        lines.append(f"- {tname}: {_fmt_money(tval)}")
-    lines.append(
-        f"- 가격 반영 {valuation.get('priced_count', 0)}종 / "
-        f"가격 미기재 {valuation.get('missing_price_count', 0)}종"
-    )
-    lines.append("- TOP20:")
-    top20 = valuation.get("top20") or []
-    if top20:
-        for i, r in enumerate(top20, 1):
-            lines.append(
-                f"  {i}. {r['label']} | 재고:{r['qty']:g} × 단가:{r['unit_price']:g} = "
-                f"{_fmt_money(r['stock_value'])}"
-            )
-    else:
-        lines.append("  없음 (가격 컬럼 없음)")
-
-    lines.append("")
-    lines.append(
-        "위 전제·할루시네이션 금지·요약 산출·출력 형식을 반영한 한국어 마크다운 분석 리포트를 작성해 주세요. "
-        "최상단 KPI 대시보드와 사실 기반 본문만 포함하고, 분석 전문가의 제언 섹션은 넣지 마세요. "
-        "원본 엑셀 전수 행·품목별 추이 시계열은 제공되지 않았으므로 추정·재구성하지 마세요."
-    )
-    return "\n".join(lines)
+    prompt = "\n".join(lines)
+    # 절대 상한 — 무료 티어 TPM 보호
+    if len(prompt) > 12000:
+        prompt = prompt[:11950] + "\n... (prompt truncated for token diet)"
+    return prompt
 
 
 
@@ -4553,13 +4544,12 @@ def match_compendium_inventory(
 
 
 def format_chat_analysis_maps_json(flags: dict[str, Any] | None) -> str:
-    """챗봇/리포트용 사전 계산 구조화 JSON (한글명 재고·영문명 매칭·위험 TOP10)."""
+    """챗봇용 초경량 구조화 JSON (샘플 최소화 — TPM 보호)."""
     if not flags:
         return ""
     maps = flags.get("chat_analysis_maps")
     if not isinstance(maps, dict) or not maps:
         return ""
-    # 프롬프트 폭주 방지: 한글명 맵은 보유/미보유 요약 + 상위 일부만
     payload: dict[str, Any] = {
         "as_of": maps.get("as_of"),
         "depletion_summary": maps.get("depletion_summary") or {},
@@ -4571,25 +4561,25 @@ def format_chat_analysis_maps_json(flags: dict[str, Any] | None) -> str:
         "total_names": len(ko_map),
         "with_stock": sum(1 for s in ko_map if s.get("has_stock")),
         "without_stock": sum(1 for s in ko_map if not s.get("has_stock")),
-        "sample_with_stock": [s for s in ko_map if s.get("has_stock")][:40],
-        "sample_without_stock": [s for s in ko_map if not s.get("has_stock")][:40],
+        "sample_with_stock": [s for s in ko_map if s.get("has_stock")][:10],
+        "sample_without_stock": [s for s in ko_map if not s.get("has_stock")][:10],
     }
     en_match = list(maps.get("name_en_match_map") or [])
-    payload["name_en_match_map_sample"] = en_match[:80]
+    payload["name_en_match_map_sample"] = en_match[:15]
     en_groups = list(maps.get("name_en_inventory_groups") or [])
     payload["name_en_group_summary"] = {
         "unique_groups": len(en_groups),
-        "sample": en_groups[:40],
+        "sample": en_groups[:10],
     }
     try:
-        body = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
     except (TypeError, ValueError):
         body = str(payload)
-    if len(body) > 12000:
-        body = body[:11950] + "\n... (JSON truncated)"
+    if len(body) > 6000:
+        body = body[:5950] + "...(JSON truncated)"
     return (
-        "[구조화 분석 맵 JSON — 한글명 통합 재고 / 영문명 공정서 매칭 / 위험 TOP10 / 소진 요약]\n"
-        "아래 JSON만 교차 분석 근거로 사용하세요. 원본 장문 텍스트를 추정하지 마세요.\n"
+        "[구조화 분석 맵 JSON — 요약만]\n"
+        "아래 JSON만 교차 분석 근거로 사용하세요.\n"
         f"```json\n{body}\n```"
     )
 

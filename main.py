@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.62
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.63
 """
 
 from __future__ import annotations
@@ -116,37 +116,35 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.62"
+APP_VERSION = "v1.63"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
-# 서버 안내 우선 후보 — 실제 타겟은 list_models 동적 탐색이 우선
+# 무료 티어 지원 모델만 — omni(할당량 0) 등 제외, 단일 호출
 GEMINI_MODEL_PREFERENCES = [
-    "gemini-3.6-flash",
-    "gemini-omni-1.1-flash",
+    "gemini-2.5-flash",
 ]
 GEMINI_FAILOVER_PREFERENCES = [
-    "gemini-3.6-flash",
-    "gemini-omni-1.1-flash",
+    "gemini-2.5-flash",
 ]
-# 신규 사용자에게 404를 내는 구버전·종료 모델
+# 할당량 0·종료·미지원 모델
 GEMINI_RETIRED_MODELS = frozenset(
     {
+        "gemini-omni-1.1-flash",
+        "gemini-omni-flash",
         "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
         "gemini-1.5-flash-001",
         "gemini-2.0-flash",
         "gemini-2.0-flash-lite",
         "gemini-2.0-flash-001",
         "gemini-2.0-flash-lite-001",
-        "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.5-flash-lite-preview",
         "gemini-2.5-flash-preview",
     }
 )
 _resolved_gemini_model: str | None = None
-_MAX_MODEL_PROBES = 4  # 연결 테스트: 동적 후보 상한
-_MAX_CASCADE_MODELS = 3  # 분석: 동적 Flash 최대 3개
+_MAX_MODEL_PROBES = 2
+_MAX_CASCADE_MODELS = 1  # 모델 전환 없음 — 동일 모델 재시도만
 _cancel_gemini: bool = False
 _discovered_flash_cache: list[str] | None = None
 
@@ -454,8 +452,8 @@ def _is_auth_error(exc: BaseException) -> bool:
 
 
 _RETRYABLE_CODES = (429, 500, 502, 503, 504)
-_MAX_RETRIES = 0  # 분석 호출은 대기 재시도 없이 즉시 다음 모델
-_RETRY_BASE_SECONDS = 1
+_MAX_RETRIES = 2  # 동일 모델 최대 2회 재시도
+_RETRY_BASE_SECONDS = 3  # 실패 시 고정 3초 대기
 _RETRY_MAX_WAIT = 3
 _HTTP_TIMEOUT_MS = 120_000  # 분석 요청 타임아웃(ms) — ReadTimeout 완화
 
@@ -521,19 +519,20 @@ def _is_model_unavailable_error(exc: BaseException) -> bool:
 
 
 def _is_retired_model(model_id: str | None) -> bool:
-    """신규 사용자에게 404를 내는 구버전·종료 모델인지."""
+    """할당량 0·종료·미지원 모델인지 (omni 등)."""
     if not model_id:
         return False
     mid = str(model_id).strip()
     if mid in GEMINI_RETIRED_MODELS:
         return True
     low = mid.lower()
-    # 1.5 / 2.0 / 2.5 Flash 계열은 더 이상 신규 키에 제공되지 않음
-    if low.startswith("gemini-1.5-flash"):
+    # 무료 티어 할당량 0인 omni 계열 차단
+    if "omni" in low:
         return True
     if low.startswith("gemini-2.0-flash"):
         return True
-    if low.startswith("gemini-2.5-flash"):
+    # 1.5-flash-latest 는 허용, 그 외 1.5 고정 ID는 제외
+    if low.startswith("gemini-1.5-flash") and low != "gemini-1.5-flash-latest":
         return True
     return False
 
@@ -546,7 +545,6 @@ def _model_supports_generate_content(model_obj: Any) -> bool:
         or []
     )
     if not actions:
-        # 필드가 비어 있으면 통과 — 이후 probe로 검증
         return True
     for raw in actions:
         a = str(raw).lower().replace("_", "")
@@ -556,20 +554,20 @@ def _model_supports_generate_content(model_obj: Any) -> bool:
 
 
 def _flash_version_sort_key(model_id: str) -> tuple:
-    """버전 숫자 큰 Flash를 앞으로 (비-lite 우선)."""
+    """선호 고정 모델(2.5-flash)을 최우선."""
     import re as _re
 
     low = str(model_id).lower()
+    prefer = 2 if low == "gemini-2.5-flash" else (1 if low == "gemini-1.5-flash-latest" else 0)
     nums = [int(x) for x in _re.findall(r"\d+", low)]
     while len(nums) < 4:
         nums.append(0)
     non_lite = 1 if "lite" not in low else 0
-    omni = 1 if "omni" in low else 0
-    return (tuple(nums[:4]), non_lite, omni)
+    return (prefer, tuple(nums[:4]), non_lite)
 
 
 def _order_discovered_flash(found: list[str]) -> list[str]:
-    """선호 ID를 앞에 두고, 나머지는 최신 버전 순."""
+    """선호 ID를 앞에 두고, 나머지는 버전 순. omni 등은 이미 필터됨."""
     ordered: list[str] = []
     seen: set[str] = set()
     for preferred in GEMINI_MODEL_PREFERENCES + list(GEMINI_FAILOVER_PREFERENCES):
@@ -583,10 +581,7 @@ def _order_discovered_flash(found: list[str]) -> list[str]:
 
 
 def _discover_flash_models(client, *, use_cache: bool = True) -> list[str]:
-    """API에서 generateContent 가능 Flash 모델 ID를 동적 조회 (캐시).
-
-    google.genai Client.models.list() ≡ legacy list_models().
-    """
+    """API Flash 모델 조회 — omni·retired 제외, 선호 모델 우선."""
     global _discovered_flash_cache
     if use_cache and _discovered_flash_cache is not None:
         return list(_discovered_flash_cache)
@@ -601,7 +596,7 @@ def _discover_flash_models(client, *, use_cache: bool = True) -> list[str]:
             low = mid.lower()
             if "flash" not in low:
                 continue
-            if any(x in low for x in ("embed", "tts", "live", "image")):
+            if any(x in low for x in ("embed", "tts", "live", "image", "omni")):
                 continue
             if not _model_supports_generate_content(m):
                 continue
@@ -612,8 +607,12 @@ def _discover_flash_models(client, *, use_cache: bool = True) -> list[str]:
     except Exception as exc:
         log_gemini(
             "WARN",
-            f"모델 목록 조회 실패(선호 후보로 진행): {format_gemini_error(exc)}",
+            f"모델 목록 조회 실패(고정 후보로 진행): {format_gemini_error(exc)}",
         )
+    # 선호 모델이 API 목록에 없어도 후보에 유지(probe로 검증)
+    for preferred in GEMINI_MODEL_PREFERENCES:
+        if preferred not in found and not _is_retired_model(preferred):
+            found.append(preferred)
     ordered = _order_discovered_flash(found)
     _discovered_flash_cache = list(ordered)
     if ordered:
@@ -626,18 +625,16 @@ def _discover_flash_models(client, *, use_cache: bool = True) -> list[str]:
 
 
 def _pick_latest_flash(discovered: list[str] | None = None) -> str | None:
-    """동적 목록(또는 선호 목록)에서 최신 Flash 1개."""
-    disc = [m for m in (discovered or []) if not _is_retired_model(m)]
-    if disc:
-        return disc[0]
+    """고정 선호 모델 우선 선택."""
     for mid in GEMINI_MODEL_PREFERENCES:
         if not _is_retired_model(mid):
             return mid
-    return None
+    disc = [m for m in (discovered or []) if not _is_retired_model(m)]
+    return disc[0] if disc else None
 
 
 def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | None = None) -> list[str]:
-    """연결 테스트용 후보 — API 동적 목록 우선, 선호 ID는 fallback."""
+    """연결 테스트용 — 선호 고정 모델만."""
     ordered: list[str] = []
 
     def _add(mid: str | None) -> None:
@@ -646,19 +643,17 @@ def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | 
 
     _add(prioritize)
     _add(_resolved_gemini_model)
-    disc = [m for m in (discovered or []) if not _is_retired_model(m)]
-    for preferred in GEMINI_MODEL_PREFERENCES:
-        if preferred in disc:
-            _add(preferred)
-    for mid in disc:
-        _add(mid)
     for preferred in GEMINI_MODEL_PREFERENCES:
         _add(preferred)
+    disc = [m for m in (discovered or []) if not _is_retired_model(m)]
+    for mid in disc:
+        if mid in GEMINI_MODEL_PREFERENCES or mid == "gemini-1.5-flash-latest":
+            _add(mid)
     return ordered[:_MAX_MODEL_PROBES]
 
 
 def _cascade_models(primary: str | None, discovered: list[str] | None = None) -> list[str]:
-    """분석용 체인 — 동적 Flash 우선, 선호 ID fallback (최대 N개)."""
+    """분석용 — 단일 고정 모델만 (omni 등 페일오버 금지)."""
     ordered: list[str] = []
 
     def _add(mid: str | None) -> None:
@@ -666,16 +661,13 @@ def _cascade_models(primary: str | None, discovered: list[str] | None = None) ->
             ordered.append(mid)
 
     _add(primary)
-    disc = [m for m in (discovered or []) if not _is_retired_model(m)]
-    for mid in disc:
-        _add(mid)
-        if len(ordered) >= _MAX_CASCADE_MODELS:
-            return ordered[:_MAX_CASCADE_MODELS]
-    for mid in GEMINI_FAILOVER_PREFERENCES + list(GEMINI_MODEL_PREFERENCES):
+    for mid in GEMINI_MODEL_PREFERENCES:
         _add(mid)
         if len(ordered) >= _MAX_CASCADE_MODELS:
             break
-    return ordered[:_MAX_CASCADE_MODELS]
+    return ordered[:_MAX_CASCADE_MODELS] or (
+        [GEMINI_MODEL_PREFERENCES[0]] if GEMINI_MODEL_PREFERENCES else []
+    )
 
 
 def extract_response_text(response: Any) -> str | None:
@@ -829,16 +821,10 @@ def _call_with_retry(
     *,
     max_retries: int | None = None,
 ) -> Any:
-    """generate_content를 짧은 backoff(+jitter)로 재시도 (429/5xx).
-
-    temperature=0.15. 모델 전환(cascade)은 generate_gemini_report에서 수행.
-    """
-    import random
-
+    """generate_content — 실패 시 3초 대기 후 최대 2회 재시도 (동일 모델)."""
     from google.genai import types
 
     retries = _MAX_RETRIES if max_retries is None else max(0, int(max_retries))
-    # thinking 켜면 대형 리포트 프롬프트에서 수분 지연/빈 응답이 잦음 → 항상 0
     try:
         gen_config = types.GenerateContentConfig(
             temperature=0.15,
@@ -867,12 +853,9 @@ def _call_with_retry(
                 raise
             last_exc = exc
             if attempt < retries:
-                wait = min(
-                    _RETRY_MAX_WAIT,
-                    _RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0.0, 1.0),
-                )
+                wait = float(_RETRY_BASE_SECONDS)
                 msg = (
-                    f"과부하({model}) — {wait:.0f}초 후 1회 재시도 "
+                    f"일시 오류({model}) — {wait:.0f}초 후 재시도 "
                     f"({attempt + 1}/{retries})..."
                 )
                 log_gemini("WARN", msg)
@@ -883,91 +866,56 @@ def _call_with_retry(
 
 
 def generate_gemini_report(api_key: str, prompt: str) -> str:
-    """Gemini 분석 호출 — 동적 Flash 탐색 후 sticky/최신 모델로 요청.
+    """Gemini 분석 호출 — gemini-2.5-flash 단일 모델, 실패 시 3초×최대 2회 재시도.
 
-    404·과부하는 즉시 다음 후보로 전환. 구버전 sticky는 폐기한다.
+    omni 등 할당량 0 모델로의 페일오버는 하지 않는다.
     """
     global _resolved_gemini_model
     client = create_gemini_client(api_key)
     if _is_retired_model(_resolved_gemini_model):
         log_gemini("WARN", f"retired 모델 sticky 제거: {_resolved_gemini_model}")
         _resolved_gemini_model = None
-    discovered = _discover_flash_models(client, use_cache=True)
-    if not discovered:
-        discovered = _discover_flash_models(client, use_cache=False)
-    primary = _resolved_gemini_model or _pick_latest_flash(discovered) or GEMINI_MODEL_PREFERENCES[0]
-    candidates = _cascade_models(primary, discovered)
-    if not candidates:
+    model = (
+        _resolved_gemini_model
+        if _resolved_gemini_model and not _is_retired_model(_resolved_gemini_model)
+        else GEMINI_MODEL_PREFERENCES[0]
+    )
+    # sticky가 선호 목록 밖이면 고정 모델로 강제
+    if model not in GEMINI_MODEL_PREFERENCES:
+        model = GEMINI_MODEL_PREFERENCES[0]
+        _resolved_gemini_model = None
+
+    log_gemini("INFO", f"AI 분석 요청 (model={model}, retries≤{_MAX_RETRIES})")
+    if _retry_stage_callback:
+        _retry_stage_callback(f"AI 분석 중… ({model})")
+    try:
+        response = _call_with_retry(client, model, prompt, max_retries=_MAX_RETRIES)
+        out = extract_response_text(response)
+        if out:
+            _resolved_gemini_model = model
+            log_gemini("INFO", f"AI 응답 성공 (model={model})")
+            return out
+        raise RuntimeError(describe_empty_response(response))
+    except Exception as exc:
+        if _is_auth_error(exc):
+            raise
+        if "취소" in str(exc):
+            raise
+        detail = format_gemini_error(exc)
+        low = detail.lower()
+        if "quota" in low or "resource_exhausted" in low or "429" in low:
+            raise RuntimeError(
+                "Gemini API 할당량(토큰/요청 한도)을 초과했습니다.\n"
+                "프롬프트는 요약 데이터만 전송하도록 축소되어 있습니다. "
+                "잠시 후 다시 시도하거나 AI Studio 할당량을 확인해 주세요.\n"
+                f"{detail}"
+            ) from exc
         raise RuntimeError(
-            "사용 가능한 Gemini Flash 모델 후보가 없습니다. "
-            "연결 테스트를 다시 실행해 주세요."
-        )
-
-    errors: list[str] = []
-    last_exc: BaseException | None = None
-    total = len(candidates)
-    for idx, model in enumerate(candidates):
-        if _cancel_gemini:
-            raise RuntimeError("사용자에 의해 AI 요청이 취소되었습니다.")
-        if idx > 0:
-            msg = f"대체 모델 전환 ({idx + 1}/{total}): {model}"
-            log_gemini("INFO", msg)
-            if _retry_stage_callback:
-                _retry_stage_callback(msg)
-        else:
-            log_gemini("INFO", f"AI 분석 요청 (model={model})")
-            if _retry_stage_callback:
-                _retry_stage_callback(f"AI 분석 중… ({model})")
-        try:
-            response = _call_with_retry(client, model, prompt, max_retries=0)
-            out = extract_response_text(response)
-            if out:
-                _resolved_gemini_model = model
-                log_gemini("INFO", f"AI 응답 성공 (model={model})")
-                return out
-            raise RuntimeError(describe_empty_response(response))
-        except Exception as exc:
-            if _is_auth_error(exc):
-                raise
-            detail = format_gemini_error(exc)
-            errors.append(f"{model}: {detail}")
-            log_gemini("WARN", f"모델 실패 → 다음 ({idx + 1}/{total}): {detail}")
-            if _resolved_gemini_model == model:
-                _resolved_gemini_model = None
-            if "취소" in str(exc):
-                raise
-            low = detail.lower()
-            if "quota" in low and "exhaust" in low.replace(" ", ""):
-                raise RuntimeError(
-                    "Gemini API 할당량(quota)이 소진된 것 같습니다.\n"
-                    f"{detail}"
-                ) from exc
-            # 404 안내의 추천 Flash 모델을 후보에 동적 추가
-            if "no longer available" in low or "not_found" in low or "404" in low:
-                import re as _re
-
-                suggested = _re.findall(
-                    r"models/(gemini-[a-z0-9._-]*flash[a-z0-9._-]*)",
-                    detail,
-                    flags=_re.I,
-                )
-                for sug in suggested:
-                    if sug not in candidates and not _is_retired_model(sug):
-                        candidates.append(sug)
-                        total = len(candidates)
-                        log_gemini("INFO", f"API 추천 모델을 후보에 추가: {sug}")
-            if not (_is_retryable_error(exc) or _is_model_unavailable_error(exc)):
-                raise
-            last_exc = exc
-            continue
-
-    summary = "\n".join(errors[:4]) if errors else "(상세 없음)"
-    raise RuntimeError(
-        "AI 분석 요청에 실패했습니다.\n"
-        "과부하/타임아웃이면 잠시 후 다시 시도해 주세요. "
-        "대기 중에는 [중단]으로 UI를 해제할 수 있습니다.\n\n"
-        f"{summary}"
-    ) from last_exc
+            "AI 분석 요청에 실패했습니다.\n"
+            f"모델: {model} (재시도 {_MAX_RETRIES}회 포함)\n"
+            "대기 중에는 [중단]으로 UI를 해제할 수 있습니다.\n\n"
+            f"{detail}"
+        ) from exc
 
 
 def load_config() -> dict[str, Any]:
