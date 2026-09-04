@@ -62,7 +62,7 @@ def test_generate_gemini_report_failsover_to_next_model(monkeypatch=None):
         return "gemini-2.5-flash"
 
     def fake_discover(client, use_cache: bool = True):
-        return ["gemini-2.5-flash-lite"]
+        return ["gemini-2.5-flash", "gemini-1.5-flash"]
 
     # Use real _call_with_retry but skip sleep
     sleeps: list[float] = []
@@ -83,8 +83,9 @@ def test_generate_gemini_report_failsover_to_next_model(monkeypatch=None):
         text = app.generate_gemini_report("fake-key", "hello")
         assert text.startswith("ok-from-")
         assert "gemini-2.5-flash" in calls
-        # should have moved to another model
+        # should have moved to another stable model
         assert any(m != "gemini-2.5-flash" for m in calls)
+        assert all(m in app.GEMINI_MODEL_PREFERENCES for m in calls)
     finally:
         app._MAX_RETRIES = old_max
         app.create_gemini_client = orig_create
@@ -105,21 +106,22 @@ def test_cancel_aborts_retry_sleep():
     assert raised
 
 
-
-
-def test_cascade_models_prefers_lite_and_caps():
-    models = app._cascade_models("gemini-2.5-flash", ["gemini-2.5-flash", "gemini-2.5-flash-lite"])
+def test_cascade_models_stable_only_and_caps():
+    models = app._cascade_models(
+        "gemini-2.5-flash",
+        ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.5-flash-lite"],
+    )
     assert models[0] == "gemini-2.5-flash"
     assert len(models) <= app._MAX_CASCADE_MODELS
-    # backup은 lite/경량 계열
-    assert any("lite" in m or m != "gemini-2.5-flash" for m in models[1:])
+    assert len(models) <= 2
+    assert all(m in app.GEMINI_MODEL_PREFERENCES for m in models)
+    assert "gemini-3.5-flash-lite" not in models
+    assert "gemini-1.5-flash" in models
 
 
 def test_api_error_code_from_text():
     assert app._api_error_code(RuntimeError("503 UNAVAILABLE overloaded")) == 503
     assert app._api_error_code(RuntimeError("RESOURCE_EXHAUSTED rate limit")) == 429
-
-
 
 
 def test_resolve_accepts_overloaded_as_connected():
@@ -157,17 +159,36 @@ def test_probe_model_returns_overloaded_status():
     class FakeClient:
         models = FakeModels()
 
-    assert app._probe_model(FakeClient(), "gemini-2.0-flash") == "overloaded"
-
-
+    assert app._probe_model(FakeClient(), "gemini-2.5-flash") == "overloaded"
 
 
 def test_retired_models_filtered_from_cascade():
     assert app._is_retired_model("gemini-2.0-flash")
     assert app._is_retired_model("gemini-2.0-flash-lite")
-    models = app._cascade_models("gemini-2.0-flash", ["gemini-2.0-flash", "gemini-3.5-flash-lite"])
+    assert app._is_retired_model("gemini-3.5-flash-lite")
+    assert app._is_retired_model("gemini-3.6-flash")
+    assert app._is_retired_model("gemini-2.5-flash-lite")
+    assert app._is_retired_model("gemini-flash-latest")
+    assert not app._is_retired_model("gemini-2.5-flash")
+    assert not app._is_retired_model("gemini-1.5-flash")
+    models = app._cascade_models(
+        "gemini-2.0-flash",
+        ["gemini-2.0-flash", "gemini-3.5-flash-lite", "gemini-1.5-flash"],
+    )
     assert "gemini-2.0-flash" not in models
-    assert "gemini-3.5-flash-lite" in models
+    assert "gemini-3.5-flash-lite" not in models
+    assert models == ["gemini-2.5-flash", "gemini-1.5-flash"] or set(models) <= set(
+        app.GEMINI_MODEL_PREFERENCES
+    )
+
+
+def test_http_timeout_at_least_120s():
+    assert app._HTTP_TIMEOUT_MS >= 120_000
+
+
+def test_stable_model_list_only():
+    assert app.GEMINI_MODEL_PREFERENCES == ["gemini-2.5-flash", "gemini-1.5-flash"]
+    assert app._MAX_CASCADE_MODELS <= 2
 
 
 if __name__ == "__main__":
@@ -177,8 +198,8 @@ if __name__ == "__main__":
     print("PASS test_generate_gemini_report_failsover_to_next_model")
     test_cancel_aborts_retry_sleep()
     print("PASS test_cancel_aborts_retry_sleep")
-    test_cascade_models_prefers_lite_and_caps()
-    print("PASS test_cascade_models_prefers_lite_and_caps")
+    test_cascade_models_stable_only_and_caps()
+    print("PASS test_cascade_models_stable_only_and_caps")
     test_api_error_code_from_text()
     print("PASS test_api_error_code_from_text")
     test_resolve_accepts_overloaded_as_connected()
@@ -187,3 +208,7 @@ if __name__ == "__main__":
     print("PASS test_probe_model_returns_overloaded_status")
     test_retired_models_filtered_from_cascade()
     print("PASS test_retired_models_filtered_from_cascade")
+    test_http_timeout_at_least_120s()
+    print("PASS test_http_timeout_at_least_120s")
+    test_stable_model_list_only()
+    print("PASS test_stable_model_list_only")

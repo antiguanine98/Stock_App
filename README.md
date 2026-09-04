@@ -1,6 +1,12 @@
-# Stock_App v1.60
+# Stock_App v1.61
 
 생약표준품 재고 엑셀을 연도별 최종 재고량 기준으로 소급 보정하고, 품목/카테고리 추이 차트·3D 시각화·Gemini AI 분석을 제공하는 데스크톱 앱입니다.
+
+## v1.61 주요 변경
+
+- Gemini 모델을 `gemini-2.5-flash` / `gemini-1.5-flash` 안정 ID만 사용 (가상 3.x·lite·latest 제거)
+- HTTP 타임아웃 120초로 연장해 대용량 분석 ReadTimeout 완화
+- AI 프롬프트를 위험 요약·KPI·카테고리 TOP15 중심으로 경량화 (원본 전수/추이 시계열 제외)
 
 ## v1.60 주요 변경
 

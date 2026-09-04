@@ -2726,6 +2726,101 @@ def _format_full_catalog_block(title: str, rows: list[dict[str, Any]]) -> list[s
     return lines
 
 
+# AI 프롬프트에 넣는 카테고리별 핵심 행 수 (전수는 앱이 리포트에 주입)
+AI_PROMPT_TOP_N = 15
+
+
+def _format_top_catalog_block(
+    title: str,
+    rows: list[dict[str, Any]],
+    *,
+    n: int = AI_PROMPT_TOP_N,
+) -> list[str]:
+    """AI 프롬프트용 — 전체 건수만 알리고 핵심 TOP N만 표로 전달."""
+    total = len(rows)
+    top = list(rows[: max(0, n)])
+    lines = [
+        f"{title} — 전체 {total}건 중 핵심 TOP {len(top)}건",
+        "",
+    ]
+    if not top:
+        lines.append("(해당 없음)")
+        return lines
+    lines.extend(_rows_to_markdown_table(top))
+    if total > len(top):
+        lines.append(
+            f"(나머지 {total - len(top)}건 전수 표는 앱이 리포트에 자동 수록 — "
+            "모델이 목록을 지어내지 말 것)"
+        )
+    return lines
+
+
+def _build_ai_risk_summary_block(
+    flags: dict[str, Any],
+    *,
+    n: int = AI_PROMPT_TOP_N,
+) -> list[str]:
+    """위험·모니터링·통계 중심의 경량 요약 블록 (원본 추이 시계열 제외)."""
+    lines: list[str] = [
+        "[위험 품목·통계 요약 — 정제 데이터만 사용, 원본 엑셀 행/추이 시계열 금지]",
+        "",
+    ]
+    maps = flags.get("chat_analysis_maps") or {}
+    dep_sum = maps.get("depletion_summary") or {}
+    if not dep_sum:
+        cat_items = flags.get("depletion_category_items") or {}
+        dep_sum = {k: len(cat_items.get(k) or []) for k in DEPLETION_CATEGORY_ORDER}
+    lines.append("### 소진구간 건수 통계")
+    for cat_name in DEPLETION_CATEGORY_ORDER:
+        lines.append(f"- {cat_name}: {int(dep_sum.get(cat_name) or 0)}건")
+    lines.append("")
+
+    risk_items = flags.get("risk_grade_items") or {}
+    lines.append("### 위험등급별 핵심 목록")
+    for grade in ("위험", "경계", "주의"):
+        rows = list(risk_items.get(grade) or [])
+        lines.extend(_format_top_catalog_block(f"위험등급 {grade}", rows, n=n))
+        lines.append("")
+
+    category_items = flags.get("depletion_category_items") or {}
+    # 단기·중기 소진 구간 (안정·미보유 제외) — 핵심 TOP만
+    priority_cats = [
+        c
+        for c in DEPLETION_CATEGORY_ORDER
+        if c != ZERO_STOCK_CATEGORY and "초과" not in c
+    ]
+    lines.append("### 주요 소진구간 핵심 목록")
+    for cat_name in priority_cats:
+        rows = list(category_items.get(cat_name) or [])
+        lines.extend(_format_top_catalog_block(f"소진구간 {cat_name}", rows, n=n))
+        lines.append("")
+
+    zero_rows = list(category_items.get(ZERO_STOCK_CATEGORY) or [])
+    lines.extend(_format_top_catalog_block("미보유(재고0)", zero_rows, n=n))
+    lines.append("")
+
+    monitoring = list(flags.get("monitoring_targets") or [])
+    surge = [r for r in monitoring if r.get("acceleration") == "급가속"]
+    increase = [r for r in monitoring if r.get("acceleration") == "증가"]
+    lines.extend(_format_top_catalog_block("모니터링 급가속", surge, n=n))
+    lines.append("")
+    lines.extend(_format_top_catalog_block("모니터링 증가", increase, n=n))
+    lines.append("")
+
+    risk_top = list(maps.get("risk_top10") or [])
+    if risk_top:
+        lines.append("### 위험 TOP10 (사전 산출)")
+        for i, r in enumerate(risk_top[:10], 1):
+            lines.append(
+                f"{i}. {r.get('name_ko') or r.get('label') or '-'} | "
+                f"{r.get('manage_no') or '-'} | 등급:{r.get('risk_grade') or '-'} | "
+                f"잔여:{r.get('years_left') if r.get('years_left') is not None else '-'}년 | "
+                f"소진:{r.get('deplete_ym') or '-'} | 우선:{r.get('priority_score')}"
+            )
+        lines.append("")
+    return lines
+
+
 def _format_candidate_lines(rows: list[dict[str, Any]], *, full: bool = False) -> str:
     if not rows:
         return "없음"
@@ -2966,9 +3061,7 @@ def build_ai_prompt(
         flags = collect_ai_analysis_flags(items)
     as_of = date.today()
     manufacture = flags.get("manufacture_candidates") or {}
-    monitoring = flags.get("monitoring_targets") or []
     long_term_low = flags.get("long_term_low_items") or []
-    categories = flags.get("depletion_categories") or {}
     valuation = flags.get("valuation") or {}
     dashboard = flags.get("dashboard") or build_kpi_dashboard(items, flags)
 
@@ -3001,37 +3094,28 @@ def build_ai_prompt(
         "('사전산출'·'사전 산출' 문구는 사용하지 마세요.)",
         "2. '분석 전문가의 제언', '전문가 제언', '제언' 섹션은 작성하지 마세요.",
         "3. 사전 산출 목록·수치를 임의로 바꾸지 마세요.",
-        "4. 소진 예상 목록·미보유 목록·제조 검토 대상 등 목록성 데이터는 "
-        "접기/토글 없이 마크다운 표로 전수 나열하세요. 재고량은 정수만 표기하고, "
-        "소진 시점은 'YYYY년 MM월' 형식만 사용하세요 (예: 2027년 03월). "
-        "'소진예상일시', '기준' 등 부가 문구는 붙이지 마세요. "
-        "표 중간에 '(중략)', '...', '등 N건'으로 생략하지 마세요. "
+        "4. 소진·미보유·모니터링 등 전수 표는 앱이 리포트에 자동 주입합니다. "
+        "모델은 제공된 요약·TOP 목록·KPI만으로 분석 서술하세요. "
+        "엑셀 원본 행·전수 목록을 재구성·추정하지 마세요. "
         "섹션 제목은 반드시 ## 헤딩으로 분리하세요: "
         "'## 소진 예상', '## 미보유', '## 차년도 제조검토', "
         "'## 분양 가속 모니터링', '## 공정서 DB 매칭' 등.",
         "",
         "[분석 요청 항목]",
-        "1. 품목별 분양 속도(빠름/보통/느림) — 증가 구간 제외 속도 사용",
-        "2. 소진 예상 시점을 'YYYY년 MM월'로만 명시하고 "
-        "카테고리 마크다운 표로 전수 목록화:",
-        "   [1년 이내] / [2년 이내] / [3년 이내] / [4년 이내] / [5년 이내] / "
-        "[5년 초과/안정] / [재고 없음(미보유)]",
-        "   ※ 현재 재고 0인 품목은 소진 위험군에서 제외하고 '재고 없음(미보유)'에만 둡니다.",
-        "3. 데이터 신뢰도 등급 A~D (수집 횟수·관측 간격). D/부족은 '신뢰도 낮음(데이터 부족)'으로 명시",
-        "4. 분양 가속도(급가속/증가/안정/감소) 및 장기 저분양·과다재고 품목(차기 제조 수량 하향 권고)",
+        "1. 분양 속도·소진 위험·가속도 관점의 핵심 이슈 요약 (TOP 목록 근거)",
+        "2. 소진 구간별 건수 통계와 위험·경계 품목 중심 해석 "
+        "(전수 표는 앱이 수록 — 모델이 전수를 지어내지 말 것)",
+        "3. 데이터 신뢰도(A~D)가 낮은 품목이 TOP에 있으면 명시",
+        "4. 분양 가속도(급가속/증가) 모니터링 핵심과 장기 저분양 권고",
         f"   ({ACCELERATION_FORMULA_KO})",
-        "5. 차년도 제조검토대상: 제조우선순위점수 상위 표준생약·지표성분 각 10종 순위표 "
-        "(마크다운 표, 재고 0 제외, 항상 상위 10건; 해당 유형이 10건 미만이면 전량)",
-        "   ※ 제조 우선순위 섹션 서두에 아래 산출 공식·가중치를 그대로 인용해 명시할 것:",
+        "5. 차년도 제조검토: 사전 산출 상위 10종 표를 반영한 해석",
+        "   ※ 제조 우선순위 섹션 서두에 아래 산출 공식·가중치를 그대로 인용:",
         f"   {PRIORITY_FORMULA_KO}",
-        "6. 아래 사전 산출 마크다운 표·헤딩을 반드시 그대로 전수 수록하세요. "
-        "빈 표·섹션 생략 금지: "
+        "6. 섹션 헤딩을 유지하세요: "
         "'## 1페이지 요약 대시보드', '## 소진 예상', '## 미보유', "
-        "'## 차년도 제조 검토', '## 분양 가속 모니터링', '## 공정서 DB 매칭 및 수재 현황'. "
-        "대상 0건이면 '(해당 없음)'을 본문에 명시하세요.",
-        "7. 현 재고 기준 분양금액 환산액(현재재고×가격): 전체·유형별·TOP20",
-        "8. 공정서 DB가 제공된 경우 위 '## 공정서 DB 매칭 및 수재 현황' 섹션에 "
-        "미보유 표준품 전수 마크다운 표를 포함하세요.",
+        "'## 차년도 제조 검토', '## 분양 가속 모니터링', '## 공정서 DB 매칭 및 수재 현황'.",
+        "7. 현 재고 기준 분양금액 환산액(전체·유형별·TOP20) 해석",
+        "8. 공정서 DB 통계가 있으면 매칭/미보유 요약을 서술하세요.",
         "",
         f"[연구과제 대량출고로 제외할 날짜] {', '.join(bulk_dates) if bulk_dates else '해당 없음'}",
         "",
@@ -3040,6 +3124,8 @@ def build_ai_prompt(
         "[제조우선순위점수 산출식·가중치]",
         PRIORITY_FORMULA_KO,
         "",
+        f"[분석 대상 품목 수] 재고변동 관측 {len(targets)}종 (원본 추이 시계열은 프롬프트에 넣지 않음)",
+        "",
     ]
 
     chat_json = format_chat_analysis_maps_json(flags)
@@ -3047,54 +3133,37 @@ def build_ai_prompt(
         lines.append(chat_json)
         lines.append("")
 
+    # 공정서 컨텍스트는 통계·요약만 — 과도한 전문은 잘라 토큰 절약
     if compendium_context and compendium_context.strip():
-        lines.append(compendium_context.strip())
+        ctx = compendium_context.strip()
+        if len(ctx) > 6000:
+            ctx = ctx[:5950] + "\n... (공정서 컨텍스트 요약 절단)"
+        lines.append(ctx)
         lines.append("")
 
     if compendium_match_report and compendium_match_report.strip():
-        lines.append(compendium_match_report.strip())
+        rep = compendium_match_report.strip()
+        if len(rep) > 4000:
+            rep = rep[:3950] + "\n... (공정서 매칭 리포트 요약 절단)"
+        lines.append(rep)
         lines.append("")
 
-    lines.extend([
-        "[1페이지 요약 대시보드(핵심 KPI)]",
-        format_kpi_dashboard_markdown(dashboard),
-        "",
-        "[소진 기간 카테고리 — 마크다운 표 전수]",
-    ])
+    lines.extend(
+        [
+            "[1페이지 요약 대시보드(핵심 KPI)]",
+            format_kpi_dashboard_markdown(dashboard),
+            "",
+        ]
+    )
+    lines.extend(_build_ai_risk_summary_block(flags, n=AI_PROMPT_TOP_N))
 
-    category_items = flags.get("depletion_category_items") or {}
-    if category_items:
-        for cat_name in DEPLETION_CATEGORY_ORDER:
-            rows = category_items.get(cat_name) or []
-            lines.extend(_format_full_catalog_block(f"소진구간 {cat_name}", rows))
-            lines.append("")
-    else:
-        for cat_name, labels in categories.items():
-            if labels:
-                lines.append(f"- {cat_name} ({len(labels)}건): {', '.join(labels)}")
-            else:
-                lines.append(f"- {cat_name}: 없음")
-
-    cat_items = flags.get("depletion_category_items") or category_items
-    zero_rows = (cat_items.get(ZERO_STOCK_CATEGORY) or []) if cat_items else []
-    miss_rows = flags.get("missing_compendium_items") or []
-    lines.append("")
-    lines.append("[소진 예상 — 리포트에 ## 소진 예상 으로 그대로 수록]")
-    lines.append(format_depletion_markdown(cat_items))
-    lines.append("")
-    lines.append("[미보유 — 리포트에 ## 미보유 로 그대로 수록]")
-    lines.append(format_missing_markdown(zero_rows, miss_rows))
-    lines.append("")
-    lines.append("[차년도 제조 검토 — 리포트에 ## 차년도 제조 검토 로 그대로 수록]")
+    lines.append("[차년도 제조 검토 — 사전 산출 상위권]")
     lines.append(format_manufacture_review_markdown(manufacture))
     lines.append("")
-    lines.append("[분양 가속 모니터링 — 리포트에 그대로 수록]")
-    lines.append(format_accel_monitoring_markdown(monitoring))
 
-    lines.append("")
-    lines.append("[장기 저분양/과다재고 — 차기 제조 수량 하향 권고]")
+    lines.append("[장기 저분양/과다재고 — 차기 제조 수량 하향 권고 (최대 20건)]")
     if long_term_low:
-        for i, r in enumerate(long_term_low[:25], 1):
+        for i, r in enumerate(long_term_low[:20], 1):
             lines.append(
                 f"{i}. {r['label']} | 연평균:{r['annual_rate'] if r['annual_rate'] is not None else '-'} | "
                 f"환산:{_fmt_money(r.get('stock_value'))} | {r['recommendation']}"
@@ -3123,37 +3192,10 @@ def build_ai_prompt(
         lines.append("  없음 (가격 컬럼 없음)")
 
     lines.append("")
-    lines.append("[재고 변동 핵심 데이터]")
-
-    for it in targets:
-        stats = flags["by_code"].get(it.manage_no) or estimate_depletion(it)
-        if "reliability" not in stats:
-            stats = estimate_depletion(it)
-        history = ", ".join(
-            f"{format_year(p.change_date)}={p.quantity:g}" for p in it.corrected_points
-        )
-        years_left = stats.get("years_left")
-        years_txt = f"{years_left:.1f}년" if years_left is not None else "산출불가/감소없음"
-        rel = stats.get("reliability") or {}
-        rel_label = rel.get("label", "") if isinstance(rel, dict) else str(rel)
-        rel_n = rel.get("count", "?") if isinstance(rel, dict) else "?"
-        lines.append(
-            f"- {it.label} | 구분:{it.std_type} | 분양여부:{_cell_str(it.distributed)} | "
-            f"최초:{it.first_qty:g} → 최종:{it.last_qty:g} (Δ{it.qty_delta:+g}) | "
-            f"분양속도:{stats.get('speed')}(증가구간제외{stats.get('increase_segments_excluded', 0)}) | "
-            f"가속도:{stats.get('acceleration')} | 예상소진:{years_txt} "
-            f"({stats.get('deplete_ym') or '-'}) | 구간:{stats.get('depletion_category')} | "
-            f"5년이내소진:{'예' if stats.get('deplete_within_5y') else '아니오'} | "
-            f"장기저분양:{'예' if stats.get('long_term_low') else '아니오'} | "
-            f"우선순위:{stats.get('priority_score')} | "
-            f"환산:{_fmt_money(stats.get('stock_value'))} | "
-            f"신뢰도:{rel_label}(수집{rel_n}회) | 추이:[{history}]"
-        )
-
-    lines.append("")
     lines.append(
-        "위 전제·할루시네이션 금지·사전 산출·출력 형식을 반영한 한국어 마크다운 분석 리포트를 작성해 주세요. "
-        "최상단 KPI 대시보드와 사실 기반 본문만 포함하고, 분석 전문가의 제언 섹션은 넣지 마세요."
+        "위 전제·할루시네이션 금지·요약 산출·출력 형식을 반영한 한국어 마크다운 분석 리포트를 작성해 주세요. "
+        "최상단 KPI 대시보드와 사실 기반 본문만 포함하고, 분석 전문가의 제언 섹션은 넣지 마세요. "
+        "원본 엑셀 전수 행·품목별 추이 시계열은 제공되지 않았으므로 추정·재구성하지 마세요."
     )
     return "\n".join(lines)
 
