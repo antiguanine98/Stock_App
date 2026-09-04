@@ -78,7 +78,7 @@ def test_generate_gemini_report_failsover_to_next_model(monkeypatch=None):
     app._sleep_with_cancel = fake_sleep
     # Reduce retries for speed
     old_max = app._MAX_RETRIES
-    app._MAX_RETRIES = 1
+    app._MAX_RETRIES = 0
     try:
         text = app.generate_gemini_report("fake-key", "hello")
         assert text.startswith("ok-from-")
