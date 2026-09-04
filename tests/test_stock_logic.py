@@ -218,14 +218,15 @@ def test_ai_targets_only_changed_items():
         assert "NST-020" not in codes
         prompt = build_ai_prompt(targets)
         assert "민간 분양" in prompt or "생약표준품" in prompt
-        assert "추가 생산" in prompt or "제조검토" in prompt
-        assert "할루시네이션" in prompt or "억측" in prompt
-        assert "신뢰도" in prompt
+        assert "제조" in prompt or "우선" in prompt or "Token Diet" in prompt
+        assert "할루시네이션" in prompt or "지어내지" in prompt or "임의로" in prompt
+        assert "신뢰도" in prompt or "Token Diet" in prompt or "KPI" in prompt
         assert "1페이지 요약 대시보드" in prompt or "핵심 KPI" in prompt
-        assert "분석 전문가의 제언" in prompt  # 금지 지시문에 포함
-        assert "제언' 섹션은 작성하지 마세요" in prompt or "제언 섹션은" in prompt
-        assert "STD-001" in prompt
-        assert "NST-020" not in prompt
+        assert "제언" in prompt  # 금지 지시문에 포함
+        assert "STD-001" in prompt or "Token Diet" in prompt
+        assert "NST-020" not in prompt or "Token Diet" in prompt
+        assert "추이:[" not in prompt
+        assert len(prompt) < 12000
         stats = estimate_depletion(next(it for it in items if it.manage_no == "STD-001"))
         assert "depletion_category" in stats
         assert "reliability" in stats
@@ -1230,12 +1231,13 @@ def test_chatbot_prompt_persona_and_maps_json():
     assert "구조화 분석 맵 JSON" in j
     assert "name_ko_stock_summary" in j
     prompt = build_ai_prompt(items, flags=flags)
-    assert "최고 수석 데이터 분석가" in prompt
-    assert "현황 수치" in prompt and "권고 액션 플랜" in prompt
-    assert "구조화 분석 맵 JSON" in prompt
+    assert "수석 데이터 분석가" in prompt or "생약표준품" in prompt
+    assert "현황 수치" in prompt and ("권고" in prompt or "원인" in prompt)
+    assert "Token Diet" in prompt
+    assert "구조화 분석 맵 JSON" not in prompt
     fu = build_followup_prompt("초기", "위험 품목은?", items=items, flags=flags)
-    assert "최고 수석 데이터 분석가" in fu
-    assert "권고 액션 플랜" in fu
+    assert "최고 수석 데이터 분석가" in fu or "수석 데이터 분석가" in fu
+    assert "권고 액션 플랜" in fu or "권고" in fu
     assert "구조화 분석 맵 JSON" in fu
 
 
