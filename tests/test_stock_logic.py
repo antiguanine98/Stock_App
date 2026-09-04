@@ -1255,6 +1255,27 @@ def test_export_markdown_report_to_docx(tmp_path=None):
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "report.docx"
         export_markdown_report_to_docx(md, out)
+        assert out.exists() and out.stat().st_size > 500
+
+    with tempfile.TemporaryDirectory() as td2:
+        try:
+            export_markdown_report_to_docx("   ", Path(td2) / "empty.docx")
+            assert False, "expected ValueError"
+        except ValueError:
+            pass
+
+
+def test_export_docx_handles_large_table_as_plain_lines():
+    """표 파서 없이 대량 | 행도 무한루프 없이 저장."""
+    import tempfile
+    from pathlib import Path
+    from stock_logic import export_markdown_report_to_docx
+
+    rows = ["| a | b |", "| --- | --- |"] + [f"| r{i} | v{i} |" for i in range(500)]
+    md = "## 표\n\n" + "\n".join(rows)
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "big.docx"
+        export_markdown_report_to_docx(md, out)
         assert out.exists() and out.stat().st_size > 1000
 
 
@@ -1296,6 +1317,7 @@ if __name__ == "__main__":
         test_report_nav_has_no_other_tab,
         test_chatbot_prompt_persona_and_maps_json,
         test_export_markdown_report_to_docx,
+        test_export_docx_handles_large_table_as_plain_lines,
     ]
     failed = 0
     for fn in tests:

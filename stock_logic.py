@@ -4585,97 +4585,54 @@ def format_chat_analysis_maps_json(flags: dict[str, Any] | None) -> str:
 
 
 def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
-    """AI 리포트 마크다운 → Word(.docx) 변환 (표·글머리·본문)."""
+    """AI 리포트 → Word(.docx) 경량 변환 (무한루프·복잡한 표 파서 없음).
+
+    헤딩·글머리·일반 문단만 처리. 마크다운 표는 한 줄 문단으로 안전하게 기록.
+    """
     try:
         from docx import Document
-        from docx.oxml.ns import qn
-        from docx.shared import Pt, RGBColor
     except ImportError as exc:
         raise RuntimeError(
             "Word 내보내기에 python-docx가 필요합니다. pip install python-docx"
         ) from exc
 
-    def _add_inline(paragraph, text: str) -> None:
-        parts = re.split(r"(\*\*.+?\*\*)", text or "")
-        for part in parts:
-            if part.startswith("**") and part.endswith("**") and len(part) >= 4:
-                run = paragraph.add_run(part[2:-2])
-                run.bold = True
-            else:
-                paragraph.add_run(part)
+    text = (md_text or "").strip()
+    if not text:
+        raise ValueError("내보낼 리포트 본문이 비어 있습니다.")
 
     doc = Document()
-    style = doc.styles["Normal"]
-    style.font.name = "Malgun Gothic"
-    style.font.size = Pt(10)
-    try:
-        style._element.rPr.rFonts.set(qn("w:eastAsia"), "Malgun Gothic")
-    except Exception:
-        pass
+    doc.add_heading("생약표준품 재고 분석 및 소진 예측 AI 리포트", level=1)
 
-    lines = (md_text or "").splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if not stripped:
-            i += 1
-            continue
-        if stripped.startswith("### "):
-            doc.add_heading(stripped[4:].strip(), level=2)
-            i += 1
-            continue
-        if stripped.startswith("## "):
-            doc.add_heading(stripped[3:].strip(), level=1)
-            i += 1
-            continue
-        if stripped.startswith("# "):
-            doc.add_heading(stripped[2:].strip(), level=0)
-            i += 1
-            continue
-        if stripped.startswith("|") and stripped.endswith("|"):
-            rows: list[list[str]] = []
-            while i < len(lines):
-                row_line = lines[i].strip()
-                if not (row_line.startswith("|") and row_line.endswith("|")):
-                    break
-                cells = [c.strip() for c in row_line.strip("|").split("|")]
-                if all(re.fullmatch(r":?-{3,}:?", c or "") for c in cells):
-                    i += 1
-                    continue
-                rows.append(cells)
-                i += 1
-            if rows:
-                cols = max(len(r) for r in rows)
-                table = doc.add_table(rows=len(rows), cols=cols)
-                table.style = "Table Grid"
-                for r_idx, row in enumerate(rows):
-                    for c_idx in range(cols):
-                        cell = table.cell(r_idx, c_idx)
-                        cell.text = ""
-                        p = cell.paragraphs[0]
-                        _add_inline(p, row[c_idx] if c_idx < len(row) else "")
-                        if r_idx == 0:
-                            for run in p.runs:
-                                run.bold = True
-            continue
-        if stripped.startswith(("- ", "* ", "• ")):
-            p = doc.add_paragraph(style="List Bullet")
-            _add_inline(p, stripped[2:].strip())
-            i += 1
-            continue
-        m_num = re.match(r"^(\d+)[.)]\s+(.*)$", stripped)
-        if m_num:
-            p = doc.add_paragraph(style="List Number")
-            _add_inline(p, m_num.group(2))
-            i += 1
-            continue
-        p = doc.add_paragraph()
-        _add_inline(p, stripped)
-        i += 1
+    # UI 프리징 방지: 과도한 행 수 상한
+    lines = text.splitlines()
+    max_lines = 8000
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines.append("… (이하 생략 — 내보내기 안전 상한)")
 
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(path))
+    for line in lines:
+        clean = line.strip()
+        if not clean:
+            continue
+        # HTML 잔여 태그 제거(간단)
+        if clean.startswith("<") and clean.endswith(">"):
+            continue
+        if clean.startswith("### "):
+            doc.add_heading(clean[4:].strip(), level=3)
+        elif clean.startswith("## "):
+            doc.add_heading(clean[3:].strip(), level=2)
+        elif clean.startswith("# "):
+            doc.add_heading(clean[2:].strip(), level=1)
+        elif clean.startswith(("- ", "* ", "• ")):
+            doc.add_paragraph(clean[2:].strip(), style="List Bullet")
+        else:
+            # 굵게(**…**) 표시는 평문으로 (정규식 재귀 파싱 회피)
+            plain = clean.replace("**", "")
+            doc.add_paragraph(plain)
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
 
 
 def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str:
