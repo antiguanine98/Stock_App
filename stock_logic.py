@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import zipfile
 from collections import Counter, defaultdict
@@ -218,11 +219,129 @@ def to_qty_int(value: Any) -> Optional[int]:
 
 
 def is_zero_stock(item: "StockItem") -> bool:
-    """현재 재고(잔고)가 0 이하인지."""
+    """현재 재고(잔고)가 0 이하인지 (로트/관리번호 단위)."""
     qty = item.current_qty
     if qty is None:
         return False
     return float(qty) <= 0
+
+
+def build_name_ko_stock_map(items: list["StockItem"]) -> dict[str, dict[str, Any]]:
+    """한글명 기준 재고 통합 맵 — 동일 한글명 로트 합산·보유 여부."""
+    out: dict[str, dict[str, Any]] = {}
+    for it in items:
+        key = (it.name_ko or "").strip()
+        if not key:
+            key = f"__unnamed__:{it.manage_no or it.label}"
+        slot = out.setdefault(
+            key,
+            {
+                "name_ko": (it.name_ko or "").strip() or key,
+                "total_qty": 0.0,
+                "has_stock": False,
+                "lot_count": 0,
+                "manage_nos": [],
+                "labels": [],
+            },
+        )
+        qty = it.current_qty
+        q = float(qty) if qty is not None else 0.0
+        if q < 0:
+            q = 0.0
+        slot["total_qty"] += q
+        slot["lot_count"] += 1
+        if q > 0:
+            slot["has_stock"] = True
+        if it.manage_no:
+            slot["manage_nos"].append(it.manage_no)
+        slot["labels"].append(it.label)
+    for slot in out.values():
+        slot["total_qty"] = round(float(slot["total_qty"]), 6)
+    return out
+
+
+def name_ko_group_has_stock(
+    item: "StockItem",
+    name_ko_map: dict[str, dict[str, Any]] | None = None,
+    items: list["StockItem"] | None = None,
+) -> bool:
+    """동일 한글명 품목군에 재고가 하나라도 있으면 True."""
+    if name_ko_map is None:
+        name_ko_map = build_name_ko_stock_map(items or [item])
+    key = (item.name_ko or "").strip() or f"__unnamed__:{item.manage_no or item.label}"
+    slot = name_ko_map.get(key)
+    if slot is None:
+        return not is_zero_stock(item)
+    return bool(slot.get("has_stock"))
+
+
+def is_name_level_zero_stock(
+    item: "StockItem",
+    name_ko_map: dict[str, dict[str, Any]] | None = None,
+    items: list["StockItem"] | None = None,
+) -> bool:
+    """한글명 단위 미보유 — 동일 한글명 전 로트가 재고 0일 때만 True."""
+    if name_ko_map is None:
+        name_ko_map = build_name_ko_stock_map(items or [item])
+    key = (item.name_ko or "").strip() or f"__unnamed__:{item.manage_no or item.label}"
+    slot = name_ko_map.get(key)
+    if slot is None:
+        return is_zero_stock(item)
+    return not bool(slot.get("has_stock"))
+
+
+def inventory_identity_key(item: "StockItem") -> str:
+    """공정서 매칭용 동일 품목 키 — 영문명 우선, 없으면 한글명."""
+    en = _cell_str(getattr(item, "name_en", None)).strip()
+    if en:
+        nk = _norm_key(en)
+        if nk:
+            return f"en:{nk}"
+    ko = (item.name_ko or "").strip()
+    if ko:
+        nk = _norm_key(ko)
+        if nk:
+            return f"ko:{nk}"
+    return f"id:{item.manage_no or item.label or id(item)}"
+
+
+def build_name_en_inventory_groups(
+    items: list["StockItem"],
+) -> dict[str, list["StockItem"]]:
+    """영문명(없으면 한글명) 동일 품목을 1그룹으로 묶음."""
+    groups: dict[str, list[StockItem]] = defaultdict(list)
+    for it in items:
+        groups[inventory_identity_key(it)].append(it)
+    return dict(groups)
+
+
+def filter_zero_stock_rows_by_name_ko(
+    rows: list[dict[str, Any]],
+    name_ko_map: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """재고 없음 목록 — 한글명 그룹에 재고가 있으면 제외, 한글명당 1행."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        name = str(r.get("name_ko") or "").strip()
+        key = name or str(r.get("manage_no") or r.get("label") or "")
+        if not key or key in seen:
+            continue
+        slot = name_ko_map.get(name) if name else None
+        if slot is not None and slot.get("has_stock"):
+            continue
+        if name and name not in name_ko_map:
+            # 맵에 없으면 행의 stock_zero/last_qty로 판정
+            if not r.get("stock_zero") and (r.get("last_qty") or 0) not in (0, "0", None, "-"):
+                continue
+        seen.add(key)
+        row = dict(r)
+        if slot is not None:
+            row["last_qty"] = to_qty_int(slot.get("total_qty"))
+            row["lot_count"] = slot.get("lot_count")
+            row["group_manage_nos"] = list(slot.get("manage_nos") or [])
+        out.append(row)
+    return out
 
 
 def format_date(d: date) -> str:
@@ -1349,12 +1468,25 @@ def _display_risk_grade(row: dict[str, Any]) -> str:
 def group_by_depletion_category(
     items: list[StockItem],
     stats_cache: dict[str, dict[str, Any]] | None = None,
+    name_ko_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[str]]:
-    """소진 기간 카테고리별 품목 라벨 목록(리포트 요약용)."""
+    """소진 기간 카테고리별 품목 라벨 목록(리포트 요약용).
+
+    '재고 없음(미보유)'은 한글명 단위 — 동일 한글명에 재고가 있으면 제외.
+    """
+    name_map = name_ko_map or build_name_ko_stock_map(items)
     buckets: dict[str, list[str]] = {k: [] for k in DEPLETION_CATEGORY_ORDER}
+    seen_zero_names: set[str] = set()
     for it in items_for_ai_analysis(items):
         stats = get_depletion_stats(it, stats_cache)
         key = stats["depletion_category"]
+        if key == ZERO_STOCK_CATEGORY:
+            if not is_name_level_zero_stock(it, name_map):
+                continue
+            nk = (it.name_ko or "").strip() or it.label
+            if nk in seen_zero_names:
+                continue
+            seen_zero_names.add(nk)
         if key not in buckets:
             buckets[key] = []
         qty = format_qty_int(it.last_qty if it.last_qty is not None else it.current_qty)
@@ -1365,15 +1497,29 @@ def group_by_depletion_category(
 def group_by_depletion_category_items(
     items: list[StockItem],
     stats_cache: dict[str, dict[str, Any]] | None = None,
+    name_ko_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """소진 예상 구간별 전수 품목 리스트(챗봇·리포트 표용)."""
+    """소진 예상 구간별 전수 품목 리스트(챗봇·리포트 표용).
+
+    '재고 없음(미보유)'은 한글명 단위 — 동일 한글명에 재고가 하나라도 있으면 제외.
+    """
+    name_map = name_ko_map or build_name_ko_stock_map(items)
     buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in DEPLETION_CATEGORY_ORDER}
     for it in items_for_ai_analysis(items):
         stats = get_depletion_stats(it, stats_cache)
         key = stats["depletion_category"]
+        if key == ZERO_STOCK_CATEGORY:
+            if not is_name_level_zero_stock(it, name_map):
+                # 로트 재고 0이어도 동일 한글명에 잔여 재고가 있으면 미보유에서 제외
+                continue
         if key not in buckets:
             buckets[key] = []
         buckets[key].append(_catalog_item_row(it, stats))
+    # 미보유 목록은 한글명 기준 고유화
+    if buckets.get(ZERO_STOCK_CATEGORY):
+        buckets[ZERO_STOCK_CATEGORY] = filter_zero_stock_rows_by_name_ko(
+            buckets[ZERO_STOCK_CATEGORY], name_map
+        )
     return buckets
 
 
@@ -1666,7 +1812,11 @@ def build_kpi_dashboard(items: list[StockItem], flags: dict[str, Any] | None = N
         if isinstance(rel, dict) and rel.get("grade") in ("A", "B"):
             grade_ab += 1
 
-    zero_n = sum(1 for it in items if is_zero_stock(it))
+    zero_n = sum(
+        1
+        for slot in (flags.get("name_ko_stock_map") or build_name_ko_stock_map(items)).values()
+        if not slot.get("has_stock")
+    )
     deplete_5y_total = deplete_1y + deplete_1_3y + deplete_3_5y
 
     mfg = flags.get("manufacture_candidates")
@@ -2287,20 +2437,27 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
     surge_codes: list[str] = []
     by_code: dict[str, dict[str, Any]] = {}
     stats_cache: dict[str, dict[str, Any]] = {}
+    name_ko_map = build_name_ko_stock_map(items)
     manufacture = select_manufacture_candidates(items, stats_cache=stats_cache)
     monitoring = select_monitoring_targets(items, stats_cache=stats_cache)
     long_term_low = select_long_term_low_items(items, stats_cache=stats_cache)
-    categories = group_by_depletion_category(items, stats_cache=stats_cache)
-    category_items = group_by_depletion_category_items(items, stats_cache=stats_cache)
+    categories = group_by_depletion_category(
+        items, stats_cache=stats_cache, name_ko_map=name_ko_map
+    )
+    category_items = group_by_depletion_category_items(
+        items, stats_cache=stats_cache, name_ko_map=name_ko_map
+    )
     risk_grade_items = group_by_risk_grade(items, stats_cache=stats_cache)
     valuation = compute_inventory_valuation(items)
 
     for it in items_for_ai_analysis(items):
         stats = get_depletion_stats(it, stats_cache)
         stock_zero = bool(stats.get("stock_zero")) or is_zero_stock(it)
+        name_zero = is_name_level_zero_stock(it, name_ko_map)
         flag = {
             "label": it.label,
             "name_ko": it.name_ko,
+            "name_en": _cell_str(getattr(it, "name_en", None)),
             "manage_no": it.manage_no,
             "speed": stats["speed"],
             "years_left": stats["years_left"],
@@ -2308,9 +2465,23 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
             "deplete_within_5y": bool(stats["deplete_within_5y"]) and not stock_zero,
             "recent_surge": bool(stats["recent_surge"]) and not stock_zero,
             "deplete_ym": stats["deplete_ym"],
-            "depletion_category": stats["depletion_category"],
+            "depletion_category": (
+                ZERO_STOCK_CATEGORY
+                if name_zero
+                else (
+                    "5년 초과/안정"
+                    if stock_zero and not name_zero
+                    else stats["depletion_category"]
+                )
+            ),
             "risk_grade": (
-                "재고없음" if stock_zero else risk_grade_from_years(stats.get("years_left"))
+                "재고없음"
+                if name_zero
+                else (
+                    risk_grade_from_years(stats.get("years_left"))
+                    if not stock_zero
+                    else "안정"
+                )
             ),
             "reliability": stats["reliability"],
             "priority_score": stats["priority_score"],
@@ -2323,6 +2494,8 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
             "unit_price": stats.get("unit_price"),
             "last_qty": to_qty_int(it.last_qty if it.last_qty is not None else it.current_qty),
             "stock_zero": stock_zero,
+            "name_level_zero": name_zero,
+            "name_group_has_stock": name_ko_group_has_stock(it, name_ko_map),
             "increase_segments_excluded": stats.get("increase_segments_excluded", 0),
         }
         if it.manage_no:
@@ -2349,11 +2522,105 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
         "depletion_category_items": category_items,
         "risk_grade_items": risk_grade_items,
         "valuation": valuation,
+        "name_ko_stock_map": name_ko_map,
         "_depletion_stats_cache": stats_cache,
     }
     flags["dashboard"] = build_kpi_dashboard(items, flags)
     flags.pop("_depletion_stats_cache", None)
+    flags["chat_analysis_maps"] = build_chat_analysis_maps(items, flags)
     return flags
+
+
+def build_chat_analysis_maps(
+    items: list[StockItem],
+    flags: dict[str, Any] | None = None,
+    match_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """챗봇용 구조화 JSON — 한글명 재고맵·영문명 공정서맵·위험 TOP10·소진 요약."""
+    flags = flags or {}
+    name_map = flags.get("name_ko_stock_map") or build_name_ko_stock_map(items)
+    name_ko_stock = [
+        {
+            "name_ko": s["name_ko"],
+            "total_qty": to_qty_int(s["total_qty"]),
+            "has_stock": bool(s["has_stock"]),
+            "lot_count": int(s["lot_count"]),
+            "manage_nos": list(s.get("manage_nos") or [])[:12],
+        }
+        for s in sorted(name_map.values(), key=lambda x: x["name_ko"])
+    ]
+    en_groups = build_name_en_inventory_groups(items)
+    name_en_groups = []
+    for key, group in en_groups.items():
+        rep = next((g for g in group if not is_zero_stock(g)), group[0])
+        name_en_groups.append(
+            {
+                "identity_key": key,
+                "name_en": _cell_str(getattr(rep, "name_en", None)),
+                "name_ko": rep.name_ko,
+                "lot_count": len(group),
+                "manage_nos": [g.manage_no for g in group if g.manage_no][:12],
+                "total_qty": to_qty_int(
+                    sum(float(g.current_qty or 0) for g in group)
+                ),
+                "has_stock": any(not is_zero_stock(g) for g in group),
+            }
+        )
+
+    risk_rows: list[dict[str, Any]] = []
+    for grade in ("위험", "경계", "주의"):
+        for r in (flags.get("risk_grade_items") or {}).get(grade) or []:
+            risk_rows.append({**r, "risk_grade": grade})
+    risk_rows.sort(
+        key=lambda r: (
+            float(r["years_left"]) if isinstance(r.get("years_left"), (int, float)) else 999.0,
+            -float(r.get("priority_score") or 0),
+        )
+    )
+    risk_top10 = [
+        {
+            "name_ko": r.get("name_ko"),
+            "manage_no": r.get("manage_no"),
+            "risk_grade": r.get("risk_grade"),
+            "years_left": r.get("years_left"),
+            "deplete_ym": r.get("deplete_ym"),
+            "priority_score": r.get("priority_score"),
+            "last_qty": r.get("last_qty"),
+        }
+        for r in risk_rows[:10]
+    ]
+
+    cat = flags.get("depletion_category_items") or {}
+    depletion_summary = {
+        k: len(cat.get(k) or [])
+        for k in DEPLETION_CATEGORY_ORDER
+    }
+    match = match_result or flags.get("compendium_match") or {}
+    match_stats = match.get("stats") or {}
+    en_match_raw = (
+        match.get("name_en_match_map")
+        or flags.get("name_en_match_map")
+        or {}
+    )
+    name_en_match_map = [
+        {"identity_key": k, **(v if isinstance(v, dict) else {"value": v})}
+        for k, v in (en_match_raw.items() if isinstance(en_match_raw, dict) else [])
+    ]
+    return {
+        "name_ko_stock_map": name_ko_stock,
+        "name_en_inventory_groups": name_en_groups,
+        "name_en_match_map": name_en_match_map,
+        "risk_top10": risk_top10,
+        "depletion_summary": depletion_summary,
+        "compendium_match_stats": {
+            "inventory_matched_groups": match_stats.get("inventory_matched"),
+            "missing_count": match_stats.get("missing_count"),
+            "compendium_total": match_stats.get("compendium_total"),
+            "unique_en_groups": match_stats.get("unique_inventory_groups"),
+            "inventory_matched_lots": match_stats.get("inventory_matched_lots"),
+        },
+        "as_of": date.today().isoformat(),
+    }
 
 
 def extract_mentioned_codes_from_report(report: str, known_codes: list[str]) -> list[str]:
@@ -2654,8 +2921,11 @@ def attach_compendium_match_to_flags(
     if not match_result:
         out.setdefault("compendium_stats", {})
         out.setdefault("missing_compendium_items", [])
+        out.setdefault("name_en_match_map", {})
         return out
+    out["compendium_match"] = match_result
     out["compendium_stats"] = match_result.get("stats") or {}
+    out["name_en_match_map"] = match_result.get("name_en_match_map") or {}
     items = match_result.get("missing_items")
     if items is None and match_result.get("missing"):
         items = [
@@ -2663,6 +2933,23 @@ def attach_compendium_match_to_flags(
             for i, e in enumerate(match_result["missing"], 1)
         ]
     out["missing_compendium_items"] = list(items or [])
+    # 챗봇용 구조화 맵에 영문명 공정서 매칭 반영
+    maps = out.get("chat_analysis_maps")
+    if isinstance(maps, dict):
+        refreshed = dict(maps)
+        refreshed["name_en_match_map"] = [
+            {"identity_key": k, **(v if isinstance(v, dict) else {"value": v})}
+            for k, v in (out["name_en_match_map"] or {}).items()
+        ]
+        st = out["compendium_stats"] or {}
+        refreshed["compendium_match_stats"] = {
+            "inventory_matched_groups": st.get("inventory_matched"),
+            "missing_count": st.get("missing_count"),
+            "compendium_total": st.get("compendium_total"),
+            "unique_en_groups": st.get("unique_inventory_groups"),
+            "inventory_matched_lots": st.get("inventory_matched_lots"),
+        }
+        out["chat_analysis_maps"] = refreshed
     return out
 
 
@@ -2686,9 +2973,15 @@ def build_ai_prompt(
     dashboard = flags.get("dashboard") or build_kpi_dashboard(items, flags)
 
     lines = [
-        "당신은 생약표준품 재고·분양 분석 전문가입니다.",
+        "너는 대한민국 약전(KP) 및 생약규격집(KHP) 생약표준품 관리 분야의 "
+        "최고 수석 데이터 분석가이다.",
         "아래는 연도별 최종 재고량 기준으로 소급 보정이 완료된 데이터와 사전 정량 산출 결과입니다.",
         f"기준일(오늘): {as_of.isoformat()} ({as_of.year}년)",
+        "",
+        "[답변·서술 논리 구조 — 필수]",
+        "각 분석 섹션과 종합 의견은 가능한 한 "
+        "① 현황 수치 → ② 원인 분석 → ③ 권고 액션 플랜 순서로 서술하세요. "
+        "단순 단답·나열만으로 끝내지 마세요.",
         "",
         "[기본 전제]",
         "1. 생약표준품은 민간 분양에 따라 지속적으로 감소하는 것이 정상이므로, 일반적인 감소 추이는 정상으로 간주합니다.",
@@ -2748,6 +3041,11 @@ def build_ai_prompt(
         PRIORITY_FORMULA_KO,
         "",
     ]
+
+    chat_json = format_chat_analysis_maps_json(flags)
+    if chat_json:
+        lines.append(chat_json)
+        lines.append("")
 
     if compendium_context and compendium_context.strip():
         lines.append(compendium_context.strip())
@@ -3420,13 +3718,19 @@ def build_followup_prompt(
     """초기 리포트 이후 추가 질문용 — 사전 산출 스냅샷과 실시간 조회를 주입."""
     full_intent = detect_full_list_intent(user_question or "")
     lines = [
-        "당신은 생약표준품 재고·분양 분석 전문가입니다.",
+        "너는 대한민국 약전(KP) 및 생약규격집(KHP) 생약표준품 관리 분야의 "
+        "최고 수석 데이터 분석가이다.",
         "사용자의 후속 질문에는 초기 리포트 문구만 반복하지 말고, "
-        "아래 [재고 조사 스냅샷]과 [실시간 재고 데이터 재검토 결과]·공정서 DB를 우선 근거로 답하세요.",
+        "아래 [구조화 분석 맵 JSON]·[재고 조사 스냅샷]·[실시간 재고 데이터 재검토 결과]·공정서 DB를 "
+        "우선 근거로 다각도 교차 분석하세요.",
+        "",
+        "[답변 논리 구조 — 필수]",
+        "단순 단답을 지양하고, 질문 의도에 맞춰 "
+        "① 현황 수치 → ② 원인 분석 → ③ 권고 액션 플랜 3단계로 심도 있게 답하세요.",
         "",
         "[용어] '스냅샷(Snapshot)'은 특정 시점의 재고 조사 데이터(코드로 산출된 정량 결과)를 의미합니다. "
         "답변에서 스냅샷이라고 말할 때 이 뜻을 명확히 하세요.",
-        "[할루시네이션 금지] 제공된 스냅샷·실시간 수치·공정서 DB에 없는 내용을 단정하지 마세요. "
+        "[할루시네이션 금지] 제공된 JSON·스냅샷·실시간 수치·공정서 DB에 없는 내용을 단정하지 마세요. "
         "불확실하면 '확실하지 않음' 또는 '추측입니다'라고 밝히세요.",
         "[형식] '분석 전문가의 제언' 섹션은 작성하지 마세요.",
         "[공정서 DB] 규격/기준 참조에만 사용하고, 재고·분양 수치 산출에는 쓰지 마세요.",
@@ -3447,6 +3751,11 @@ def build_followup_prompt(
         f"- 이번 질문 전수 요청 감지: {full_intent}",
         "",
     ]
+
+    chat_json = format_chat_analysis_maps_json(flags)
+    if chat_json:
+        lines.append(chat_json)
+        lines.append("")
 
     if flags:
         lines.append(serialize_flags_snapshot(flags))
@@ -3493,9 +3802,11 @@ def build_followup_prompt(
         )
     else:
         lines.append(
-            "질문에 대해 한국어 마크다운으로 답하되, 필요한 경우 스냅샷·실시간 수치(연도·수량·소진시점·"
+            "질문에 대해 한국어 마크다운으로, "
+            "① 현황 수치 → ② 원인 분석 → ③ 권고 액션 플랜 구조로 답하세요. "
+            "필요한 경우 스냅샷·JSON·실시간 수치(연도·수량·소진시점·"
             "가속도·환산액·신뢰도 등급·우선순위점수 등)를 명시해 주세요. "
-            "스냅샷에 있는 수치 외 추론·재계산은 하지 마세요."
+            "스냅샷/JSON에 있는 수치 외 추론·재계산은 하지 마세요."
         )
     return "\n".join(lines)
 
@@ -3697,16 +4008,17 @@ def split_markdown_report_sections(
             }
         )
 
+    # [기타] 탭 제거 — 잔여 본문은 요약 탭에 병합
     if other:
         body = _strip_auto_summary_opinion_blocks("\n\n".join(other).strip())
-        sections.append(
-            {
-                "id": "other",
-                "title": "기타",
-                "short": "기타",
-                "markdown": body if body.lstrip().startswith("#") else f"## 기타\n\n{body}",
-            }
-        )
+        if body:
+            for sec in sections:
+                if sec.get("id") == "summary":
+                    base = str(sec.get("markdown") or "").rstrip()
+                    sec["markdown"] = (base + "\n\n" + body).strip() if base else (
+                        body if body.lstrip().startswith("#") else f"## 요약\n\n{body}"
+                    )
+                    break
     return sections
 
 
@@ -3996,15 +4308,18 @@ def match_compendium_inventory(
 ) -> dict[str, Any]:
     """공정서 entries ↔ 재고 품목 매칭.
 
-    동일성 기준: 한글 생약명 + 기원(한글/영문). 단순 영문명 단독 매칭은 사용하지 않음.
+    재고 측은 영문명(없으면 한글명)이 같으면 1건으로 그룹화한 뒤 매칭한다.
+    매칭 키: 한글명 exact/fuzzy, 영문명 fuzzy, 한글명↔기원 교차.
     """
     corrections: list[dict[str, Any]] = []
     by_manage_no: dict[str, str] = {}
     by_label: dict[str, str] = {}
     matched_entry_ids: set[int] = set()
+    name_en_match_map: dict[str, dict[str, Any]] = {}
 
     by_exact_ko: dict[str, list[CompendiumEntry]] = defaultdict(list)
     by_norm_ko: dict[str, list[CompendiumEntry]] = defaultdict(list)
+    by_norm_en: dict[str, list[CompendiumEntry]] = defaultdict(list)
     by_norm_origin_ko: dict[str, list[CompendiumEntry]] = defaultdict(list)
     by_norm_origin_en: dict[str, list[CompendiumEntry]] = defaultdict(list)
 
@@ -4014,6 +4329,10 @@ def match_compendium_inventory(
             nk = _norm_key(e.name_ko)
             if nk:
                 by_norm_ko[nk].append(e)
+        if e.name_en:
+            ne = _norm_key(e.name_en)
+            if ne:
+                by_norm_en[ne].append(e)
         if e.origin_ko:
             no = _norm_key(e.origin_ko)
             if no:
@@ -4032,7 +4351,6 @@ def match_compendium_inventory(
     def _pick_by_origin(
         cands: list[CompendiumEntry], stock_ko: str
     ) -> Optional[CompendiumEntry]:
-        """동명 후보 중 기원 필드와 한글명이 교차 확인되는 항목 우선."""
         nk = _norm_key(stock_ko)
         scored: list[tuple[int, CompendiumEntry]] = []
         for c in cands:
@@ -4054,9 +4372,13 @@ def match_compendium_inventory(
             return scored[0][1]
         return _pick_first(cands)
 
-    for it in items:
-        stock_ko = (it.name_ko or "").strip()
-        stock_en = _cell_str(it.name_en).strip() if not _is_empty(it.name_en) else ""
+    groups = build_name_en_inventory_groups(items)
+    unique_inventory_groups = len(groups)
+
+    for group_key, group_items in groups.items():
+        rep = next((g for g in group_items if not is_zero_stock(g)), group_items[0])
+        stock_ko = (rep.name_ko or "").strip()
+        stock_en = _cell_str(getattr(rep, "name_en", None)).strip()
         hit: Optional[CompendiumEntry] = None
         match_type = ""
 
@@ -4070,8 +4392,12 @@ def match_compendium_inventory(
                 cands = by_norm_ko[nk]
                 hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
                 match_type = "fuzzy_ko"
+        if hit is None and stock_en:
+            ne = _norm_key(stock_en)
+            if ne and ne in by_norm_en:
+                hit = _pick_first(by_norm_en[ne])
+                match_type = "fuzzy_en"
         if hit is None and stock_ko:
-            # 한글명 ↔ 기원(한글/영문) 교차 매칭 (영문명 단독 매칭 금지)
             nk = _norm_key(stock_ko)
             if nk and nk in by_norm_origin_ko:
                 hit = _pick_first(by_norm_origin_ko[nk])
@@ -4112,24 +4438,37 @@ def match_compendium_inventory(
             short = hit.pharmacopoeia.strip()
             if "생약규격집" in short or "약전외" in short or "KHP" in short.upper():
                 short = "KHP(생약규격집)"
-        if it.manage_no and short:
-            by_manage_no[it.manage_no] = short
-        if tag:
-            by_label[it.label] = tag
 
-        corrections.append(
-            {
-                "stock_label": it.label,
-                "stock_name_ko": stock_ko,
-                "stock_name_en": stock_en,
-                "matched_name_ko": hit.name_ko,
-                "matched_name_en": hit.name_en,
-                "matched_origin_ko": hit.origin_ko,
-                "matched_origin_en": hit.origin_en,
-                "pharmacopoeia": hit.pharmacopoeia,
-                "match_type": match_type,
-            }
-        )
+        name_en_match_map[group_key] = {
+            "name_en": stock_en,
+            "name_ko": stock_ko,
+            "matched_name_ko": hit.name_ko,
+            "matched_name_en": hit.name_en,
+            "match_type": match_type,
+            "pharmacopoeia": hit.pharmacopoeia,
+            "lot_count": len(group_items),
+        }
+
+        for it in group_items:
+            if it.manage_no and short:
+                by_manage_no[it.manage_no] = short
+            if tag:
+                by_label[it.label] = tag
+            corrections.append(
+                {
+                    "stock_label": it.label,
+                    "stock_name_ko": (it.name_ko or "").strip() or stock_ko,
+                    "stock_name_en": _cell_str(getattr(it, "name_en", None)).strip() or stock_en,
+                    "matched_name_ko": hit.name_ko,
+                    "matched_name_en": hit.name_en,
+                    "matched_origin_ko": hit.origin_ko,
+                    "matched_origin_en": hit.origin_en,
+                    "pharmacopoeia": hit.pharmacopoeia,
+                    "match_type": match_type,
+                    "identity_key": group_key,
+                    "group_lot_count": len(group_items),
+                }
+            )
 
     missing: list[CompendiumEntry] = [
         e for e in entries if id(e) not in matched_entry_ids
@@ -4138,12 +4477,18 @@ def match_compendium_inventory(
         _missing_compendium_row(e, i) for i, e in enumerate(missing, 1)
     ]
     auto_corrected = sum(
-        1 for c in corrections if c.get("match_type") and c.get("match_type") != "exact_ko"
+        1
+        for c in name_en_match_map.values()
+        if c.get("match_type") and c.get("match_type") != "exact_ko"
     )
-    exact_matched = sum(1 for c in corrections if c.get("match_type") == "exact_ko")
+    exact_matched = sum(
+        1 for c in name_en_match_map.values() if c.get("match_type") == "exact_ko"
+    )
     stats = {
         "compendium_total": len(entries),
-        "inventory_matched": len(corrections),
+        "inventory_matched": len(name_en_match_map),
+        "inventory_matched_lots": len(corrections),
+        "unique_inventory_groups": unique_inventory_groups,
         "entries_matched": len(matched_entry_ids),
         "exact_matched": exact_matched,
         "auto_corrected": auto_corrected,
@@ -4158,7 +4503,147 @@ def match_compendium_inventory(
         "by_manage_no": by_manage_no,
         "by_label": by_label,
         "correction_count": len(corrections),
+        "name_en_match_map": name_en_match_map,
     }
+
+
+
+
+
+def format_chat_analysis_maps_json(flags: dict[str, Any] | None) -> str:
+    """챗봇/리포트용 사전 계산 구조화 JSON (한글명 재고·영문명 매칭·위험 TOP10)."""
+    if not flags:
+        return ""
+    maps = flags.get("chat_analysis_maps")
+    if not isinstance(maps, dict) or not maps:
+        return ""
+    # 프롬프트 폭주 방지: 한글명 맵은 보유/미보유 요약 + 상위 일부만
+    payload: dict[str, Any] = {
+        "as_of": maps.get("as_of"),
+        "depletion_summary": maps.get("depletion_summary") or {},
+        "compendium_match_stats": maps.get("compendium_match_stats") or {},
+        "risk_top10": maps.get("risk_top10") or [],
+    }
+    ko_map = list(maps.get("name_ko_stock_map") or [])
+    payload["name_ko_stock_summary"] = {
+        "total_names": len(ko_map),
+        "with_stock": sum(1 for s in ko_map if s.get("has_stock")),
+        "without_stock": sum(1 for s in ko_map if not s.get("has_stock")),
+        "sample_with_stock": [s for s in ko_map if s.get("has_stock")][:40],
+        "sample_without_stock": [s for s in ko_map if not s.get("has_stock")][:40],
+    }
+    en_match = list(maps.get("name_en_match_map") or [])
+    payload["name_en_match_map_sample"] = en_match[:80]
+    en_groups = list(maps.get("name_en_inventory_groups") or [])
+    payload["name_en_group_summary"] = {
+        "unique_groups": len(en_groups),
+        "sample": en_groups[:40],
+    }
+    try:
+        body = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    except (TypeError, ValueError):
+        body = str(payload)
+    if len(body) > 12000:
+        body = body[:11950] + "\n... (JSON truncated)"
+    return (
+        "[구조화 분석 맵 JSON — 한글명 통합 재고 / 영문명 공정서 매칭 / 위험 TOP10 / 소진 요약]\n"
+        "아래 JSON만 교차 분석 근거로 사용하세요. 원본 장문 텍스트를 추정하지 마세요.\n"
+        f"```json\n{body}\n```"
+    )
+
+
+def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
+    """AI 리포트 마크다운 → Word(.docx) 변환 (표·글머리·본문)."""
+    try:
+        from docx import Document
+        from docx.oxml.ns import qn
+        from docx.shared import Pt, RGBColor
+    except ImportError as exc:
+        raise RuntimeError(
+            "Word 내보내기에 python-docx가 필요합니다. pip install python-docx"
+        ) from exc
+
+    def _add_inline(paragraph, text: str) -> None:
+        parts = re.split(r"(\*\*.+?\*\*)", text or "")
+        for part in parts:
+            if part.startswith("**") and part.endswith("**") and len(part) >= 4:
+                run = paragraph.add_run(part[2:-2])
+                run.bold = True
+            else:
+                paragraph.add_run(part)
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Malgun Gothic"
+    style.font.size = Pt(10)
+    try:
+        style._element.rPr.rFonts.set(qn("w:eastAsia"), "Malgun Gothic")
+    except Exception:
+        pass
+
+    lines = (md_text or "").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped:
+            i += 1
+            continue
+        if stripped.startswith("### "):
+            doc.add_heading(stripped[4:].strip(), level=2)
+            i += 1
+            continue
+        if stripped.startswith("## "):
+            doc.add_heading(stripped[3:].strip(), level=1)
+            i += 1
+            continue
+        if stripped.startswith("# "):
+            doc.add_heading(stripped[2:].strip(), level=0)
+            i += 1
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            rows: list[list[str]] = []
+            while i < len(lines):
+                row_line = lines[i].strip()
+                if not (row_line.startswith("|") and row_line.endswith("|")):
+                    break
+                cells = [c.strip() for c in row_line.strip("|").split("|")]
+                if all(re.fullmatch(r":?-{3,}:?", c or "") for c in cells):
+                    i += 1
+                    continue
+                rows.append(cells)
+                i += 1
+            if rows:
+                cols = max(len(r) for r in rows)
+                table = doc.add_table(rows=len(rows), cols=cols)
+                table.style = "Table Grid"
+                for r_idx, row in enumerate(rows):
+                    for c_idx in range(cols):
+                        cell = table.cell(r_idx, c_idx)
+                        cell.text = ""
+                        p = cell.paragraphs[0]
+                        _add_inline(p, row[c_idx] if c_idx < len(row) else "")
+                        if r_idx == 0:
+                            for run in p.runs:
+                                run.bold = True
+            continue
+        if stripped.startswith(("- ", "* ", "• ")):
+            p = doc.add_paragraph(style="List Bullet")
+            _add_inline(p, stripped[2:].strip())
+            i += 1
+            continue
+        m_num = re.match(r"^(\d+)[.)]\s+(.*)$", stripped)
+        if m_num:
+            p = doc.add_paragraph(style="List Number")
+            _add_inline(p, m_num.group(2))
+            i += 1
+            continue
+        p = doc.add_paragraph()
+        _add_inline(p, stripped)
+        i += 1
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(path))
 
 
 def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str:
@@ -4196,11 +4681,14 @@ def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str
     examples = _unique_missing_compendium_examples(missing_items, limit=8)
     ex_txt = ", ".join(examples) if examples else "(해당 없음)"
 
+    groups_n = int(stats.get("unique_inventory_groups") or held)
+    lots_n = int(stats.get("inventory_matched_lots") or held)
     lines = [
         "## 공정서 DB 매칭 및 수재 현황",
         "",
         f"- 총 공정서 수재 품목 수: **{total}건**",
-        f"- 재고 엑셀 보유 매칭 품목 수: **{held}건**",
+        f"- 재고 엑셀 보유 매칭 품목 수(영문명 기준 품목군): **{held}건** "
+        f"(고유 품목군 {groups_n}건 / 매칭 로트 {lots_n}건)",
         f"- 기원(한글/영문) 기반 자동 보정 매칭 품목 수: **{auto_n}건**",
         f"- 공정서 수재 품목 중 미보유(부재) 품목 총 건수: **{miss_n}건**",
         f"- 미보유 대표 예시: {ex_txt}",

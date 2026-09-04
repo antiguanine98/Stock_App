@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.54
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.55
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ from urllib.parse import unquote
 import matplotlib
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
+from matplotlib.ticker import MaxNLocator
+from PyQt6.QtCore import QEvent, QMarginsF, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -23,8 +24,11 @@ from PyQt6.QtGui import (
     QDropEvent,
     QFont,
     QKeySequence,
+    QPageLayout,
+    QPageSize,
     QPainter,
     QPainterPath,
+    QPdfWriter,
     QPen,
     QPixmap,
     QShortcut,
@@ -68,6 +72,7 @@ from stock_logic import (
     build_scatter3d_records,
     collect_ai_analysis_flags,
     ensure_mandatory_report_sections,
+    export_markdown_report_to_docx,
     extract_mentioned_codes_from_report,
     format_compendium_context,
     format_compendium_match_report,
@@ -111,7 +116,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.54"
+APP_VERSION = "v1.55"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
@@ -574,12 +579,26 @@ _retry_stage_callback: Callable[[str], None] | None = None
 
 
 def _call_with_retry(client, model: str, prompt: str) -> Any:
-    """generate_content를 exponential backoff로 재시도 (429/503/504)."""
+    """generate_content를 exponential backoff로 재시도 (429/503/504).
+
+    temperature=0.15 로 팩트 중심·환각 억제.
+    """
     import time
+
+    from google.genai import types
+
+    try:
+        gen_config = types.GenerateContentConfig(temperature=0.15)
+    except Exception:
+        gen_config = None
 
     last_exc: BaseException | None = None
     for attempt in range(_MAX_RETRIES + 1):
         try:
+            if gen_config is not None:
+                return client.models.generate_content(
+                    model=model, contents=prompt, config=gen_config
+                )
             return client.models.generate_content(model=model, contents=prompt)
         except Exception as exc:
             if _is_auth_error(exc):
@@ -954,6 +973,7 @@ class InventoryChart(FigureCanvas):
         ax.set_xticklabels([str(y) for y in years], rotation=0, ha="center", fontsize=9)
         ax.set_xlabel("연도 (YYYY)")
         ax.set_ylabel("재고량")
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         tag = (pharmacopoeia_tag or subtitle or "").strip()
         title = f"재고 추이 — {label}"
         if tag:
@@ -1030,6 +1050,7 @@ class InventoryChart(FigureCanvas):
             ax.set_xticklabels([str(y) for y in ticks], fontsize=8)
         ax.set_xlabel("연도 (YYYY)")
         ax.set_ylabel("재고량")
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         ax.set_title(f"카테고리 비교 — {category}", fontsize=12, fontweight="bold", color="#0b1f3a")
         ax.legend(loc="best", fontsize=8, frameon=False)
         ax.grid(True, axis="y", alpha=0.28, linestyle="--")
@@ -1523,9 +1544,24 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left_pane)
         left_layout.setContentsMargins(0, 0, 4, 0)
         left_layout.setSpacing(6)
+        title_row = QWidget()
+        title_row_layout = QHBoxLayout(title_row)
+        title_row_layout.setContentsMargins(0, 0, 0, 0)
+        title_row_layout.setSpacing(8)
         left_title = QLabel("표준 분석 리포트")
         left_title.setObjectName("sectionLabel")
-        left_layout.addWidget(left_title)
+        title_row_layout.addWidget(left_title, stretch=1)
+        self.btn_dl_word = QPushButton("📄 Word 다운로드")
+        self.btn_dl_word.setToolTip("AI 리포트를 Word(.docx)로 저장")
+        self.btn_dl_word.clicked.connect(self._download_report_word)
+        self.btn_dl_word.setEnabled(False)
+        title_row_layout.addWidget(self.btn_dl_word)
+        self.btn_dl_pdf = QPushButton("📑 PDF 다운로드")
+        self.btn_dl_pdf.setToolTip("현재 리포트 서식을 PDF로 저장")
+        self.btn_dl_pdf.clicked.connect(self._download_report_pdf)
+        self.btn_dl_pdf.setEnabled(False)
+        title_row_layout.addWidget(self.btn_dl_pdf)
+        left_layout.addWidget(title_row)
 
         # Ctrl+F 찾기 바 (기본 숨김)
         self.report_find_bar = QWidget()
@@ -2008,6 +2044,9 @@ class MainWindow(QMainWindow):
         self.inventory_data = None
         self._chat_history.clear()
         self._initial_report = ""
+        if hasattr(self, "btn_dl_word"):
+            self.btn_dl_word.setEnabled(False)
+            self.btn_dl_pdf.setEnabled(False)
         self._report_sections = []
         self._report_section_key = "all"
         self._report_expanded_ids.clear()
@@ -2114,6 +2153,9 @@ class MainWindow(QMainWindow):
         self._refresh_compendium_match()
         self._chat_history.clear()
         self._initial_report = ""
+        if hasattr(self, "btn_dl_word"):
+            self.btn_dl_word.setEnabled(False)
+            self.btn_dl_pdf.setEnabled(False)
         self._report_sections = []
         self._report_section_key = "all"
         self._report_expanded_ids.clear()
@@ -2329,6 +2371,20 @@ class MainWindow(QMainWindow):
         self.item_combo.setCurrentIndex(idx)
         return True
 
+    def _focus_table_row(self, row: int) -> None:
+        """분양현황 테이블에서 행 선택·스크롤·포커스."""
+        if row < 0 or row >= self.table.rowCount():
+            return
+        self.table.clearSelection()
+        self.table.selectRow(row)
+        self.table.setCurrentCell(row, 0)
+        item = self.table.item(row, 0)
+        if item is not None:
+            self.table.scrollToItem(
+                item, self.table.ScrollHint.PositionAtCenter
+            )
+        self.table.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def _on_table_double_clicked(self, row: int, _column: int) -> None:
         if not self.inventory_data:
             return
@@ -2348,35 +2404,47 @@ class MainWindow(QMainWindow):
             self._select_item_by_label(str(label))
 
     def _on_3d_point_picked(self, code: str, name: str) -> None:
+        """3D 산점도 점 클릭 → 분양현황 탭으로 전환 후 해당 행 스크롤·선택."""
         if not self.inventory_data:
             return
         items = list(self.inventory_data.get("items") or [])
         target = None
+        target_row = -1
         code = (code or "").strip()
         name = (name or "").strip()
         if code:
-            for it in items:
+            for idx, it in enumerate(items):
                 mgmt = str(it.get("mgmt_no") or it.get("manage_no") or "")
                 label = str(it.get("label") or "")
                 if mgmt == code or label.startswith(f"{code}(") or code in label:
                     target = it
+                    target_row = idx
                     break
         if target is None and name:
-            for it in items:
+            for idx, it in enumerate(items):
                 label = str(it.get("label") or "")
                 if name in label or label.endswith(f"({name})"):
                     target = it
+                    target_row = idx
                     break
-        self.tabs.setCurrentIndex(1)
+        # 분양현황 탭(0)으로 전환 — 분양차트 이동 중단
+        self.tabs.setCurrentIndex(0)
         if target is None:
             return
-        # 품목 목록이 전체 기준으로 보이도록 카테고리 리셋
-        if self.category_combo.currentIndex() != 0:
-            self._updating_combo = True
-            self.category_combo.setCurrentIndex(0)
-            self._refill_item_combo("전체")
-            self._updating_combo = False
-        self._select_item_by_label(str(target["label"]))
+        row = target_row
+        if row < 0 or row >= self.table.rowCount():
+            # 라벨로 테이블 행 재검색
+            want = str(target.get("label") or "")
+            for r in range(self.table.rowCount()):
+                cell = self.table.item(r, 0)
+                stored = ""
+                if cell is not None:
+                    stored = str(cell.data(Qt.ItemDataRole.UserRole) or "")
+                if stored == want or (want and want in stored):
+                    row = r
+                    break
+        if 0 <= row < self.table.rowCount():
+            self._focus_table_row(row)
 
     def _refresh_3d(self, _index: int = 0) -> None:
         if not self.inventory_data:
@@ -2509,6 +2577,69 @@ class MainWindow(QMainWindow):
             f"검색 {self._table_find_index + 1}/{len(self._table_find_matches)}: {query}",
             4000,
         )
+
+    def _download_report_word(self) -> None:
+        """AI 리포트를 Word(.docx)로 저장 (QFileDialog)."""
+        from PyQt6.QtWidgets import QFileDialog
+
+        if not self._initial_report:
+            QMessageBox.information(self, "안내", "먼저 AI 분석 리포트를 생성해 주세요.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Word 저장",
+            "생약표준품_AI_분석_리포트.docx",
+            "Word 문서 (*.docx)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".docx"):
+            path += ".docx"
+        try:
+            export_markdown_report_to_docx(self._initial_report, path)
+            self.statusBar().showMessage(f"Word 저장 완료: {path}", 5000)
+        except Exception as exc:
+            QMessageBox.critical(self, "Word 저장 실패", str(exc))
+
+    def _download_report_pdf(self) -> None:
+        """현재 렌더링된 리포트 서식을 PDF로 저장 (QPdfWriter)."""
+        from PyQt6.QtWidgets import QFileDialog
+
+        if not self._initial_report:
+            QMessageBox.information(self, "안내", "먼저 AI 분석 리포트를 생성해 주세요.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "PDF 저장",
+            "생약표준품_AI_분석_리포트.pdf",
+            "PDF (*.pdf)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".pdf"):
+            path += ".pdf"
+        try:
+            writer = QPdfWriter(path)
+            writer.setTitle("생약표준품 AI 분석 리포트")
+            writer.setPageLayout(
+                QPageLayout(
+                    QPageSize(QPageSize.PageSizeId.A4),
+                    QPageLayout.Orientation.Portrait,
+                    QMarginsF(12, 12, 12, 12),
+                    QPageLayout.Unit.Millimeter,
+                )
+            )
+            html = markdown_report_to_collapsible_html(
+                self._initial_report,
+                expanded_ids=set(self._report_expanded_ids),
+            )
+            doc = QTextDocument()
+            doc.setDefaultFont(QFont("Malgun Gothic", 10))
+            doc.setHtml(html)
+            doc.print(writer)
+            self.statusBar().showMessage(f"PDF 저장 완료: {path}", 5000)
+        except Exception as exc:
+            QMessageBox.critical(self, "PDF 저장 실패", str(exc))
 
     def _show_report_find_bar(self) -> None:
         self.report_find_bar.show()
@@ -2722,6 +2853,9 @@ class MainWindow(QMainWindow):
         data["ai_flags"] = attach_compendium_match_to_flags(data.get("ai_flags"), match)
         self._chat_history.clear()
         self._initial_report = ""
+        if hasattr(self, "btn_dl_word"):
+            self.btn_dl_word.setEnabled(False)
+            self.btn_dl_pdf.setEnabled(False)
         self._report_sections = []
         self._report_section_key = "all"
         self._report_expanded_ids.clear()
@@ -2810,6 +2944,8 @@ class MainWindow(QMainWindow):
         )
         self._rebuild_report_nav()
         self._render_report_html()
+        self.btn_dl_word.setEnabled(True)
+        self.btn_dl_pdf.setEnabled(True)
         self.chat_view.setMarkdown(
             "*표준 분석 리포트가 왼쪽에 준비되었습니다. 추가 질문을 입력해 주세요.*"
         )
