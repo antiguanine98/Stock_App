@@ -21,10 +21,6 @@ class _FakeExc(Exception):
 
 
 def test_retryable_detects_503_and_overload_text():
-    class E503(Exception):
-        pass
-
-    # text-based
     assert app._is_retryable_error(RuntimeError("The model is overloaded"))
     assert app._is_retryable_error(RuntimeError("503 UNAVAILABLE"))
     assert not app._is_retryable_error(RuntimeError("invalid argument 400"))
@@ -36,35 +32,34 @@ def test_generate_gemini_report_failsover_to_next_model(monkeypatch=None):
     class FakeModels:
         def generate_content(self, model, contents, config=None):
             calls.append(model)
-            if model == "gemini-2.5-flash":
+            if model == "gemini-3.6-flash":
                 raise RuntimeError("503 UNAVAILABLE: model is overloaded")
+
             class R:
                 text = "ok-from-" + model
                 candidates = [1]
+
             return R()
 
     class FakeClient:
         models = FakeModels()
 
-    app._resolved_gemini_model = "gemini-2.5-flash"
+    app._resolved_gemini_model = "gemini-3.6-flash"
     app.clear_cancel_gemini()
 
-    # stub helpers
     orig_create = app.create_gemini_client
     orig_resolve = app.resolve_gemini_model
     orig_discover = app._discover_flash_models
-    orig_retry = app._call_with_retry
 
     def fake_create(_key):
         return FakeClient()
 
     def fake_resolve(client, force_refresh=False):
-        return "gemini-2.5-flash"
+        return "gemini-3.6-flash"
 
     def fake_discover(client, use_cache: bool = True):
-        return ["gemini-2.5-flash", "gemini-1.5-flash"]
+        return ["gemini-3.6-flash", "gemini-omni-1.1-flash"]
 
-    # Use real _call_with_retry but skip sleep
     sleeps: list[float] = []
 
     def fake_sleep(sec):
@@ -76,16 +71,15 @@ def test_generate_gemini_report_failsover_to_next_model(monkeypatch=None):
     app._discover_flash_models = fake_discover
     orig_sleep = app._sleep_with_cancel
     app._sleep_with_cancel = fake_sleep
-    # Reduce retries for speed
     old_max = app._MAX_RETRIES
     app._MAX_RETRIES = 0
     try:
         text = app.generate_gemini_report("fake-key", "hello")
         assert text.startswith("ok-from-")
-        assert "gemini-2.5-flash" in calls
-        # should have moved to another stable model
-        assert any(m != "gemini-2.5-flash" for m in calls)
-        assert all(m in app.GEMINI_MODEL_PREFERENCES for m in calls)
+        assert "gemini-3.6-flash" in calls
+        assert any(m != "gemini-3.6-flash" for m in calls)
+        assert "gemini-2.5-flash" not in calls
+        assert "gemini-1.5-flash" not in calls
     finally:
         app._MAX_RETRIES = old_max
         app.create_gemini_client = orig_create
@@ -106,17 +100,15 @@ def test_cancel_aborts_retry_sleep():
     assert raised
 
 
-def test_cascade_models_stable_only_and_caps():
+def test_cascade_models_prefers_discovered_flash():
     models = app._cascade_models(
-        "gemini-2.5-flash",
-        ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.5-flash-lite"],
+        "gemini-3.6-flash",
+        ["gemini-3.6-flash", "gemini-omni-1.1-flash", "gemini-3.5-flash"],
     )
-    assert models[0] == "gemini-2.5-flash"
+    assert models[0] == "gemini-3.6-flash"
     assert len(models) <= app._MAX_CASCADE_MODELS
-    assert len(models) <= 2
-    assert all(m in app.GEMINI_MODEL_PREFERENCES for m in models)
-    assert "gemini-3.5-flash-lite" not in models
-    assert "gemini-1.5-flash" in models
+    assert "gemini-2.5-flash" not in models
+    assert "gemini-1.5-flash" not in models
 
 
 def test_api_error_code_from_text():
@@ -126,6 +118,7 @@ def test_api_error_code_from_text():
 
 def test_resolve_accepts_overloaded_as_connected():
     """모든 후보가 503이어도 API Key 유효 시 모델을 채택한다."""
+
     class FakeModels:
         def generate_content(self, model, contents, config=None):
             raise RuntimeError("503 UNAVAILABLE: model is overloaded")
@@ -133,18 +126,16 @@ def test_resolve_accepts_overloaded_as_connected():
     class FakeClient:
         models = FakeModels()
 
-        class models_list:
-            pass
-
-    client = FakeClient()
-    # discover returns empty via patch
     orig_disc = app._discover_flash_models
-    app._discover_flash_models = lambda c, use_cache=True: []
+    app._discover_flash_models = lambda c, use_cache=True: [
+        "gemini-3.6-flash",
+        "gemini-omni-1.1-flash",
+    ]
     app._resolved_gemini_model = None
     app._discovered_flash_cache = []
     try:
-        model = app.resolve_gemini_model(client, force_refresh=True)
-        assert model in app.GEMINI_MODEL_PREFERENCES
+        model = app.resolve_gemini_model(FakeClient(), force_refresh=True)
+        assert model in ("gemini-3.6-flash", "gemini-omni-1.1-flash")
         assert app._resolved_gemini_model == model
     finally:
         app._discover_flash_models = orig_disc
@@ -159,36 +150,102 @@ def test_probe_model_returns_overloaded_status():
     class FakeClient:
         models = FakeModels()
 
-    assert app._probe_model(FakeClient(), "gemini-2.5-flash") == "overloaded"
+    assert app._probe_model(FakeClient(), "gemini-3.6-flash") == "overloaded"
 
 
-def test_retired_models_filtered_from_cascade():
+def test_retired_legacy_flash_filtered():
+    assert app._is_retired_model("gemini-1.5-flash")
     assert app._is_retired_model("gemini-2.0-flash")
-    assert app._is_retired_model("gemini-2.0-flash-lite")
-    assert app._is_retired_model("gemini-3.5-flash-lite")
-    assert app._is_retired_model("gemini-3.6-flash")
+    assert app._is_retired_model("gemini-2.5-flash")
     assert app._is_retired_model("gemini-2.5-flash-lite")
-    assert app._is_retired_model("gemini-flash-latest")
-    assert not app._is_retired_model("gemini-2.5-flash")
-    assert not app._is_retired_model("gemini-1.5-flash")
+    assert not app._is_retired_model("gemini-3.6-flash")
+    assert not app._is_retired_model("gemini-omni-1.1-flash")
     models = app._cascade_models(
-        "gemini-2.0-flash",
-        ["gemini-2.0-flash", "gemini-3.5-flash-lite", "gemini-1.5-flash"],
+        "gemini-2.5-flash",
+        ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash"],
     )
-    assert "gemini-2.0-flash" not in models
-    assert "gemini-3.5-flash-lite" not in models
-    assert models == ["gemini-2.5-flash", "gemini-1.5-flash"] or set(models) <= set(
-        app.GEMINI_MODEL_PREFERENCES
-    )
+    assert "gemini-2.5-flash" not in models
+    assert "gemini-1.5-flash" not in models
+    assert models[0] == "gemini-3.6-flash"
+
+
+def test_discover_filters_generate_content_and_orders():
+    class FakeModel:
+        def __init__(self, name, actions):
+            self.name = name
+            self.supported_actions = actions
+
+    class FakePager:
+        def __iter__(self):
+            return iter(
+                [
+                    FakeModel("models/gemini-2.5-flash", ["generateContent"]),
+                    FakeModel("models/gemini-3.6-flash", ["generateContent"]),
+                    FakeModel("models/gemini-embedding-flash", ["embedContent"]),
+                    FakeModel("models/gemini-omni-1.1-flash", ["generateContent"]),
+                    FakeModel("models/gemini-3.1-flash-lite", ["generateContent"]),
+                ]
+            )
+
+    class FakeClient:
+        class models:
+            @staticmethod
+            def list():
+                return FakePager()
+
+    app._discovered_flash_cache = None
+    found = app._discover_flash_models(FakeClient(), use_cache=False)
+    assert "gemini-2.5-flash" not in found
+    assert "gemini-embedding-flash" not in found
+    assert found[0] == "gemini-3.6-flash"
+    assert "gemini-omni-1.1-flash" in found
+    assert "gemini-3.1-flash-lite" in found
 
 
 def test_http_timeout_at_least_120s():
     assert app._HTTP_TIMEOUT_MS >= 120_000
 
 
-def test_stable_model_list_only():
-    assert app.GEMINI_MODEL_PREFERENCES == ["gemini-2.5-flash", "gemini-1.5-flash"]
-    assert app._MAX_CASCADE_MODELS <= 2
+def test_preference_list_uses_current_server_ids():
+    assert "gemini-3.6-flash" in app.GEMINI_MODEL_PREFERENCES
+    assert "gemini-2.5-flash" not in app.GEMINI_MODEL_PREFERENCES
+    assert "gemini-1.5-flash" not in app.GEMINI_MODEL_PREFERENCES
+
+
+def test_404_suggestion_appended_to_cascade():
+    calls: list[str] = []
+
+    class FakeModels:
+        def generate_content(self, model, contents, config=None):
+            calls.append(model)
+            if model == "gemini-3.6-flash":
+                raise RuntimeError(
+                    "404 NOT_FOUND. models/gemini-3.6-flash is no longer available "
+                    "to new users. Please update your code to use models/gemini-omni-1.1-flash"
+                )
+
+            class R:
+                text = "ok-" + model
+                candidates = [1]
+
+            return R()
+
+    class FakeClient:
+        models = FakeModels()
+
+    app._resolved_gemini_model = "gemini-3.6-flash"
+    app.clear_cancel_gemini()
+    orig_create = app.create_gemini_client
+    orig_discover = app._discover_flash_models
+    app.create_gemini_client = lambda _k: FakeClient()
+    app._discover_flash_models = lambda c, use_cache=True: ["gemini-3.6-flash"]
+    try:
+        text = app.generate_gemini_report("fake-key", "hi")
+        assert text.startswith("ok-")
+        assert "gemini-omni-1.1-flash" in calls
+    finally:
+        app.create_gemini_client = orig_create
+        app._discover_flash_models = orig_discover
 
 
 if __name__ == "__main__":
@@ -198,17 +255,21 @@ if __name__ == "__main__":
     print("PASS test_generate_gemini_report_failsover_to_next_model")
     test_cancel_aborts_retry_sleep()
     print("PASS test_cancel_aborts_retry_sleep")
-    test_cascade_models_stable_only_and_caps()
-    print("PASS test_cascade_models_stable_only_and_caps")
+    test_cascade_models_prefers_discovered_flash()
+    print("PASS test_cascade_models_prefers_discovered_flash")
     test_api_error_code_from_text()
     print("PASS test_api_error_code_from_text")
     test_resolve_accepts_overloaded_as_connected()
     print("PASS test_resolve_accepts_overloaded_as_connected")
     test_probe_model_returns_overloaded_status()
     print("PASS test_probe_model_returns_overloaded_status")
-    test_retired_models_filtered_from_cascade()
-    print("PASS test_retired_models_filtered_from_cascade")
+    test_retired_legacy_flash_filtered()
+    print("PASS test_retired_legacy_flash_filtered")
+    test_discover_filters_generate_content_and_orders()
+    print("PASS test_discover_filters_generate_content_and_orders")
     test_http_timeout_at_least_120s()
     print("PASS test_http_timeout_at_least_120s")
-    test_stable_model_list_only()
-    print("PASS test_stable_model_list_only")
+    test_preference_list_uses_current_server_ids()
+    print("PASS test_preference_list_uses_current_server_ids")
+    test_404_suggestion_appended_to_cascade()
+    print("PASS test_404_suggestion_appended_to_cascade")

@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.61
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.62
 """
 
 from __future__ import annotations
@@ -116,38 +116,37 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.61"
+APP_VERSION = "v1.62"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
-# Google API 안정 Flash만 사용 (가상 3.x·lite·latest 제외)
+# 서버 안내 우선 후보 — 실제 타겟은 list_models 동적 탐색이 우선
 GEMINI_MODEL_PREFERENCES = [
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
+    "gemini-3.6-flash",
+    "gemini-omni-1.1-flash",
 ]
 GEMINI_FAILOVER_PREFERENCES = [
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
+    "gemini-3.6-flash",
+    "gemini-omni-1.1-flash",
 ]
-# 미지원·가상·종료 모델 — 후보에서 제외
+# 신규 사용자에게 404를 내는 구버전·종료 모델
 GEMINI_RETIRED_MODELS = frozenset(
     {
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-001",
         "gemini-2.0-flash",
         "gemini-2.0-flash-lite",
         "gemini-2.0-flash-001",
         "gemini-2.0-flash-lite-001",
+        "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.5-flash-lite-preview",
-        "gemini-flash-latest",
-        "gemini-3.5-flash-lite",
-        "gemini-3.6-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash-001",
+        "gemini-2.5-flash-preview",
     }
 )
 _resolved_gemini_model: str | None = None
-_MAX_MODEL_PROBES = 2  # 안정 모델 2개만 프로브
-_MAX_CASCADE_MODELS = 2  # 분석: 안정 모델 최대 2개
+_MAX_MODEL_PROBES = 4  # 연결 테스트: 동적 후보 상한
+_MAX_CASCADE_MODELS = 3  # 분석: 동적 Flash 최대 3개
 _cancel_gemini: bool = False
 _discovered_flash_cache: list[str] | None = None
 
@@ -522,27 +521,72 @@ def _is_model_unavailable_error(exc: BaseException) -> bool:
 
 
 def _is_retired_model(model_id: str | None) -> bool:
-    """API에서 제거·미지원·가상 모델 ID인지."""
+    """신규 사용자에게 404를 내는 구버전·종료 모델인지."""
     if not model_id:
         return False
     mid = str(model_id).strip()
     if mid in GEMINI_RETIRED_MODELS:
         return True
     low = mid.lower()
-    # 2.0·3.x·lite·latest 계열은 사용하지 않음 (1.5-flash 본명은 허용)
+    # 1.5 / 2.0 / 2.5 Flash 계열은 더 이상 신규 키에 제공되지 않음
+    if low.startswith("gemini-1.5-flash"):
+        return True
     if low.startswith("gemini-2.0-flash"):
         return True
-    if low.startswith("gemini-3."):
-        return True
-    if "flash-lite" in low or low.endswith("-lite"):
-        return True
-    if "flash-latest" in low or low == "gemini-flash-latest":
+    if low.startswith("gemini-2.5-flash"):
         return True
     return False
 
 
+def _model_supports_generate_content(model_obj: Any) -> bool:
+    """list_models 항목이 generateContent를 지원하는지."""
+    actions = (
+        getattr(model_obj, "supported_actions", None)
+        or getattr(model_obj, "supported_generation_methods", None)
+        or []
+    )
+    if not actions:
+        # 필드가 비어 있으면 통과 — 이후 probe로 검증
+        return True
+    for raw in actions:
+        a = str(raw).lower().replace("_", "")
+        if "generatecontent" in a:
+            return True
+    return False
+
+
+def _flash_version_sort_key(model_id: str) -> tuple:
+    """버전 숫자 큰 Flash를 앞으로 (비-lite 우선)."""
+    import re as _re
+
+    low = str(model_id).lower()
+    nums = [int(x) for x in _re.findall(r"\d+", low)]
+    while len(nums) < 4:
+        nums.append(0)
+    non_lite = 1 if "lite" not in low else 0
+    omni = 1 if "omni" in low else 0
+    return (tuple(nums[:4]), non_lite, omni)
+
+
+def _order_discovered_flash(found: list[str]) -> list[str]:
+    """선호 ID를 앞에 두고, 나머지는 최신 버전 순."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for preferred in GEMINI_MODEL_PREFERENCES + list(GEMINI_FAILOVER_PREFERENCES):
+        if preferred in found and preferred not in seen:
+            ordered.append(preferred)
+            seen.add(preferred)
+    rest = [m for m in found if m not in seen]
+    rest.sort(key=_flash_version_sort_key, reverse=True)
+    ordered.extend(rest)
+    return ordered
+
+
 def _discover_flash_models(client, *, use_cache: bool = True) -> list[str]:
-    """API Flash 모델 ID 조회 — 결과는 캐시(분석 경로에서 반복 list 호출 방지)."""
+    """API에서 generateContent 가능 Flash 모델 ID를 동적 조회 (캐시).
+
+    google.genai Client.models.list() ≡ legacy list_models().
+    """
     global _discovered_flash_cache
     if use_cache and _discovered_flash_cache is not None:
         return list(_discovered_flash_cache)
@@ -557,20 +601,43 @@ def _discover_flash_models(client, *, use_cache: bool = True) -> list[str]:
             low = mid.lower()
             if "flash" not in low:
                 continue
-            if any(x in low for x in ("embed", "tts", "live", "image", "preview")):
+            if any(x in low for x in ("embed", "tts", "live", "image")):
+                continue
+            if not _model_supports_generate_content(m):
                 continue
             if _is_retired_model(mid):
                 continue
             if mid not in found:
                 found.append(mid)
     except Exception as exc:
-        log_gemini("WARN", f"모델 목록 조회 실패(고정 후보로 진행): {format_gemini_error(exc)}")
-    _discovered_flash_cache = list(found)
-    return found
+        log_gemini(
+            "WARN",
+            f"모델 목록 조회 실패(선호 후보로 진행): {format_gemini_error(exc)}",
+        )
+    ordered = _order_discovered_flash(found)
+    _discovered_flash_cache = list(ordered)
+    if ordered:
+        log_gemini(
+            "INFO",
+            f"동적 Flash 후보 {len(ordered)}개: {', '.join(ordered[:8])}"
+            + ("…" if len(ordered) > 8 else ""),
+        )
+    return ordered
+
+
+def _pick_latest_flash(discovered: list[str] | None = None) -> str | None:
+    """동적 목록(또는 선호 목록)에서 최신 Flash 1개."""
+    disc = [m for m in (discovered or []) if not _is_retired_model(m)]
+    if disc:
+        return disc[0]
+    for mid in GEMINI_MODEL_PREFERENCES:
+        if not _is_retired_model(mid):
+            return mid
+    return None
 
 
 def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | None = None) -> list[str]:
-    """연결 테스트용 후보 — retired 제외, API discover 우선."""
+    """연결 테스트용 후보 — API 동적 목록 우선, 선호 ID는 fallback."""
     ordered: list[str] = []
 
     def _add(mid: str | None) -> None:
@@ -580,7 +647,6 @@ def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | 
     _add(prioritize)
     _add(_resolved_gemini_model)
     disc = [m for m in (discovered or []) if not _is_retired_model(m)]
-    # 선호 목록 중 API에 실제로 있는 것 먼저
     for preferred in GEMINI_MODEL_PREFERENCES:
         if preferred in disc:
             _add(preferred)
@@ -592,20 +658,17 @@ def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | 
 
 
 def _cascade_models(primary: str | None, discovered: list[str] | None = None) -> list[str]:
-    """분석용 체인 — 안정 선호 모델만 (최대 2개). discover는 allowlist 검증용."""
+    """분석용 체인 — 동적 Flash 우선, 선호 ID fallback (최대 N개)."""
     ordered: list[str] = []
-    allow = set(GEMINI_MODEL_PREFERENCES) | set(GEMINI_FAILOVER_PREFERENCES)
 
     def _add(mid: str | None) -> None:
-        if mid and mid in allow and not _is_retired_model(mid) and mid not in ordered:
+        if mid and not _is_retired_model(mid) and mid not in ordered:
             ordered.append(mid)
 
     _add(primary)
-    disc = set(m for m in (discovered or []) if not _is_retired_model(m))
-    # API에 실제로 보이는 안정 모델 우선
-    for preferred in GEMINI_FAILOVER_PREFERENCES:
-        if preferred in disc:
-            _add(preferred)
+    disc = [m for m in (discovered or []) if not _is_retired_model(m)]
+    for mid in disc:
+        _add(mid)
         if len(ordered) >= _MAX_CASCADE_MODELS:
             return ordered[:_MAX_CASCADE_MODELS]
     for mid in GEMINI_FAILOVER_PREFERENCES + list(GEMINI_MODEL_PREFERENCES):
@@ -716,7 +779,10 @@ def resolve_gemini_model(client, force_refresh: bool = False) -> str:
 
 
 def get_active_gemini_model() -> str:
-    return _resolved_gemini_model or GEMINI_MODEL_PREFERENCES[0]
+    if _resolved_gemini_model and not _is_retired_model(_resolved_gemini_model):
+        return _resolved_gemini_model
+    pick = _pick_latest_flash(_discovered_flash_cache)
+    return pick or GEMINI_MODEL_PREFERENCES[0]
 
 
 def describe_empty_response(response: Any) -> str:
@@ -817,17 +883,19 @@ def _call_with_retry(
 
 
 def generate_gemini_report(api_key: str, prompt: str) -> str:
-    """Gemini 분석 호출 — sticky/최신 Flash로 요청, 404·과부하는 즉시 다음 모델.
+    """Gemini 분석 호출 — 동적 Flash 탐색 후 sticky/최신 모델로 요청.
 
-    retired(2.0 등) sticky는 버리고, 연결 테스트 때 캐시한 discover 목록을 활용한다.
+    404·과부하는 즉시 다음 후보로 전환. 구버전 sticky는 폐기한다.
     """
     global _resolved_gemini_model
     client = create_gemini_client(api_key)
     if _is_retired_model(_resolved_gemini_model):
         log_gemini("WARN", f"retired 모델 sticky 제거: {_resolved_gemini_model}")
         _resolved_gemini_model = None
-    primary = _resolved_gemini_model or GEMINI_MODEL_PREFERENCES[0]
     discovered = _discover_flash_models(client, use_cache=True)
+    if not discovered:
+        discovered = _discover_flash_models(client, use_cache=False)
+    primary = _resolved_gemini_model or _pick_latest_flash(discovered) or GEMINI_MODEL_PREFERENCES[0]
     candidates = _cascade_models(primary, discovered)
     if not candidates:
         raise RuntimeError(
@@ -874,25 +942,20 @@ def generate_gemini_report(api_key: str, prompt: str) -> str:
                     "Gemini API 할당량(quota)이 소진된 것 같습니다.\n"
                     f"{detail}"
                 ) from exc
-            # 404 안내의 추천 모델은 안정 allowlist에 있을 때만 추가
+            # 404 안내의 추천 Flash 모델을 후보에 동적 추가
             if "no longer available" in low or "not_found" in low or "404" in low:
                 import re as _re
 
-                allow = set(GEMINI_MODEL_PREFERENCES) | set(GEMINI_FAILOVER_PREFERENCES)
                 suggested = _re.findall(
-                    r"models/(gemini-[a-z0-9.-]*flash[a-z0-9.-]*)",
+                    r"models/(gemini-[a-z0-9._-]*flash[a-z0-9._-]*)",
                     detail,
                     flags=_re.I,
                 )
                 for sug in suggested:
-                    if (
-                        sug in allow
-                        and sug not in candidates
-                        and not _is_retired_model(sug)
-                    ):
+                    if sug not in candidates and not _is_retired_model(sug):
                         candidates.append(sug)
                         total = len(candidates)
-                        log_gemini("INFO", f"API 추천 안정 모델을 후보에 추가: {sug}")
+                        log_gemini("INFO", f"API 추천 모델을 후보에 추가: {sug}")
             if not (_is_retryable_error(exc) or _is_model_unavailable_error(exc)):
                 raise
             last_exc = exc
