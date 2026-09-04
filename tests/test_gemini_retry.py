@@ -61,7 +61,7 @@ def test_generate_gemini_report_failsover_to_next_model(monkeypatch=None):
     def fake_resolve(client, force_refresh=False):
         return "gemini-2.5-flash"
 
-    def fake_discover(client):
+    def fake_discover(client, use_cache: bool = True):
         return ["gemini-2.5-flash-lite"]
 
     # Use real _call_with_retry but skip sleep
@@ -160,6 +160,16 @@ def test_probe_model_returns_overloaded_status():
     assert app._probe_model(FakeClient(), "gemini-2.0-flash") == "overloaded"
 
 
+
+
+def test_retired_models_filtered_from_cascade():
+    assert app._is_retired_model("gemini-2.0-flash")
+    assert app._is_retired_model("gemini-2.0-flash-lite")
+    models = app._cascade_models("gemini-2.0-flash", ["gemini-2.0-flash", "gemini-3.5-flash-lite"])
+    assert "gemini-2.0-flash" not in models
+    assert "gemini-3.5-flash-lite" in models
+
+
 if __name__ == "__main__":
     test_retryable_detects_503_and_overload_text()
     print("PASS test_retryable_detects_503_and_overload_text")
@@ -175,3 +185,5 @@ if __name__ == "__main__":
     print("PASS test_resolve_accepts_overloaded_as_connected")
     test_probe_model_returns_overloaded_status()
     print("PASS test_probe_model_returns_overloaded_status")
+    test_retired_models_filtered_from_cascade()
+    print("PASS test_retired_models_filtered_from_cascade")
