@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.55
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.56
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.55"
+APP_VERSION = "v1.56"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
@@ -124,12 +124,15 @@ GEMINI_MODEL_PREFERENCES = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-flash-latest",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
     "gemini-3.5-flash",
 ]
 _resolved_gemini_model: str | None = None
-_MAX_MODEL_PROBES = 10
+_MAX_MODEL_PROBES = 12
+_cancel_gemini: bool = False
 
 APP_STYLE = """
 QMainWindow, QWidget {
@@ -403,9 +406,32 @@ def _is_auth_error(exc: BaseException) -> bool:
     return any(k in text for k in ("api key", "api_key", "permission denied", "unauthenticated"))
 
 
-_RETRYABLE_CODES = (429, 503, 504)
-_MAX_RETRIES = 4
-_RETRY_BASE_SECONDS = 4
+_RETRYABLE_CODES = (429, 500, 502, 503, 504)
+_MAX_RETRIES = 3  # per-model; cascade switches model after exhaustion
+_RETRY_BASE_SECONDS = 3
+_RETRY_MAX_WAIT = 45
+
+
+def request_cancel_gemini() -> None:
+    """백그라운드 Gemini 호출 취소를 요청한다."""
+    global _cancel_gemini
+    _cancel_gemini = True
+
+
+def clear_cancel_gemini() -> None:
+    global _cancel_gemini
+    _cancel_gemini = False
+
+
+def _sleep_with_cancel(seconds: float) -> None:
+    """취소 가능한 대기 (0.25초 단위 폴링)."""
+    import time
+
+    end = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < end:
+        if _cancel_gemini:
+            raise RuntimeError("사용자에 의해 AI 요청이 취소되었습니다.")
+        time.sleep(min(0.25, end - time.monotonic()))
 
 
 def _is_retryable_error(exc: BaseException) -> bool:
@@ -415,8 +441,22 @@ def _is_retryable_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     return any(
         m in text
-        for m in ("resource_exhausted", "rate limit", "quota", "unavailable",
-                  "high demand", "overloaded", "deadline", "timed out", "timeout")
+        for m in (
+            "resource_exhausted",
+            "rate limit",
+            "quota",
+            "unavailable",
+            "high demand",
+            "overloaded",
+            "overload",
+            "deadline",
+            "timed out",
+            "timeout",
+            "temporarily",
+            "try again",
+            "server error",
+            "internal error",
+        )
     )
 
 
@@ -579,11 +619,12 @@ _retry_stage_callback: Callable[[str], None] | None = None
 
 
 def _call_with_retry(client, model: str, prompt: str) -> Any:
-    """generate_content를 exponential backoff로 재시도 (429/503/504).
+    """generate_content를 exponential backoff(+jitter)로 재시도 (429/5xx).
 
-    temperature=0.15 로 팩트 중심·환각 억제.
+    temperature=0.15 로 팩트 중심·환각 억제. 모델 단위 재시도만 담당하며,
+    모델 전환(cascade)은 generate_gemini_report에서 수행한다.
     """
-    import time
+    import random
 
     from google.genai import types
 
@@ -594,6 +635,8 @@ def _call_with_retry(client, model: str, prompt: str) -> Any:
 
     last_exc: BaseException | None = None
     for attempt in range(_MAX_RETRIES + 1):
+        if _cancel_gemini:
+            raise RuntimeError("사용자에 의해 AI 요청이 취소되었습니다.")
         try:
             if gen_config is not None:
                 return client.models.generate_content(
@@ -607,36 +650,72 @@ def _call_with_retry(client, model: str, prompt: str) -> Any:
                 raise
             last_exc = exc
             if attempt < _MAX_RETRIES:
-                wait = _RETRY_BASE_SECONDS * (2 ** attempt)
+                wait = min(
+                    _RETRY_MAX_WAIT,
+                    _RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0.0, 1.5),
+                )
                 msg = (
-                    f"서버 과부하 — {wait}초 후 자동 재시도 "
+                    f"서버 과부하({model}) — {wait:.0f}초 후 재시도 "
                     f"({attempt + 1}/{_MAX_RETRIES})..."
                 )
                 log_gemini("WARN", msg)
                 if _retry_stage_callback:
                     _retry_stage_callback(msg)
-                time.sleep(wait)
+                _sleep_with_cancel(wait)
     raise last_exc  # type: ignore[misc]
 
 
 def generate_gemini_report(api_key: str, prompt: str) -> str:
+    """Gemini 호출 — 과부하 시 동일 모델 재시도 후 대체 Flash 모델로 페일오버."""
     global _resolved_gemini_model
     client = create_gemini_client(api_key)
-    model = resolve_gemini_model(client)
-    log_gemini("INFO", f"AI 분석 요청 시작 (model={model})")
-    try:
-        response = _call_with_retry(client, model, prompt)
-    except Exception as exc:
-        if _is_model_unavailable_error(exc) and not _is_retryable_error(exc):
-            _resolved_gemini_model = None
-            model = resolve_gemini_model(client, force_refresh=True)
-            response = _call_with_retry(client, model, prompt)
+    primary = resolve_gemini_model(client)
+    discovered = _discover_flash_models(client)
+    candidates = _candidate_models(prioritize=primary, discovered=discovered)
+
+    errors: list[str] = []
+    last_exc: BaseException | None = None
+    for idx, model in enumerate(candidates):
+        if _cancel_gemini:
+            raise RuntimeError("사용자에 의해 AI 요청이 취소되었습니다.")
+        if idx > 0:
+            msg = f"과부하 우회 — 대체 모델 시도 ({model})..."
+            log_gemini("INFO", msg)
+            if _retry_stage_callback:
+                _retry_stage_callback(msg)
         else:
-            raise
-    text = extract_response_text(response)
-    if text:
-        return text
-    raise RuntimeError(describe_empty_response(response))
+            log_gemini("INFO", f"AI 분석 요청 시작 (model={model})")
+        try:
+            response = _call_with_retry(client, model, prompt)
+            text = extract_response_text(response)
+            if text:
+                _resolved_gemini_model = model
+                log_gemini("INFO", f"AI 응답 성공 (model={model})")
+                return text
+            raise RuntimeError(describe_empty_response(response))
+        except Exception as exc:
+            if _is_auth_error(exc):
+                raise
+            detail = format_gemini_error(exc)
+            errors.append(f"{model}: {detail}")
+            log_gemini("WARN", f"모델 실패 → 다음 후보: {model} — {detail}", exc)
+            if _resolved_gemini_model == model:
+                _resolved_gemini_model = None
+            # 취소는 즉시 중단
+            if "취소" in str(exc):
+                raise
+            # 일시 오류/모델 불가만 cascade, 그 외는 즉시 실패
+            if not (_is_retryable_error(exc) or _is_model_unavailable_error(exc)):
+                raise
+            last_exc = exc
+            continue
+
+    summary = "\n".join(errors[:8]) if errors else "(상세 없음)"
+    raise RuntimeError(
+        "모든 Gemini Flash 모델이 과부하이거나 응답하지 않습니다.\n"
+        "잠시 후 다시 시도하거나, API 할당량/상태를 확인해 주세요.\n\n"
+        f"{summary}"
+    ) from last_exc
 
 
 def load_config() -> dict[str, Any]:
@@ -700,6 +779,7 @@ class GeminiWorker(QThread):
 
     def run(self) -> None:
         global _retry_stage_callback
+        clear_cancel_gemini()
         _retry_stage_callback = lambda msg: self.stage.emit(msg)
         try:
             if self.build_prompt is not None:
@@ -1671,9 +1751,13 @@ class MainWindow(QMainWindow):
         self.chat_busy_label = QLabel("")
         self.chat_busy_label.setWordWrap(True)
         self.chat_busy_label.setStyleSheet(
-            "color: #1e3a5f; font-size: 12px; font-weight: 600; padding: 4px 2px;"
+            "color: #9a3412; font-size: 12px; padding: 2px 0;"
         )
         chat_busy_layout.addWidget(self.chat_busy_label, stretch=1)
+        self.btn_ai_cancel = QPushButton("중단")
+        self.btn_ai_cancel.setToolTip("서버 과부하 대기/재시도를 중단하고 UI를 해제합니다.")
+        self.btn_ai_cancel.clicked.connect(self._cancel_ai_request)
+        chat_busy_layout.addWidget(self.btn_ai_cancel)
         self.chat_busy_bar.hide()
         right_layout.addWidget(self.chat_busy_bar)
 
@@ -2814,11 +2898,24 @@ class MainWindow(QMainWindow):
         if message:
             self.chat_busy_label.setText(f"🤖 {message}")
             self.chat_busy_bar.show()
+            if hasattr(self, "btn_ai_cancel"):
+                self.btn_ai_cancel.setEnabled(True)
             self.statusBar().showMessage(message)
         else:
             self.chat_busy_bar.hide()
             self.chat_busy_label.clear()
+            if hasattr(self, "btn_ai_cancel"):
+                self.btn_ai_cancel.setEnabled(False)
             self.statusBar().clearMessage()
+
+    def _cancel_ai_request(self) -> None:
+        """과부하 대기/재시도 중 AI 요청을 중단하고 UI를 해제."""
+        if not self._chat_busy:
+            return
+        request_cancel_gemini()
+        self._set_ai_progress("취소 요청됨 — 진행 중인 대기를 중단합니다…")
+        if hasattr(self, "btn_ai_cancel"):
+            self.btn_ai_cancel.setEnabled(False)
 
     def _on_ai_stage(self, message: str) -> None:
         self._set_ai_progress(message)
@@ -2929,6 +3026,7 @@ class MainWindow(QMainWindow):
     def _on_report_ready(self, text: str) -> None:
         self._set_ai_progress(None)
         self._chat_busy = False
+        clear_cancel_gemini()
         self._chat_history.clear()
         flags, match = self._report_context_for_sections()
         text = ensure_mandatory_report_sections(text, flags=flags, match_result=match)
@@ -2965,13 +3063,28 @@ class MainWindow(QMainWindow):
     def _on_report_error(self, message: str) -> None:
         self._set_ai_progress(None)
         self._chat_busy = False
+        clear_cancel_gemini()
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
+        hint = ""
+        low = (message or "").lower()
+        if any(k in low for k in ("과부하", "503", "429", "unavailable", "overload")) or "취소" in (message or ""):
+            hint = (
+                "\n\n💡 **안내:** 서버 과부하 시 앱이 대체 Flash 모델로 자동 전환합니다. "
+                "그래도 실패하면 1~2분 뒤 [🚀 분석 시작]을 다시 눌러 주세요. "
+                "대기 중에는 [중단]으로 UI를 해제할 수 있습니다."
+            )
         self._chat_history.append(
-            {"role": "assistant", "text": f"AI 분석 생성 실패:\n\n{message}"}
+            {"role": "assistant", "text": f"AI 분석 생성 실패:\n\n{message}{hint}"}
         )
         self._render_chat_view()
         self._set_chat_enabled(bool(self._initial_report))
-        self._set_api_status(False, message)
+        # 일시 과부하는 API Key 자체 문제로 보지 않음
+        if "취소" in (message or "") or any(
+            k in low for k in ("과부하", "503", "429", "unavailable", "overload")
+        ):
+            self._set_api_status(True, f"연결됨 ({get_active_gemini_model()}) — 일시 과부하")
+        else:
+            self._set_api_status(False, message)
 
     def _send_chat_message(self) -> None:
         if self._chat_busy:
@@ -3053,6 +3166,7 @@ class MainWindow(QMainWindow):
     def _on_chat_reply(self, text: str) -> None:
         self._set_ai_progress(None)
         self._chat_busy = False
+        clear_cancel_gemini()
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
         self._chat_history.append({"role": "assistant", "text": text})
         self._render_chat_view()
@@ -3073,13 +3187,29 @@ class MainWindow(QMainWindow):
     def _on_chat_error(self, message: str) -> None:
         self._set_ai_progress(None)
         self._chat_busy = False
+        clear_cancel_gemini()
         self._chat_history = [m for m in self._chat_history if m.get("role") != "system"]
+        hint = ""
+        if any(
+            k in (message or "").lower()
+            for k in ("과부하", "503", "429", "unavailable", "overload")
+        ) or "취소" in (message or ""):
+            hint = (
+                "\n\n💡 잠시 후 다시 질문해 주세요. "
+                "앱은 과부하 시 대체 모델로 자동 전환을 시도합니다."
+            )
         self._chat_history.append(
-            {"role": "assistant", "text": f"답변 생성 실패:\n\n{message}"}
+            {"role": "assistant", "text": f"답변 생성 실패:\n\n{message}{hint}"}
         )
         self._render_chat_view()
         self._set_chat_enabled(True)
-        self._set_api_status(False, message)
+        low = (message or "").lower()
+        if "취소" in (message or "") or any(
+            k in low for k in ("과부하", "503", "429", "unavailable", "overload")
+        ):
+            self._set_api_status(True, f"연결됨 ({get_active_gemini_model()}) — 일시 과부하")
+        else:
+            self._set_api_status(False, message)
 
 
 def create_splash(app: QApplication) -> tuple[QWidget, QProgressBar, QLabel]:

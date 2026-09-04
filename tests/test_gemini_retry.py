@@ -1,0 +1,114 @@
+"""Gemini 과부하 재시도·모델 페일오버 단위 테스트."""
+
+from __future__ import annotations
+
+import os
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import main as app  # noqa: E402
+
+
+class _FakeExc(Exception):
+    def __init__(self, code: int, message: str = "overloaded"):
+        super().__init__(message)
+        self.code = code
+
+
+def test_retryable_detects_503_and_overload_text():
+    class E503(Exception):
+        pass
+
+    # text-based
+    assert app._is_retryable_error(RuntimeError("The model is overloaded"))
+    assert app._is_retryable_error(RuntimeError("503 UNAVAILABLE"))
+    assert not app._is_retryable_error(RuntimeError("invalid argument 400"))
+
+
+def test_generate_gemini_report_failsover_to_next_model(monkeypatch=None):
+    calls: list[str] = []
+
+    class FakeModels:
+        def generate_content(self, model, contents, config=None):
+            calls.append(model)
+            if model == "gemini-2.5-flash":
+                raise RuntimeError("503 UNAVAILABLE: model is overloaded")
+            class R:
+                text = "ok-from-" + model
+                candidates = [1]
+            return R()
+
+    class FakeClient:
+        models = FakeModels()
+
+    app._resolved_gemini_model = "gemini-2.5-flash"
+    app.clear_cancel_gemini()
+
+    # stub helpers
+    orig_create = app.create_gemini_client
+    orig_resolve = app.resolve_gemini_model
+    orig_discover = app._discover_flash_models
+    orig_retry = app._call_with_retry
+
+    def fake_create(_key):
+        return FakeClient()
+
+    def fake_resolve(client, force_refresh=False):
+        return "gemini-2.5-flash"
+
+    def fake_discover(client):
+        return ["gemini-2.5-flash-lite"]
+
+    # Use real _call_with_retry but skip sleep
+    sleeps: list[float] = []
+
+    def fake_sleep(sec):
+        sleeps.append(sec)
+        return None
+
+    app.create_gemini_client = fake_create
+    app.resolve_gemini_model = fake_resolve
+    app._discover_flash_models = fake_discover
+    orig_sleep = app._sleep_with_cancel
+    app._sleep_with_cancel = fake_sleep
+    # Reduce retries for speed
+    old_max = app._MAX_RETRIES
+    app._MAX_RETRIES = 1
+    try:
+        text = app.generate_gemini_report("fake-key", "hello")
+        assert text.startswith("ok-from-")
+        assert "gemini-2.5-flash" in calls
+        # should have moved to another model
+        assert any(m != "gemini-2.5-flash" for m in calls)
+    finally:
+        app._MAX_RETRIES = old_max
+        app.create_gemini_client = orig_create
+        app.resolve_gemini_model = orig_resolve
+        app._discover_flash_models = orig_discover
+        app._sleep_with_cancel = orig_sleep
+
+
+def test_cancel_aborts_retry_sleep():
+    app.clear_cancel_gemini()
+    app.request_cancel_gemini()
+    try:
+        app._sleep_with_cancel(5)
+        raised = False
+    except RuntimeError as exc:
+        raised = "취소" in str(exc)
+    app.clear_cancel_gemini()
+    assert raised
+
+
+if __name__ == "__main__":
+    test_retryable_detects_503_and_overload_text()
+    print("PASS test_retryable_detects_503_and_overload_text")
+    test_generate_gemini_report_failsover_to_next_model()
+    print("PASS test_generate_gemini_report_failsover_to_next_model")
+    test_cancel_aborts_retry_sleep()
+    print("PASS test_cancel_aborts_retry_sleep")
