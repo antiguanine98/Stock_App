@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.57
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.58
 """
 
 from __future__ import annotations
@@ -116,21 +116,21 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.57"
+APP_VERSION = "v1.58"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
+# 연결/분석 안정성 우선: lite 먼저 (과부하·thinking 지연 적음)
 GEMINI_MODEL_PREFERENCES = [
-    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash-lite",
     "gemini-2.0-flash",
+    "gemini-2.5-flash",
     "gemini-flash-latest",
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
 ]
-# 과부하 시 우선 전환할 경량 모델 (primary 실패 직후)
+# 과부하 시 전환 후보 (primary와 중복 제거됨)
 GEMINI_FAILOVER_PREFERENCES = [
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash-lite",
@@ -138,9 +138,10 @@ GEMINI_FAILOVER_PREFERENCES = [
     "gemini-flash-latest",
 ]
 _resolved_gemini_model: str | None = None
-_MAX_MODEL_PROBES = 8
-_MAX_CASCADE_MODELS = 4  # 리포트/챗 호출당 최대 모델 수 (빠른 탈출)
+_MAX_MODEL_PROBES = 5  # 연결 테스트용 프로브 상한
+_MAX_CASCADE_MODELS = 2  # 분석: primary + backup 1개만
 _cancel_gemini: bool = False
+_discovered_flash_cache: list[str] | None = None
 
 APP_STYLE = """
 QMainWindow, QWidget {
@@ -446,10 +447,10 @@ def _is_auth_error(exc: BaseException) -> bool:
 
 
 _RETRYABLE_CODES = (429, 500, 502, 503, 504)
-_MAX_RETRIES = 1  # per-model: 최대 1회만 재시도 후 즉시 다음 모델
-_RETRY_BASE_SECONDS = 2
-_RETRY_MAX_WAIT = 8
-_HTTP_TIMEOUT_MS = 90_000  # 요청 타임아웃(ms) — 무한 대기로 멈춘 것처럼 방지
+_MAX_RETRIES = 0  # 분석 호출은 대기 재시도 없이 즉시 다음 모델
+_RETRY_BASE_SECONDS = 1
+_RETRY_MAX_WAIT = 3
+_HTTP_TIMEOUT_MS = 60_000  # 분석 요청 타임아웃(ms)
 
 
 def request_cancel_gemini() -> None:
@@ -512,8 +513,11 @@ def _is_model_unavailable_error(exc: BaseException) -> bool:
     return code in (404, 400, 429, 503, 504)
 
 
-def _discover_flash_models(client) -> list[str]:
-    """API에서 사용 가능한 Flash 계열 모델 ID를 조회 (실패 시 빈 목록)."""
+def _discover_flash_models(client, *, use_cache: bool = True) -> list[str]:
+    """API Flash 모델 ID 조회 — 결과는 캐시(분석 경로에서 반복 list 호출 방지)."""
+    global _discovered_flash_cache
+    if use_cache and _discovered_flash_cache is not None:
+        return list(_discovered_flash_cache)
     found: list[str] = []
     try:
         pager = client.models.list()
@@ -531,6 +535,7 @@ def _discover_flash_models(client) -> list[str]:
                 found.append(mid)
     except Exception as exc:
         log_gemini("WARN", f"모델 목록 조회 실패(고정 후보로 진행): {format_gemini_error(exc)}")
+    _discovered_flash_cache = list(found)
     return found
 
 
@@ -550,7 +555,7 @@ def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | 
 
 
 def _cascade_models(primary: str | None, discovered: list[str] | None = None) -> list[str]:
-    """과부하 탈출용 짧은 모델 체인 — primary 다음 lite 우선, 최대 N개."""
+    """분석용 짧은 체인 — sticky/primary + backup 1개 (list API 불필요)."""
     ordered: list[str] = []
 
     def _add(mid: str | None) -> None:
@@ -560,10 +565,14 @@ def _cascade_models(primary: str | None, discovered: list[str] | None = None) ->
     _add(primary)
     for mid in GEMINI_FAILOVER_PREFERENCES:
         _add(mid)
-    for mid in _candidate_models(prioritize=None, discovered=discovered):
+        if len(ordered) >= _MAX_CASCADE_MODELS:
+            break
+    for mid in GEMINI_MODEL_PREFERENCES:
         _add(mid)
         if len(ordered) >= _MAX_CASCADE_MODELS:
             break
+    # discovered는 연결 테스트에서만 쓰고, 분석 cascade는 고정 목록으로 충분
+    _ = discovered
     return ordered[:_MAX_CASCADE_MODELS]
 
 
@@ -692,10 +701,17 @@ def _call_with_retry(
     from google.genai import types
 
     retries = _MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+    # thinking 켜면 대형 리포트 프롬프트에서 수분 지연/빈 응답이 잦음 → 항상 0
     try:
-        gen_config = types.GenerateContentConfig(temperature=0.15)
+        gen_config = types.GenerateContentConfig(
+            temperature=0.15,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
     except Exception:
-        gen_config = None
+        try:
+            gen_config = types.GenerateContentConfig(temperature=0.15)
+        except Exception:
+            gen_config = None
 
     last_exc: BaseException | None = None
     for attempt in range(retries + 1):
@@ -730,12 +746,17 @@ def _call_with_retry(
 
 
 def generate_gemini_report(api_key: str, prompt: str) -> str:
-    """Gemini 호출 — 과부하 시 짧게 재시도 후 lite 등 대체 모델로 즉시 페일오버."""
+    """Gemini 분석 호출 — 연결 테스트에서 고른 모델로 바로 요청.
+
+    v1.56~1.57 회귀: 매 요청 models.list + 다단 재시도 + thinking 지연으로
+    분석이 수분간 멈추거나 실패함. 여기서는 list/probe 없이 sticky 모델
+    → backup 1회만 즉시 전환한다.
+    """
     global _resolved_gemini_model
     client = create_gemini_client(api_key)
-    primary = resolve_gemini_model(client)
-    discovered = _discover_flash_models(client)
-    candidates = _cascade_models(primary, discovered)
+    # 핫패스에서 resolve/list 금지 (이미 연결 테스트로 sticky 확보)
+    primary = _resolved_gemini_model or GEMINI_MODEL_PREFERENCES[0]
+    candidates = _cascade_models(primary)
 
     errors: list[str] = []
     last_exc: BaseException | None = None
@@ -743,21 +764,17 @@ def generate_gemini_report(api_key: str, prompt: str) -> str:
     for idx, model in enumerate(candidates):
         if _cancel_gemini:
             raise RuntimeError("사용자에 의해 AI 요청이 취소되었습니다.")
-        # primary만 1회 재시도, fallback은 단발(빠른 전환)
-        model_retries = _MAX_RETRIES if idx == 0 else 0
         if idx > 0:
-            msg = f"과부하 우회 — 대체 모델 ({idx + 1}/{total}): {model}"
+            msg = f"대체 모델 전환 ({idx + 1}/{total}): {model}"
             log_gemini("INFO", msg)
             if _retry_stage_callback:
                 _retry_stage_callback(msg)
         else:
-            log_gemini("INFO", f"AI 분석 요청 시작 (model={model}, cascade={total})")
+            log_gemini("INFO", f"AI 분석 요청 (model={model})")
             if _retry_stage_callback:
-                _retry_stage_callback(f"AI 응답 요청 중… ({model})")
+                _retry_stage_callback(f"AI 분석 중… ({model})")
         try:
-            response = _call_with_retry(
-                client, model, prompt, max_retries=model_retries
-            )
+            response = _call_with_retry(client, model, prompt, max_retries=0)
             out = extract_response_text(response)
             if out:
                 _resolved_gemini_model = model
@@ -769,22 +786,27 @@ def generate_gemini_report(api_key: str, prompt: str) -> str:
                 raise
             detail = format_gemini_error(exc)
             errors.append(f"{model}: {detail}")
-            # traceback 전체 dump는 과부하 루프에서 노이즈 → 메시지 위주
-            log_gemini("WARN", f"모델 실패 → 다음 후보 ({idx + 1}/{total}): {detail}")
+            log_gemini("WARN", f"모델 실패 → 다음 ({idx + 1}/{total}): {detail}")
             if _resolved_gemini_model == model:
                 _resolved_gemini_model = None
             if "취소" in str(exc):
                 raise
+            # quota는 cascade해도 무의미 — 즉시 실패 메시지
+            low = detail.lower()
+            if "quota" in low and "exhaust" in low.replace(" ", ""):
+                raise RuntimeError(
+                    "Gemini API 할당량(quota)이 소진된 것 같습니다.\n"
+                    f"{detail}"
+                ) from exc
             if not (_is_retryable_error(exc) or _is_model_unavailable_error(exc)):
                 raise
             last_exc = exc
             continue
 
-    summary = "\n".join(errors[:6]) if errors else "(상세 없음)"
+    summary = "\n".join(errors[:4]) if errors else "(상세 없음)"
     raise RuntimeError(
-        "Gemini 서버 과부하로 응답을 받지 못했습니다.\n"
-        f"대체 모델 {total}개를 짧게 시도했으나 모두 실패했습니다.\n"
-        "1~2분 뒤 다시 [분석 시작]/전송을 눌러 주세요. "
+        "AI 분석 요청에 실패했습니다.\n"
+        "과부하/타임아웃이면 잠시 후 다시 시도해 주세요. "
         "대기 중에는 [중단]으로 UI를 해제할 수 있습니다.\n\n"
         f"{summary}"
     ) from last_exc
