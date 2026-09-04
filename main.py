@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.64
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.65
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.64"
+APP_VERSION = "v1.65"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 서버 확인 최신 Flash — 탐색 실패 시에도 이 기본값으로 연결
@@ -2891,27 +2891,55 @@ class MainWindow(QMainWindow):
         )
 
     def _download_report_word(self) -> None:
-        """AI 리포트를 Word(.docx)로 저장 (QFileDialog)."""
+        """AI 리포트를 Word(.docx)로 저장 — 본문 검사·경량 변환·WaitCursor."""
         from PyQt6.QtWidgets import QFileDialog
 
-        if not self._initial_report:
-            QMessageBox.information(self, "안내", "먼저 AI 분석 리포트를 생성해 주세요.")
+        placeholder_hints = (
+            "생약표준품 분양·소진 예측 AI 리포트가 여기에 표시됩니다",
+            "엑셀 업로드 후",
+        )
+        viewer_text = ""
+        if hasattr(self, "report_fixed"):
+            try:
+                viewer_text = self.report_fixed.toPlainText().strip()
+            except Exception:
+                viewer_text = ""
+        report_text = (self._initial_report or "").strip() or viewer_text
+        if (
+            not report_text
+            or any(h in report_text for h in placeholder_hints)
+            or len(report_text) < 40
+        ):
+            QMessageBox.warning(
+                self,
+                "안내",
+                "내보낼 AI 분석 리포트가 없습니다. 먼저 분석을 완료해 주세요.",
+            )
             return
+
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Word 저장",
-            "생약표준품_AI_분석_리포트.docx",
-            "Word 문서 (*.docx)",
+            "Word 리포트 저장",
+            "생약표준품_AI_분석리포트.docx",
+            "Word Files (*.docx)",
         )
         if not path:
             return
         if not path.lower().endswith(".docx"):
             path += ".docx"
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            export_markdown_report_to_docx(self._initial_report, path)
+            export_markdown_report_to_docx(report_text, path)
+            QApplication.processEvents()
+            QMessageBox.information(self, "완료", "Word 파일 저장이 완료되었습니다.")
             self.statusBar().showMessage(f"Word 저장 완료: {path}", 5000)
         except Exception as exc:
-            QMessageBox.critical(self, "Word 저장 실패", str(exc))
+            QMessageBox.critical(
+                self, "저장 오류", f"Word 파일 생성 실패: {exc}"
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _download_report_pdf(self) -> None:
         """현재 렌더링된 리포트 서식을 PDF로 저장 (QPdfWriter)."""
