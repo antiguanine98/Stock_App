@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.60
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.61
 """
 
 from __future__ import annotations
@@ -116,41 +116,38 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.60"
+APP_VERSION = "v1.61"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
-# 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
-# API에서 안내하는 현재 Flash ID 우선 (2.0 계열은 404 retired)
+# Google API 안정 Flash만 사용 (가상 3.x·lite·latest 제외)
 GEMINI_MODEL_PREFERENCES = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-flash-latest",
-    "gemini-3.1-flash-lite",
+    "gemini-1.5-flash",
 ]
 GEMINI_FAILOVER_PREFERENCES = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
-    "gemini-flash-latest",
+    "gemini-1.5-flash",
 ]
-# 더 이상 제공되지 않는 모델 — 후보에서 제외
+# 미지원·가상·종료 모델 — 후보에서 제외
 GEMINI_RETIRED_MODELS = frozenset(
     {
         "gemini-2.0-flash",
         "gemini-2.0-flash-lite",
         "gemini-2.0-flash-001",
         "gemini-2.0-flash-lite-001",
-        "gemini-1.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash-lite-preview",
+        "gemini-flash-latest",
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.1-flash-lite",
         "gemini-1.5-flash-latest",
         "gemini-1.5-flash-001",
     }
 )
 _resolved_gemini_model: str | None = None
-_MAX_MODEL_PROBES = 6  # 연결 테스트용 프로브 상한
-_MAX_CASCADE_MODELS = 4  # 분석: 최대 4모델 (404 즉시 스킵)
+_MAX_MODEL_PROBES = 2  # 안정 모델 2개만 프로브
+_MAX_CASCADE_MODELS = 2  # 분석: 안정 모델 최대 2개
 _cancel_gemini: bool = False
 _discovered_flash_cache: list[str] | None = None
 
@@ -461,7 +458,7 @@ _RETRYABLE_CODES = (429, 500, 502, 503, 504)
 _MAX_RETRIES = 0  # 분석 호출은 대기 재시도 없이 즉시 다음 모델
 _RETRY_BASE_SECONDS = 1
 _RETRY_MAX_WAIT = 3
-_HTTP_TIMEOUT_MS = 60_000  # 분석 요청 타임아웃(ms)
+_HTTP_TIMEOUT_MS = 120_000  # 분석 요청 타임아웃(ms) — ReadTimeout 완화
 
 
 def request_cancel_gemini() -> None:
@@ -525,15 +522,21 @@ def _is_model_unavailable_error(exc: BaseException) -> bool:
 
 
 def _is_retired_model(model_id: str | None) -> bool:
-    """API에서 제거된(404) 모델 ID인지."""
+    """API에서 제거·미지원·가상 모델 ID인지."""
     if not model_id:
         return False
     mid = str(model_id).strip()
     if mid in GEMINI_RETIRED_MODELS:
         return True
-    # 2.0-flash* / 1.5-flash* 계열은 더 이상 사용하지 않음
     low = mid.lower()
-    if low.startswith("gemini-2.0-flash") or low.startswith("gemini-1.5-flash"):
+    # 2.0·3.x·lite·latest 계열은 사용하지 않음 (1.5-flash 본명은 허용)
+    if low.startswith("gemini-2.0-flash"):
+        return True
+    if low.startswith("gemini-3."):
+        return True
+    if "flash-lite" in low or low.endswith("-lite"):
+        return True
+    if "flash-latest" in low or low == "gemini-flash-latest":
         return True
     return False
 
@@ -589,22 +592,20 @@ def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | 
 
 
 def _cascade_models(primary: str | None, discovered: list[str] | None = None) -> list[str]:
-    """분석용 체인 — retired 제외, discover/선호 혼합, 최대 N개."""
+    """분석용 체인 — 안정 선호 모델만 (최대 2개). discover는 allowlist 검증용."""
     ordered: list[str] = []
+    allow = set(GEMINI_MODEL_PREFERENCES) | set(GEMINI_FAILOVER_PREFERENCES)
 
     def _add(mid: str | None) -> None:
-        if mid and not _is_retired_model(mid) and mid not in ordered:
+        if mid and mid in allow and not _is_retired_model(mid) and mid not in ordered:
             ordered.append(mid)
 
     _add(primary)
-    disc = [m for m in (discovered or []) if not _is_retired_model(m)]
+    disc = set(m for m in (discovered or []) if not _is_retired_model(m))
+    # API에 실제로 보이는 안정 모델 우선
     for preferred in GEMINI_FAILOVER_PREFERENCES:
         if preferred in disc:
             _add(preferred)
-        if len(ordered) >= _MAX_CASCADE_MODELS:
-            return ordered[:_MAX_CASCADE_MODELS]
-    for mid in disc:
-        _add(mid)
         if len(ordered) >= _MAX_CASCADE_MODELS:
             return ordered[:_MAX_CASCADE_MODELS]
     for mid in GEMINI_FAILOVER_PREFERENCES + list(GEMINI_MODEL_PREFERENCES):
@@ -873,20 +874,25 @@ def generate_gemini_report(api_key: str, prompt: str) -> str:
                     "Gemini API 할당량(quota)이 소진된 것 같습니다.\n"
                     f"{detail}"
                 ) from exc
-            # 404 retired 안내 문구에서 추천 모델이 있으면 후보에 끼워 넣기
+            # 404 안내의 추천 모델은 안정 allowlist에 있을 때만 추가
             if "no longer available" in low or "not_found" in low or "404" in low:
                 import re as _re
 
+                allow = set(GEMINI_MODEL_PREFERENCES) | set(GEMINI_FAILOVER_PREFERENCES)
                 suggested = _re.findall(
                     r"models/(gemini-[a-z0-9.-]*flash[a-z0-9.-]*)",
                     detail,
                     flags=_re.I,
                 )
                 for sug in suggested:
-                    if sug not in candidates and not _is_retired_model(sug):
+                    if (
+                        sug in allow
+                        and sug not in candidates
+                        and not _is_retired_model(sug)
+                    ):
                         candidates.append(sug)
                         total = len(candidates)
-                        log_gemini("INFO", f"API 추천 모델을 후보에 추가: {sug}")
+                        log_gemini("INFO", f"API 추천 안정 모델을 후보에 추가: {sug}")
             if not (_is_retryable_error(exc) or _is_model_unavailable_error(exc)):
                 raise
             last_exc = exc
