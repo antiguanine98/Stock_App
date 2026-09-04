@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.58
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.59
 """
 
 from __future__ import annotations
@@ -116,26 +116,28 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.58"
+APP_VERSION = "v1.59"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 연결 안정성 우선: 광범위 가용 모델 → 최신 후보 순
-# 연결/분석 안정성 우선: lite 먼저 (과부하·thinking 지연 적음)
+# 연결/분석 안정성 우선: 널리 쓰이는 Flash ID 우선
 GEMINI_MODEL_PREFERENCES = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
     "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-flash-latest",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash-lite-001",
 ]
-# 과부하 시 전환 후보 (primary와 중복 제거됨)
+# 과부하 시 전환 후보
 GEMINI_FAILOVER_PREFERENCES = [
-    "gemini-2.5-flash-lite",
     "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
     "gemini-flash-latest",
+    "gemini-1.5-flash",
 ]
 _resolved_gemini_model: str | None = None
 _MAX_MODEL_PROBES = 5  # 연결 테스트용 프로브 상한
@@ -583,11 +585,13 @@ def extract_response_text(response: Any) -> str | None:
     return None
 
 
-def _probe_model(client, model: str) -> bool:
-    """모델이 generate_content에 응답하는지 짧게 검증.
+def _probe_model(client, model: str) -> str:
+    """모델 짧은 검증.
 
-    thinking 모델은 낮은 max_output_tokens에서 본문이 비는 경우가 있어
-    토큰 여유를 두고, 후보(candidates)만 있어도 가용으로 본다.
+    Returns:
+        "ok"         — 정상 응답
+        "overloaded" — 키/모델은 유효하나 503/429 등 일시 과부하
+        "fail"       — 모델 없음·기타 실패
     """
     from google.genai import types
 
@@ -606,17 +610,27 @@ def _probe_model(client, model: str) -> bool:
             config=config,
         )
         if extract_response_text(response) is not None:
-            return True
+            return "ok"
         candidates = getattr(response, "candidates", None) or []
-        return bool(candidates)
+        return "ok" if candidates else "fail"
     except Exception as exc:
         if _is_auth_error(exc):
             raise
-        log_gemini("WARN", f"모델 사용 불가, 건너뜀: {model} ({format_gemini_error(exc)})")
-        return False
+        detail = format_gemini_error(exc)
+        # 과부하는 "모델 없음"이 아님 — API Key는 유효함
+        if _is_retryable_error(exc):
+            log_gemini("WARN", f"모델 일시 과부하: {model} ({detail})")
+            return "overloaded"
+        log_gemini("WARN", f"모델 사용 불가, 건너뜀: {model} ({detail})")
+        return "fail"
 
 
 def resolve_gemini_model(client, force_refresh: bool = False) -> str:
+    """연결에 쓸 Flash 모델 선택.
+
+    모든 후보가 과부하(503/429)여도 API Key가 유효하면 해당 모델을 채택한다.
+    (이전에는 과부하를 '모델 없음'으로 오판해 연결 테스트가 실패했음)
+    """
     global _resolved_gemini_model
     if _resolved_gemini_model and not force_refresh:
         return _resolved_gemini_model
@@ -626,15 +640,21 @@ def resolve_gemini_model(client, force_refresh: bool = False) -> str:
         log_gemini("INFO", f"API Flash 모델 목록: {', '.join(discovered[:12])}")
 
     errors: list[str] = []
+    overloaded: list[str] = []
     for model in _candidate_models(
         prioritize=_resolved_gemini_model, discovered=discovered
     ):
         log_gemini("INFO", f"모델 후보 검증: {model}")
         try:
-            if _probe_model(client, model):
+            status = _probe_model(client, model)
+            if status == "ok":
                 _resolved_gemini_model = model
                 log_gemini("INFO", f"사용 모델 선택: {model}")
                 return model
+            if status == "overloaded":
+                overloaded.append(model)
+                errors.append(f"{model}: 일시 과부하(서버 busy)")
+                continue
             errors.append(f"{model}: 응답 없음 또는 사용 불가")
         except Exception as exc:
             if _is_auth_error(exc):
@@ -642,6 +662,13 @@ def resolve_gemini_model(client, force_refresh: bool = False) -> str:
             detail = format_gemini_error(exc)
             errors.append(f"{model}: {detail}")
             log_gemini("ERROR", f"모델 검증 실패: {model} — {detail}", exc)
+
+    # 키는 유효하고 서버만 바쁜 경우 → 연결 성공으로 간주
+    if overloaded:
+        pick = overloaded[0]
+        _resolved_gemini_model = pick
+        log_gemini("INFO", f"과부하 상태지만 모델 채택(연결 유지): {pick}")
+        return pick
 
     detail = "\n".join(errors[:10]) if errors else "(후보 모델 없음)"
     raise RuntimeError(
@@ -675,10 +702,14 @@ def test_gemini_connection(api_key: str) -> tuple[bool, str]:
     client = create_gemini_client(api_key)
     log_gemini("INFO", "연결 테스트 시작")
     if _resolved_gemini_model:
-        if _probe_model(client, _resolved_gemini_model):
+        status = _probe_model(client, _resolved_gemini_model)
+        if status == "ok":
             return True, f"연결됨 ({_resolved_gemini_model})"
+        if status == "overloaded":
+            return True, f"연결됨 ({_resolved_gemini_model}) — 서버 일시 과부하"
         _resolved_gemini_model = None
     model = resolve_gemini_model(client, force_refresh=True)
+    # resolve가 overloaded 채택한 경우 안내
     return True, f"연결됨 ({model})"
 
 

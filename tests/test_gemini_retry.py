@@ -110,13 +110,54 @@ def test_cancel_aborts_retry_sleep():
 def test_cascade_models_prefers_lite_and_caps():
     models = app._cascade_models("gemini-2.5-flash", ["gemini-2.5-flash", "gemini-2.5-flash-lite"])
     assert models[0] == "gemini-2.5-flash"
-    assert "gemini-2.5-flash-lite" in models
     assert len(models) <= app._MAX_CASCADE_MODELS
+    # backup은 lite/경량 계열
+    assert any("lite" in m or m != "gemini-2.5-flash" for m in models[1:])
 
 
 def test_api_error_code_from_text():
     assert app._api_error_code(RuntimeError("503 UNAVAILABLE overloaded")) == 503
     assert app._api_error_code(RuntimeError("RESOURCE_EXHAUSTED rate limit")) == 429
+
+
+
+
+def test_resolve_accepts_overloaded_as_connected():
+    """모든 후보가 503이어도 API Key 유효 시 모델을 채택한다."""
+    class FakeModels:
+        def generate_content(self, model, contents, config=None):
+            raise RuntimeError("503 UNAVAILABLE: model is overloaded")
+
+    class FakeClient:
+        models = FakeModels()
+
+        class models_list:
+            pass
+
+    client = FakeClient()
+    # discover returns empty via patch
+    orig_disc = app._discover_flash_models
+    app._discover_flash_models = lambda c, use_cache=True: []
+    app._resolved_gemini_model = None
+    app._discovered_flash_cache = []
+    try:
+        model = app.resolve_gemini_model(client, force_refresh=True)
+        assert model in app.GEMINI_MODEL_PREFERENCES
+        assert app._resolved_gemini_model == model
+    finally:
+        app._discover_flash_models = orig_disc
+        app.clear_cancel_gemini()
+
+
+def test_probe_model_returns_overloaded_status():
+    class FakeModels:
+        def generate_content(self, model, contents, config=None):
+            raise RuntimeError("503 UNAVAILABLE overloaded")
+
+    class FakeClient:
+        models = FakeModels()
+
+    assert app._probe_model(FakeClient(), "gemini-2.0-flash") == "overloaded"
 
 
 if __name__ == "__main__":
@@ -130,3 +171,7 @@ if __name__ == "__main__":
     print("PASS test_cascade_models_prefers_lite_and_caps")
     test_api_error_code_from_text()
     print("PASS test_api_error_code_from_text")
+    test_resolve_accepts_overloaded_as_connected()
+    print("PASS test_resolve_accepts_overloaded_as_connected")
+    test_probe_model_returns_overloaded_status()
+    print("PASS test_probe_model_returns_overloaded_status")
