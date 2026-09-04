@@ -1123,6 +1123,139 @@ def test_normalize_excel_path_filters_temp_and_empty():
         os.remove(good)
 
 
+
+def test_name_ko_stock_grouping_and_zero_filter():
+    """동일 한글명 로트 중 하나라도 재고가 있으면 품목은 재고 보유."""
+    from stock_logic import (
+        StockItem,
+        StockPoint,
+        build_name_ko_stock_map,
+        group_by_depletion_category_items,
+        is_name_level_zero_stock,
+        name_ko_group_has_stock,
+        ZERO_STOCK_CATEGORY,
+    )
+    from datetime import date
+
+    def _item(code, name, qty, *, start=10.0):
+        it = StockItem(manage_no=code, name_ko=name, std_type="표준생약", balance=qty)
+        # AI 대상은 수량 변동 이력이 있어야 함
+        it.corrected_points = [
+            StockPoint(change_date=date(2022, 12, 31), quantity=float(start)),
+            StockPoint(change_date=date(2024, 12, 31), quantity=float(qty)),
+        ]
+        return it
+
+    items = [
+        _item("B-1", "베타인", 0, start=5),
+        _item("B-2", "베타인", 3, start=8),
+        _item("Z-1", "제로만", 0, start=4),
+    ]
+    m = build_name_ko_stock_map(items)
+    assert m["베타인"]["has_stock"] is True
+    assert m["베타인"]["total_qty"] == 3
+    assert m["제로만"]["has_stock"] is False
+    assert name_ko_group_has_stock(items[0], m) is True
+    assert is_name_level_zero_stock(items[0], m) is False
+    assert is_name_level_zero_stock(items[2], m) is True
+
+    cats = group_by_depletion_category_items(items, name_ko_map=m)
+    zero_names = {r.get("name_ko") for r in cats.get(ZERO_STOCK_CATEGORY) or []}
+    assert "베타인" not in zero_names
+    assert "제로만" in zero_names
+
+
+def test_name_en_inventory_group_compendium_match():
+    """영문명 동일 로트는 공정서 매칭·통계에서 1건으로 집계."""
+    from stock_logic import (
+        CompendiumEntry,
+        StockItem,
+        attach_compendium_match_to_flags,
+        build_name_en_inventory_groups,
+        collect_ai_analysis_flags,
+        match_compendium_inventory,
+    )
+
+    entries = [
+        CompendiumEntry(name_ko="노포", name_en="Nofo Extract", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="감초", name_en="Glycyrrhizae Radix", pharmacopoeia="KP"),
+    ]
+    items = [
+        StockItem(manage_no="NOFO2009", name_ko="노포A", name_en="Nofo Extract", balance=1),
+        StockItem(manage_no="NOFO2023", name_ko="노포B", name_en="Nofo Extract", balance=2),
+        StockItem(manage_no="G1", name_ko="감초", name_en="Glycyrrhizae Radix", balance=5),
+    ]
+    groups = build_name_en_inventory_groups(items)
+    assert len(groups) == 2
+    match = match_compendium_inventory(entries, items)
+    assert match["stats"]["unique_inventory_groups"] == 2
+    assert match["stats"]["inventory_matched"] == 2
+    assert match["stats"]["inventory_matched_lots"] == 3
+    assert len(match.get("name_en_match_map") or {}) == 2
+
+    flags = collect_ai_analysis_flags(items)
+    flags = attach_compendium_match_to_flags(flags, match)
+    maps = flags.get("chat_analysis_maps") or {}
+    assert maps.get("name_en_match_map")
+    assert maps.get("name_ko_stock_map")
+
+
+def test_report_nav_has_no_other_tab():
+    from stock_logic import split_markdown_report_sections
+
+    md = (
+        "## 1페이지 요약 대시보드\n\n요약본문\n\n"
+        "## 소진 예상\n\n소진본문\n\n"
+        "## 예기치 않은 잔여 섹션\n\n잔여본문\n"
+    )
+    secs = split_markdown_report_sections(md)
+    assert all(s.get("id") != "other" for s in secs)
+    assert all(s.get("short") != "기타" for s in secs)
+    summary = next(s for s in secs if s["id"] == "summary")
+    assert "잔여본문" in summary["markdown"]
+
+
+def test_chatbot_prompt_persona_and_maps_json():
+    from stock_logic import (
+        StockItem,
+        build_ai_prompt,
+        build_followup_prompt,
+        collect_ai_analysis_flags,
+        format_chat_analysis_maps_json,
+    )
+
+    items = [StockItem(manage_no="1", name_ko="감초", balance=10)]
+    flags = collect_ai_analysis_flags(items)
+    j = format_chat_analysis_maps_json(flags)
+    assert "구조화 분석 맵 JSON" in j
+    assert "name_ko_stock_summary" in j
+    prompt = build_ai_prompt(items, flags=flags)
+    assert "최고 수석 데이터 분석가" in prompt
+    assert "현황 수치" in prompt and "권고 액션 플랜" in prompt
+    assert "구조화 분석 맵 JSON" in prompt
+    fu = build_followup_prompt("초기", "위험 품목은?", items=items, flags=flags)
+    assert "최고 수석 데이터 분석가" in fu
+    assert "권고 액션 플랜" in fu
+    assert "구조화 분석 맵 JSON" in fu
+
+
+def test_export_markdown_report_to_docx(tmp_path=None):
+    import tempfile
+    from pathlib import Path
+    from stock_logic import export_markdown_report_to_docx
+
+    md = (
+        "## 요약\n\n**중요** 본문입니다.\n\n"
+        "- 항목 하나\n"
+        "- 항목 둘\n\n"
+        "| 이름 | 값 |\n| --- | --- |\n| 감초 | 1 |\n"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "report.docx"
+        export_markdown_report_to_docx(md, out)
+        assert out.exists() and out.stat().st_size > 1000
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -1156,6 +1289,11 @@ if __name__ == "__main__":
         test_excel_engine_branch_and_badzip_fallback,
         test_process_excels_skips_failed_file,
         test_normalize_excel_path_filters_temp_and_empty,
+        test_name_ko_stock_grouping_and_zero_filter,
+        test_name_en_inventory_group_compendium_match,
+        test_report_nav_has_no_other_tab,
+        test_chatbot_prompt_persona_and_maps_json,
+        test_export_markdown_report_to_docx,
     ]
     failed = 0
     for fn in tests:
