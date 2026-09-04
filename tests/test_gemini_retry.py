@@ -105,6 +105,20 @@ def test_cancel_aborts_retry_sleep():
     assert raised
 
 
+
+
+def test_cascade_models_prefers_lite_and_caps():
+    models = app._cascade_models("gemini-2.5-flash", ["gemini-2.5-flash", "gemini-2.5-flash-lite"])
+    assert models[0] == "gemini-2.5-flash"
+    assert "gemini-2.5-flash-lite" in models
+    assert len(models) <= app._MAX_CASCADE_MODELS
+
+
+def test_api_error_code_from_text():
+    assert app._api_error_code(RuntimeError("503 UNAVAILABLE overloaded")) == 503
+    assert app._api_error_code(RuntimeError("RESOURCE_EXHAUSTED rate limit")) == 429
+
+
 if __name__ == "__main__":
     test_retryable_detects_503_and_overload_text()
     print("PASS test_retryable_detects_503_and_overload_text")
@@ -112,3 +126,7 @@ if __name__ == "__main__":
     print("PASS test_generate_gemini_report_failsover_to_next_model")
     test_cancel_aborts_retry_sleep()
     print("PASS test_cancel_aborts_retry_sleep")
+    test_cascade_models_prefers_lite_and_caps()
+    print("PASS test_cascade_models_prefers_lite_and_caps")
+    test_api_error_code_from_text()
+    print("PASS test_api_error_code_from_text")
