@@ -64,7 +64,8 @@ jobs:
           generate_release_notes: true
           body: |
             ## Summary
-            - 리포트 목록 표 `(중략)` 생략 제거(전수 정량 표)
+            - Gemini 일시 과부하 시 대체 Flash(2.5/3.5) 빠른 페일오버
+            - 동일 연도 내 재고 변동 시 AI 분석 스킵되던 오류 수정
 
             ## Assets
             - `${{ steps.exe.outputs.name }}` (Windows one-file, Python 3.12 / PE VERSIONINFO 포함)
