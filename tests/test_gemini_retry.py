@@ -28,11 +28,12 @@ def test_generate_retries_same_model_not_omni():
     class FakeModels:
         def generate_content(self, model, contents, config=None):
             calls.append(model)
-            if len(calls) < 3:
-                raise RuntimeError("429 RESOURCE_EXHAUSTED: input_token_count Quota Exceeded")
+            # 첫 모델은 과부하 → 재시도 1회 후 페일오버
+            if model == "gemini-3.6-flash":
+                raise RuntimeError("503 UNAVAILABLE: The model is overloaded")
 
             class R:
-                text = "ok-after-retry"
+                text = "ok-after-failover"
                 candidates = [1]
 
             return R()
@@ -48,13 +49,26 @@ def test_generate_retries_same_model_not_omni():
     app._sleep_with_cancel = lambda sec: sleeps.append(sec)
     try:
         text = app.generate_gemini_report("fake-key", "hello")
-        assert text == "ok-after-retry"
-        assert all(c == "gemini-3.6-flash" for c in calls)
+        assert text == "ok-after-failover"
+        assert calls[0] == "gemini-3.6-flash"
+        assert "gemini-2.5-flash" in calls
         assert "omni" not in "".join(calls).lower()
-        assert sleeps == [3.0, 3.0]
+        # 모델당 재시도 1회 → 3.6에 대해 sleep 1회
+        assert sleeps == [2.0]
+        assert app._resolved_gemini_model == "gemini-2.5-flash"
     finally:
         app.create_gemini_client = orig_create
         app._sleep_with_cancel = orig_sleep
+
+
+def test_cascade_models_includes_failover_backups():
+    app._resolved_gemini_model = None
+    models = app._cascade_models("gemini-3.6-flash")
+    assert models[0] == "gemini-3.6-flash"
+    assert "gemini-2.5-flash" in models
+    assert len(models) >= 2
+    assert len(models) <= app._MAX_CASCADE_MODELS
+    assert all("omni" not in m for m in models)
 
 
 def test_cancel_aborts_retry_sleep():
@@ -218,6 +232,8 @@ if __name__ == "__main__":
     print("PASS test_retryable_detects_503_and_overload_text")
     test_generate_retries_same_model_not_omni()
     print("PASS test_generate_retries_same_model_not_omni")
+    test_cascade_models_includes_failover_backups()
+    print("PASS test_cascade_models_includes_failover_backups")
     test_cancel_aborts_retry_sleep()
     print("PASS test_cancel_aborts_retry_sleep")
     test_default_model_is_36_flash()
