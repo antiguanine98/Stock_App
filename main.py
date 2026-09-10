@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.66
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.67
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.66"
+APP_VERSION = "v1.67"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 서버 확인 최신 Flash — 탐색 실패 시에도 이 기본값으로 연결
@@ -2280,7 +2280,9 @@ class MainWindow(QMainWindow):
         # AI/챗봇 스냅샷과 동기화
         flags = self.inventory_data.get("ai_flags")
         if isinstance(flags, dict) or flags is None:
-            self.inventory_data["ai_flags"] = attach_compendium_match_to_flags(flags, match)
+            self.inventory_data["ai_flags"] = attach_compendium_match_to_flags(
+                flags, match, items=stock_items
+            )
         return match
 
     def _pharmacopoeia_tag_for_item(self, item: dict[str, Any] | StockItem | str) -> str:
@@ -3059,7 +3061,9 @@ class MainWindow(QMainWindow):
         flags = dict(data.get("ai_flags") or {})
         match = data.get("compendium_match")
         if match:
-            flags = attach_compendium_match_to_flags(flags, match)
+            flags = attach_compendium_match_to_flags(
+                flags, match, items=list(data.get("stock_items") or [])
+            )
         return flags, match
 
     def _render_report_html(self) -> None:
@@ -3203,7 +3207,9 @@ class MainWindow(QMainWindow):
         if "ai_flags" not in data:
             data["ai_flags"] = collect_ai_analysis_flags(stock_items)
         match = data.get("compendium_match") or {}
-        data["ai_flags"] = attach_compendium_match_to_flags(data.get("ai_flags"), match)
+        data["ai_flags"] = attach_compendium_match_to_flags(
+            data.get("ai_flags"), match, items=stock_items
+        )
         self._chat_history.clear()
         self._initial_report = ""
         if hasattr(self, "btn_dl_word"):
@@ -3376,6 +3382,7 @@ class MainWindow(QMainWindow):
             ai_flags = attach_compendium_match_to_flags(
                 self.inventory_data.get("ai_flags"),
                 self.inventory_data.get("compendium_match"),
+                items=stock_items,
             )
             self.inventory_data["ai_flags"] = ai_flags
         compendium_df = self.compendium_df

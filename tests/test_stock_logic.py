@@ -278,7 +278,15 @@ def test_decrease_only_excludes_increases():
     )
     stats = estimate_depletion(item)
     assert stats["increase_segments_excluded"] >= 1
-    assert stats["acceleration"] in ("급가속", "증가", "안정", "감소")
+    assert stats["acceleration"] in (
+        "신규수요",
+        "급증",
+        "증가",
+        "안정",
+        "감소",
+        "급감",
+        "분석불가/자료부족",
+    )
     assert stats["stock_value"] == 70 * 500
 
 
@@ -469,14 +477,14 @@ def test_ensure_mandatory_report_sections():
             "summary_lines": ["요약"],
         },
         "depletion_category_items": {
-            "1년 이내": [
+            "긴급제조(<1년)": [
                 {
                     "name_ko": "소진품A",
                     "manage_no": "D-001",
                     "std_type": "표준생약",
                     "last_qty": 10,
                     "deplete_ym": "2026년 12월",
-                    "depletion_category": "1년 이내",
+                    "depletion_category": "긴급제조(<1년)",
                     "risk_grade": "위험",
                 }
             ],
@@ -614,7 +622,7 @@ def test_ensure_accel_monitoring_section_always_has_body():
             "manage_no": "A-001",
             "std_type": "표준생약",
             "last_qty": 120,
-            "acceleration": "급가속",
+            "acceleration": "급증",
             "acceleration_ratio": 2.5,
             "annual_rate": 40.0,
             "deplete_ym": "2027년 03월",
@@ -638,7 +646,7 @@ def test_ensure_accel_monitoring_section_always_has_body():
     bare = "## 1페이지 요약 대시보드\n\n요약입니다.\n\n## 소진 예상\n\n소진 내용\n"
     filled = ensure_accel_monitoring_in_report(bare, monitoring)
     assert "## 분양 가속 모니터링" in filled
-    assert "가속품A" in filled and "급가속" in filled
+    assert "가속품A" in filled and "급증" in filled
     assert "증가품B" in filled
     secs = split_markdown_report_sections(filled, monitoring=monitoring)
     accel = next(s for s in secs if s["id"] == "accel")
@@ -964,17 +972,190 @@ def test_deplete_ym_uses_today_not_past_survey_date():
         corrected_points=[
             StockPoint(date(2015, 1, 1), 300),
             StockPoint(date(2018, 6, 1), 120),
-            StockPoint(date(2020, 1, 1), 100),
+            StockPoint(date(2020, 1, 1), 40),
         ],
     )
     stats = estimate_depletion(item)
     assert stats["years_left"] is not None
     assert stats["deplete_ym"] is not None
-    year = int(str(stats["deplete_ym"]).split("년")[0])
-    month = int(str(stats["deplete_ym"]).split("년")[1].replace("월", "").strip())
+    ym = str(stats["deplete_ym"])
+    if "장기저수요" in ym or "휴면재고" in ym:
+        assert stats["years_left"] >= 15.0 or stats.get("recent_annual_rate") in (None, 0)
+        return
+    year = int(ym.split("년")[0])
+    month = int(ym.split("년")[1].replace("월", "").strip())
     target = date(year, month, 1)
     today = date.today().replace(day=1)
     assert target >= today
+
+
+def test_acceleration_seven_tiers_and_no_cap():
+    from stock_logic import acceleration_from_rates
+
+    new = acceleration_from_rates(0.0, 5.0)
+    assert new["label"] == "신규수요"
+    assert new["ratio"] is None  # Cap 3.0 제거
+    assert new["is_surge"] is True
+
+    surge = acceleration_from_rates(10.0, 25.0)
+    assert surge["label"] == "급증" and abs(surge["ratio"] - 2.5) < 1e-9
+
+    up = acceleration_from_rates(10.0, 15.0)
+    assert up["label"] == "증가"
+
+    stable = acceleration_from_rates(10.0, 10.0)
+    assert stable["label"] == "안정"
+
+    down = acceleration_from_rates(10.0, 6.0)
+    assert down["label"] == "감소"
+
+    crash = acceleration_from_rates(10.0, 4.0)
+    assert crash["label"] == "급감"
+
+    empty = acceleration_from_rates(0.0, 0.0)
+    assert empty["label"] == "분석불가/자료부족"
+
+    low = acceleration_from_rates(0.2, 0.5)
+    assert low["label"] == "급증"
+    assert low["low_volume_intermittent"] is True
+
+
+def test_coverage_long_low_and_manufacture_reduce():
+    from stock_logic import (
+        LONG_LOW_DEMAND_CATEGORY,
+        DORMANT_STOCK_CATEGORY,
+        MANUFACTURE_REDUCE_RECOMMENDATION,
+        collect_ai_analysis_flags,
+        estimate_depletion,
+        format_deplete_ym,
+        select_long_term_low_items,
+    )
+
+    assert format_deplete_ym(20.0, recent_rate=1.0) == LONG_LOW_DEMAND_CATEGORY
+    assert format_deplete_ym(None, recent_rate=0.0) == DORMANT_STOCK_CATEGORY
+
+    # 재고 많음 + 최근 저분양 → 장기저수요 + 과다재고 → 제조 축소/보존
+    item = StockItem(
+        manage_no="LOW-01",
+        name_ko="저분양과다",
+        std_type="표준생약",
+        unit_price=1000,
+        corrected_points=[
+            StockPoint(date(2018, 1, 1), 500),
+            StockPoint(date(2019, 1, 1), 499),
+            StockPoint(date(2020, 1, 1), 498),
+            StockPoint(date(2021, 1, 1), 497),
+            StockPoint(date(2022, 1, 1), 496.5),
+            StockPoint(date(2023, 1, 1), 496),
+            StockPoint(date(2024, 1, 1), 495.5),
+            StockPoint(date(2025, 1, 1), 495),
+        ],
+    )
+    stats = estimate_depletion(item)
+    assert stats["long_term_low"] is True
+    assert stats["overstock"] is True
+    assert stats["manufacture_reduce"] is True
+    assert stats["deplete_ym"] == LONG_LOW_DEMAND_CATEGORY
+    assert stats["depletion_category"] == LONG_LOW_DEMAND_CATEGORY
+
+    rows = select_long_term_low_items([item])
+    assert len(rows) >= 1
+    assert rows[0]["recommendation"] == MANUFACTURE_REDUCE_RECOMMENDATION
+    flags = collect_ai_analysis_flags([item])
+    assert len(flags.get("manufacture_reduce_items") or []) >= 1
+
+
+def test_manufacture_need_score_excludes_reliability():
+    from stock_logic import (
+        apply_manufacture_need_scores,
+        estimate_depletion,
+        get_depletion_stats,
+        manufacturing_priority_score,
+    )
+
+    # 동일 커버리지·수요·가속도에서 신뢰도만 달라도 점수 동일
+    a = manufacturing_priority_score(
+        years_left=2.0,
+        acceleration_label="급증",
+        demand_percentile=0.8,
+        pharmacopoeia_weight=1.0,
+        reliability_score=1.0,
+    )
+    b = manufacturing_priority_score(
+        years_left=2.0,
+        acceleration_label="급증",
+        demand_percentile=0.8,
+        pharmacopoeia_weight=1.0,
+        reliability_score=0.25,
+    )
+    assert a == b
+    assert 0 <= a <= 100
+
+    items = []
+    for i, qty in enumerate((80, 60, 40)):
+        items.append(
+            StockItem(
+                manage_no=f"P{i}",
+                name_ko=f"점수{i}",
+                std_type="표준생약",
+                corrected_points=[
+                    StockPoint(date(2021, 1, 1), qty + 60),
+                    StockPoint(date(2022, 1, 1), qty + 40),
+                    StockPoint(date(2023, 1, 1), qty + 20),
+                    StockPoint(date(2024, 1, 1), qty),
+                ],
+            )
+        )
+    cache = {}
+    for it in items:
+        get_depletion_stats(it, cache)
+    apply_manufacture_need_scores(
+        items,
+        cache,
+        match_result={"by_manage_no": {"P0": "KP", "P1": "KHP"}, "by_label": {}},
+    )
+    s0 = cache["P0"]["priority_score"]
+    s1 = cache["P1"]["priority_score"]
+    assert s0 > s1  # KP 가중치
+    assert "reliability" in cache["P0"]
+    assert cache["P0"]["pharmacopoeia_weight"] == 1.0
+    assert cache["P1"]["pharmacopoeia_weight"] == 0.5
+
+
+def test_compendium_herb_vs_origin_and_hwonchogeun_khp():
+    from stock_logic import (
+        CompendiumEntry,
+        StockItem,
+        format_compendium_stats_markdown,
+        match_compendium_inventory,
+        _normalize_compendium_pharmacopoeia,
+    )
+
+    assert _normalize_compendium_pharmacopoeia("훤초근", "") == "KHP"
+    assert _normalize_compendium_pharmacopoeia("훤초근", "KP") == "KP"
+
+    entries = [
+        CompendiumEntry(name_ko="감초", origin_ko="기원A", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="감초", origin_ko="기원B", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="당귀", origin_ko="기원C", pharmacopoeia="KHP"),
+        CompendiumEntry(name_ko="훤초근", origin_ko="기원D", pharmacopoeia=""),
+    ]
+    items = [StockItem(manage_no="1", name_ko="감초", std_type="표준생약")]
+    match = match_compendium_inventory(entries, items)
+    st = match["stats"]
+    assert st["herb_total"] == 3  # 감초·당귀·훤초근
+    assert st["origin_total"] == 4
+    assert st["herb_held"] == 1
+    assert st["herb_missing"] == 2
+    assert st["origin_held"] == 1
+    assert st["origin_missing"] == 3
+    assert any(e.pharmacopoeia == "KHP" for e in entries if e.name_ko == "훤초근")
+    md = format_compendium_stats_markdown(match)
+    assert "품목 기준" in md and "기원식물 기준" in md
+    assert "품목 확보율" in md and "기원 확보율" in md
+    # 미보유를 기원 전체로만 왜곡하지 않음
+    assert "미보유 생약 수: **2건**" in md
+    assert "미확보 기원 수: **3건**" in md
 
 
 def test_strip_duplicate_auto_summary_opinion():
@@ -1344,6 +1525,10 @@ if __name__ == "__main__":
         test_scatter_cat_label,
         test_scatter3d_records_from_sample,
         test_deplete_ym_uses_today_not_past_survey_date,
+        test_acceleration_seven_tiers_and_no_cap,
+        test_coverage_long_low_and_manufacture_reduce,
+        test_manufacture_need_score_excludes_reliability,
+        test_compendium_herb_vs_origin_and_hwonchogeun_khp,
         test_strip_duplicate_auto_summary_opinion,
         test_manufacture_section_always_has_priority_formula,
         test_unique_missing_compendium_examples,
