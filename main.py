@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.68
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.70
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.68"
+APP_VERSION = "v1.70"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 서버 확인 최신 Flash — 탐색 실패 시에도 이 기본값으로 연결
@@ -124,10 +124,13 @@ GEMINI_DEFAULT_MODEL = "gemini-3.6-flash"
 GEMINI_MODEL_PREFERENCES = [
     "gemini-3.6-flash",
     "gemini-2.5-flash",
+    "gemini-3.5-flash",
 ]
+# 과부하 시 우선 전환할 대체 Flash (기본과 다른 용량 풀 우선)
 GEMINI_FAILOVER_PREFERENCES = [
-    "gemini-3.6-flash",
     "gemini-2.5-flash",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
 ]
 # 할당량 0·종료·미지원 모델 (omni 등)
 GEMINI_RETIRED_MODELS = frozenset(
@@ -147,7 +150,7 @@ GEMINI_RETIRED_MODELS = frozenset(
 )
 _resolved_gemini_model: str | None = None
 _MAX_MODEL_PROBES = 6
-_MAX_CASCADE_MODELS = 1  # 분석은 sticky/기본 1개 + 동일 모델 재시도
+_MAX_CASCADE_MODELS = 3  # sticky + 대체 Flash 최대 3개 (빠른 과부하 우회)
 _cancel_gemini: bool = False
 _discovered_flash_cache: list[str] | None = None
 
@@ -455,10 +458,11 @@ def _is_auth_error(exc: BaseException) -> bool:
 
 
 _RETRYABLE_CODES = (429, 500, 502, 503, 504)
-_MAX_RETRIES = 2  # 동일 모델 최대 2회 재시도
-_RETRY_BASE_SECONDS = 3  # 실패 시 고정 3초 대기
-_RETRY_MAX_WAIT = 3
+_MAX_RETRIES = 1  # 모델당 재시도 1회 → 실패 시 대체 모델로 빠르게 전환
+_RETRY_BASE_SECONDS = 2  # 짧은 대기 후 재시도/페일오버
+_RETRY_MAX_WAIT = 2
 _HTTP_TIMEOUT_MS = 120_000  # 분석 요청 타임아웃(ms) — ReadTimeout 완화
+_PER_MODEL_RETRIES = 1  # cascade 경로에서 모델당 재시도 횟수
 
 
 def request_cancel_gemini() -> None:
@@ -672,7 +676,7 @@ def _candidate_models(prioritize: str | None = None, *, discovered: list[str] | 
 
 
 def _cascade_models(primary: str | None, discovered: list[str] | None = None) -> list[str]:
-    """분석용 — sticky/기본 1개 (omni 페일오버 금지)."""
+    """분석용 후보 — sticky 우선, 과부하 시 대체 Flash로 전환 (omni 제외)."""
     ordered: list[str] = []
 
     def _add(mid: str | None) -> None:
@@ -680,9 +684,18 @@ def _cascade_models(primary: str | None, discovered: list[str] | None = None) ->
             ordered.append(mid)
 
     _add(primary)
-    _add(_pick_target_from_available(list(discovered or [])))
+    _add(_resolved_gemini_model)
+    # 기본과 다른 용량 풀을 먼저 시도
+    for mid in GEMINI_FAILOVER_PREFERENCES:
+        _add(mid)
+        if len(ordered) >= _MAX_CASCADE_MODELS:
+            return ordered[:_MAX_CASCADE_MODELS]
     _add(GEMINI_DEFAULT_MODEL)
     for mid in GEMINI_MODEL_PREFERENCES:
+        _add(mid)
+        if len(ordered) >= _MAX_CASCADE_MODELS:
+            break
+    for mid in list(discovered or []):
         _add(mid)
         if len(ordered) >= _MAX_CASCADE_MODELS:
             break
@@ -888,53 +901,124 @@ def _call_with_retry(
     raise last_exc  # type: ignore[misc]
 
 
-def generate_gemini_report(api_key: str, prompt: str) -> str:
-    """Gemini 분석 호출 — sticky/기본(gemini-3.6-flash), 실패 시 3초×최대 2회 재시도.
+def _is_capacity_overload_error(exc: BaseException) -> bool:
+    """서버 용량 과부하(다른 모델로 우회 가치 있음) 여부.
 
-    omni 등 할당량 0 모델로의 페일오버는 하지 않는다.
+    키 전체 할당량 고갈과 구분 — high demand / overloaded / 503 등.
+    """
+    text = str(exc).lower()
+    # 키·프로젝트 전체 쿼터는 모델 전환으로 해결되지 않는 경우가 많음
+    hard_quota = (
+        "input_token_count" in text
+        or "output_token_count" in text
+        or ("quota exceeded" in text and "model" not in text and "high demand" not in text)
+    )
+    if hard_quota and "high demand" not in text and "overloaded" not in text:
+        return False
+    if any(
+        m in text
+        for m in (
+            "high demand",
+            "overloaded",
+            "overload",
+            "unavailable",
+            "503",
+            "temporarily",
+            "try again later",
+            "server error",
+            "internal error",
+        )
+    ):
+        return True
+    code = _api_error_code(exc)
+    return code in (503, 500, 502, 504)
+
+
+def generate_gemini_report(api_key: str, prompt: str) -> str:
+    """Gemini 분석 — sticky 우선, 과부하 시 대체 Flash로 빠른 페일오버.
+
+    모델당 짧은 재시도 후 다음 후보로 전환한다. omni 등 retired 모델은 제외.
     """
     global _resolved_gemini_model
     client = create_gemini_client(api_key)
     if _is_retired_model(_resolved_gemini_model):
         log_gemini("WARN", f"retired 모델 sticky 제거: {_resolved_gemini_model}")
         _resolved_gemini_model = None
-    model = (
+
+    primary = (
         _resolved_gemini_model
         if _resolved_gemini_model and not _is_retired_model(_resolved_gemini_model)
         else GEMINI_DEFAULT_MODEL
     )
+    # 분석마다 models.list 호출하지 않음(지연·할당량 소모 방지) — 정적 페일오버 목록 사용
+    candidates = _cascade_models(primary, discovered=None)
 
-    log_gemini("INFO", f"AI 분석 요청 (model={model}, retries≤{_MAX_RETRIES})")
-    if _retry_stage_callback:
-        _retry_stage_callback(f"AI 분석 중… ({model})")
-    try:
-        response = _call_with_retry(client, model, prompt, max_retries=_MAX_RETRIES)
-        out = extract_response_text(response)
-        if out:
-            _resolved_gemini_model = model
-            log_gemini("INFO", f"AI 응답 성공 (model={model})")
-            return out
-        raise RuntimeError(describe_empty_response(response))
-    except Exception as exc:
-        if _is_auth_error(exc):
-            raise
-        if "취소" in str(exc):
-            raise
-        detail = format_gemini_error(exc)
-        low = detail.lower()
-        if "quota" in low or "resource_exhausted" in low or "429" in low:
-            raise RuntimeError(
-                "Gemini API 할당량(토큰/요청 한도)을 초과했습니다.\n"
-                "프롬프트는 요약 데이터만 전송하도록 축소되어 있습니다. "
-                "잠시 후 다시 시도하거나 AI Studio 할당량을 확인해 주세요.\n"
-                f"{detail}"
-            ) from exc
+    errors: list[str] = []
+    last_exc: BaseException | None = None
+    for idx, model in enumerate(candidates):
+        if _cancel_gemini:
+            raise RuntimeError("사용자에 의해 AI 요청이 취소되었습니다.")
+        if idx == 0:
+            log_gemini(
+                "INFO",
+                f"AI 분석 요청 (model={model}, cascade={candidates}, "
+                f"retries/model≤{_PER_MODEL_RETRIES})",
+            )
+            if _retry_stage_callback:
+                _retry_stage_callback(f"AI 분석 중… ({model})")
+        else:
+            msg = f"과부하 우회 — 대체 모델 시도 ({model})…"
+            log_gemini("INFO", msg)
+            if _retry_stage_callback:
+                _retry_stage_callback(msg)
+        try:
+            response = _call_with_retry(
+                client, model, prompt, max_retries=_PER_MODEL_RETRIES
+            )
+            out = extract_response_text(response)
+            if out:
+                _resolved_gemini_model = model
+                log_gemini("INFO", f"AI 응답 성공 (model={model})")
+                return out
+            raise RuntimeError(describe_empty_response(response))
+        except Exception as exc:
+            if _is_auth_error(exc):
+                raise
+            if "취소" in str(exc):
+                raise
+            detail = format_gemini_error(exc)
+            errors.append(f"{model}: {detail}")
+            last_exc = exc
+            log_gemini("WARN", f"모델 실패 → 다음 후보: {model} — {detail}", exc)
+            if _resolved_gemini_model == model:
+                _resolved_gemini_model = None
+            # 일시 과부하·모델 불가만 다음 후보로, 그 외는 즉시 실패
+            if not (_is_retryable_error(exc) or _is_model_unavailable_error(exc)):
+                raise RuntimeError(
+                    "AI 분석 요청에 실패했습니다.\n"
+                    f"모델: {model}\n\n{detail}"
+                ) from exc
+            continue
+
+    joined = "\n".join(f"- {e}" for e in errors) or "(상세 없음)"
+    detail = format_gemini_error(last_exc) if last_exc else ""
+    low = (detail + " " + joined).lower()
+    if "quota" in low or "resource_exhausted" in low:
         raise RuntimeError(
-            "AI 분석 요청에 실패했습니다.\n"
-            f"모델: {model} (재시도 {_MAX_RETRIES}회 포함)\n"
+            "Gemini API 할당량(토큰/요청 한도) 또는 서버 과부하로 분석에 실패했습니다.\n"
+            f"시도한 모델: {', '.join(candidates)}\n"
+            "1~2분 뒤 다시 시도하거나 AI Studio 할당량을 확인해 주세요.\n"
             "대기 중에는 [중단]으로 UI를 해제할 수 있습니다.\n\n"
-            f"{detail}"
-        ) from exc
+            f"{joined}"
+        ) from last_exc
+    raise RuntimeError(
+        "AI 분석 요청에 실패했습니다 (서버 일시 과부하).\n"
+        f"시도한 모델: {', '.join(candidates)}\n"
+        "앱이 대체 Flash로 전환을 시도했으나 모두 실패했습니다. "
+        "1~2분 뒤 [🚀 분석 시작]을 다시 눌러 주세요.\n"
+        "대기 중에는 [중단]으로 UI를 해제할 수 있습니다.\n\n"
+        f"{joined}"
+    ) from last_exc
 
 
 def load_config() -> dict[str, Any]:
