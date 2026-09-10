@@ -1595,6 +1595,61 @@ def test_slim_report_five_sections_no_full_catalog_blowup():
     assert "부록" in appendix
 
 
+def test_thin_roadmap_replaced_with_pillars_and_examples():
+    """AI가 로드맵을 한 줄만 쓰면 유지/확대/신규/축소 + 예시 품명으로 교체."""
+    from stock_logic import (
+        _roadmap_section_is_thin,
+        ensure_mandatory_report_sections,
+        format_roadmap_markdown,
+        split_markdown_report_sections,
+    )
+
+    flags = {
+        "dashboard": {
+            "kpis": [{"key": "managed", "label": "대상", "value": 3, "display": "3종"}],
+            "summary_lines": ["요약"],
+        },
+        "by_code": {"A": {}},
+        "depletion_category_items": {
+            "긴급제조(<1년)": [
+                {
+                    "manage_no": "A",
+                    "name_ko": "감초",
+                    "years_left": 0.5,
+                    "priority_score": 90,
+                }
+            ],
+            "적정(5~10년)": [{"manage_no": "C", "name_ko": "작약"}],
+            "모니터링(3~5년)": [{"manage_no": "D", "name_ko": "천궁"}],
+        },
+        "manufacture_reduce_items": [
+            {
+                "manage_no": "B",
+                "name_ko": "당귀",
+                "manufacture_reduce": True,
+                "stock_value": 1,
+            }
+        ],
+        "long_term_low_items": [],
+        "monitoring_targets": [{"name_ko": "인삼", "acceleration": "급증"}],
+        "missing_herb_items": [{"name_ko": "황기", "pharmacopoeia_kind": "KP"}],
+    }
+    thin = (
+        "## 로드맵 총괄 제안\n\n"
+        "유지 · 확대 · 신규 · 축소 관점의 실행 로드맵 (요약형).\n"
+    )
+    assert _roadmap_section_is_thin(thin) is True
+    filled = ensure_mandatory_report_sections(thin, flags=flags)
+    for pillar in ("### 유지", "### 확대", "### 신규", "### 축소"):
+        assert pillar in filled
+    assert "감초" in filled and "당귀" in filled
+    secs = split_markdown_report_sections(filled, flags=flags)
+    rm = next(s for s in secs if s["id"] == "roadmap")
+    assert "### 유지" in rm["markdown"]
+    assert "감초" in rm["markdown"]
+    full = format_roadmap_markdown(flags)
+    assert _roadmap_section_is_thin(full) is False
+
 
 if __name__ == "__main__":
     import traceback
@@ -1642,6 +1697,7 @@ if __name__ == "__main__":
         test_export_docx_markdown_table_as_grid,
         test_export_docx_handles_large_table_as_plain_lines,
         test_slim_report_five_sections_no_full_catalog_blowup,
+        test_thin_roadmap_replaced_with_pillars_and_examples,
     ]
     failed = 0
     for fn in tests:

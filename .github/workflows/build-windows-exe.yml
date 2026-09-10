@@ -64,8 +64,9 @@ jobs:
           generate_release_notes: true
           body: |
             ## Summary
-            - Gemini 일시 과부하 시 대체 Flash(2.5/3.5) 빠른 페일오버
-            - 동일 연도 내 재고 변동 시 AI 분석 스킵되던 오류 수정
+            - 로드맵 한 줄 요약 → 유지/확대/신규/축소 본문·예시 자동 보완
+            - Gemini 일시 과부하 시 대체 Flash 빠른 페일오버
+            - 동일 연도 내 재고 변동 시 AI 분석 스킵 수정
 
             ## Assets
             - `${{ steps.exe.outputs.name }}` (Windows one-file, Python 3.12 / PE VERSIONINFO 포함)

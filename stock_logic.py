@@ -2599,36 +2599,104 @@ def format_develop_targets_markdown(
     return "\n".join(lines)
 
 
+def _roadmap_example_names(rows: list[dict[str, Any]], *, limit: int = 3) -> str:
+    """로드맵 문장용 품목명 예시 (최대 limit개)."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        name = str(r.get("name_ko") or r.get("label") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+        if len(names) >= limit:
+            break
+    return ", ".join(names)
+
+
+def _roadmap_section_is_thin(markdown: str) -> bool:
+    """로드맵이 한 줄 요약·골격만 있고 유지/확대/신규/축소 본문이 부족한지."""
+    text = markdown or ""
+    if not text.strip():
+        return True
+    pillars = ("유지", "확대", "신규", "축소")
+    found = 0
+    for kw in pillars:
+        if re.search(rf"^###\s*{kw}\b", text, re.MULTILINE):
+            found += 1
+        elif re.search(rf"^\*\*{kw}\*\*", text, re.MULTILINE):
+            found += 1
+    if found < 4:
+        return True
+    bullets = [
+        ln
+        for ln in text.splitlines()
+        if re.match(r"^[-*•]\s+\S", ln.strip())
+        or re.match(r"^\d+\.\s+\S", ln.strip())
+    ]
+    return len(bullets) < 4
+
+
 def format_roadmap_markdown(
     flags: dict[str, Any] | None = None,
     match_result: dict[str, Any] | None = None,
 ) -> str:
-    """⑤ 로드맵 총괄 제안 — 유지/확대/신규/축소 골격."""
+    """⑤ 로드맵 총괄 제안 — 유지/확대/신규/축소 + 실데이터 건수·예시."""
     f = flags or {}
+    urgent_rows = _collect_urgent_rows(f, limit=5)
+    reduce_rows = _collect_reduce_rows(f, limit=5)
+    by_kind = _collect_develop_rows_by_kind(f, match_result, limit_per_kind=5)
+    develop_rows = (by_kind.get("KP") or []) + (by_kind.get("KHP") or []) + (by_kind.get("기타") or [])
     urgent_n = len(_collect_urgent_rows(f, limit=9999))
     reduce_n = len(_collect_reduce_rows(f, limit=9999))
-    by_kind = _collect_develop_rows_by_kind(f, match_result, limit_per_kind=9999)
     develop_n = sum(len(v) for v in by_kind.values())
-    accel_n = len(f.get("monitoring_targets") or [])
+    # 가속 모니터링은 전체 목록 길이 사용
+    accel_rows = list(f.get("monitoring_targets") or [])
+    accel_n = len(accel_rows)
+    urgent_ex = _roadmap_example_names(urgent_rows)
+    reduce_ex = _roadmap_example_names(reduce_rows)
+    develop_ex = _roadmap_example_names(develop_rows)
+    accel_ex = _roadmap_example_names(accel_rows[:5])
+
+    cat = f.get("depletion_category_items") or {}
+    stable_n = len(cat.get("적정(5~10년)") or [])
+    monitor_n = len(cat.get("모니터링(3~5년)") or [])
+
     lines = [
         "## 로드맵 총괄 제안",
         "",
-        "유지 · 확대 · 신규 · 축소 관점의 실행 로드맵 (요약형).",
+        "유지 · 확대 · 신규 · 축소 관점의 실행 로드맵 (요약형 · 앱 산출 수치 기준).",
         "",
         "### 유지",
-        f"- 커버리지 적정(5~10년) 구간 품목은 현 재고·분양 패턴을 유지 모니터링합니다.",
-        f"- 분양 가속도 '안정' 품목은 기존 제조 주기·로트 규모를 유지합니다.",
+        f"- 커버리지 적정(5~10년) {stable_n}종·모니터링(3~5년) {monitor_n}종은 "
+        "현 재고·분양 패턴을 유지하며 주기적으로 재평가합니다.",
+        "- 분양 가속도 '안정' 품목은 기존 제조 주기·로트 규모를 유지합니다.",
         "",
         "### 확대",
-        f"- 제조 시급(1~2년) 후보 {urgent_n}종: 차기 제조 물량·일정을 앞당기는 확대를 검토합니다.",
-        f"- 분양 가속(신규수요·급증·증가) {accel_n}종: 수요 증가에 맞춘 생산 확대를 검토합니다.",
+        (
+            f"- 제조 시급(1~2년) 후보 {urgent_n}종: 차기 제조 물량·일정을 앞당기는 확대를 검토합니다."
+            + (f" (예: {urgent_ex})" if urgent_ex else "")
+        ),
+        (
+            f"- 분양 가속(신규수요·급증·증가) {accel_n}종: 수요 증가에 맞춘 생산 확대를 검토합니다."
+            + (f" (예: {accel_ex})" if accel_ex else "")
+        ),
         "",
         "### 신규",
-        f"- 공정서 미확보 개발 대상(표본) {develop_n}종: KP/KHP 분리 목록을 기준으로 "
-        "표준생약 신규 확보 우선순위를 수립합니다.",
+        (
+            f"- 공정서 미확보 개발 대상 {develop_n}종: KP/KHP 분리 목록을 기준으로 "
+            "표준생약 신규 확보 우선순위를 수립합니다."
+            + (f" (예: {develop_ex})" if develop_ex else "")
+        ),
+        "- 미확보 품목은 기원·공정서 중요도를 반영해 연간 개발 파이프라인에 편성합니다.",
         "",
         "### 축소",
-        f"- 제조 축소/보존 검토 {reduce_n}종: 장기 저분양·과다재고 품목은 차기 제조 물량 축소·보존을 권고합니다.",
+        (
+            f"- 제조 축소/보존 검토 {reduce_n}종: 장기 저분양·과다재고 품목은 "
+            "차기 제조 물량 축소·보존을 권고합니다."
+            + (f" (예: {reduce_ex})" if reduce_ex else "")
+        ),
+        "- 축소 대상은 폐기 전에 수요 재확인·로트 통합·보관 비용 검토를 선행합니다.",
         "",
     ]
     return "\n".join(lines)
@@ -3076,9 +3144,9 @@ def _section_needs_mandatory_inject(
         section_key, flags, match_result
     ):
         return True
-    # 로드맵: AI 서술이 있으면 유지, 없을 때만 골격 주입
+    # 로드맵: 한 줄 요약만 있으면 앱 산출 유지/확대/신규/축소로 교체
     if section_key == "roadmap":
-        return False
+        return _roadmap_section_is_thin(raw)
     if _mandatory_section_has_source_data(section_key, flags, match_result):
         if not _report_section_has_item_rows(raw):
             return True
@@ -3950,7 +4018,8 @@ def build_ai_prompt(
         "2. ## 제조 시급 품목 — TOP20 의미·위험 요인 요약",
         "3. ## 과다재고 및 제조 축소 권고 — 상위 품목 시사점",
         "4. ## 공정서 미확보 개발 대상 — KP/KHP 분리 우선순위 제언",
-        "5. ## 로드맵 총괄 제안 — 유지/확대/신규/축소 각 3~5문장",
+        "5. ## 로드맵 총괄 제안 — 반드시 ### 유지 / ### 확대 / ### 신규 / ### 축소 "
+        "하위 헤딩을 두고 각 3~5문장(불릿)으로 작성. 한 줄 요약만 쓰지 마세요.",
         f"6. 제조필요도 공식 인용: {PRIORITY_FORMULA_KO}",
         "",
         "[종합현황 대시보드(핵심 KPI)]",
