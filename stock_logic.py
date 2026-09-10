@@ -535,10 +535,22 @@ class StockItem:
 
     @property
     def has_stock_change(self) -> bool:
+        """수량 변동 여부.
+
+        연도말 소급 보정 시계열(first→last)뿐 아니라, 동일 연도 안에서만
+        발생한 원시 변경일자 변동도 감지한다. (연도말 붕괴로 보정 포인트가
+        1개만 남아 AI 분석이 통째로 스킵되던 오류 방지)
+        """
         delta = self.qty_delta
-        if delta is None:
+        if delta is not None and abs(delta) > 1e-9:
+            return True
+        pts = collapse_same_dates(self.raw_points)
+        if len(pts) < 2:
             return False
-        return abs(delta) > 1e-9
+        return any(
+            abs(pts[i].quantity - pts[i - 1].quantity) > 1e-9
+            for i in range(1, len(pts))
+        )
 
 
 def collapse_same_dates(points: list[StockPoint]) -> list[StockPoint]:
@@ -547,6 +559,21 @@ def collapse_same_dates(points: list[StockPoint]) -> list[StockPoint]:
     for point in points:
         by_date[point.change_date] = point.quantity
     return [StockPoint(d, by_date[d]) for d in sorted(by_date.keys())]
+
+
+def analysis_time_series(item: StockItem) -> list[StockPoint]:
+    """분양속도·가속도 산출용 시계열.
+
+    기본은 연도말 소급 보정 포인트. 보정 포인트가 2개 미만이면
+    (동일 연도 내 변동만 있는 경우) 일자별 원시 포인트로 대체한다.
+    """
+    pts = list(item.corrected_points or [])
+    if len(pts) >= 2:
+        return pts
+    raw = collapse_same_dates(item.raw_points or [])
+    if len(raw) >= 2:
+        return raw
+    return pts
 
 
 def collapse_to_year_end(points: list[StockPoint]) -> list[StockPoint]:
@@ -1363,7 +1390,7 @@ def total_decrease_in_recent_years(
     reference_date: date | None = None,
 ) -> float:
     """기준일 직전 N년 구간의 감소(분양) 합계 vial."""
-    pts = item.corrected_points
+    pts = analysis_time_series(item)
     if len(pts) < 2:
         return 0.0
     ref = reference_date or date.today()
@@ -1475,7 +1502,7 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
         item.unit_price = _extract_unit_price_from_meta(item.extra_meta)
 
     reliability = compute_data_reliability(item)
-    pts = item.corrected_points
+    pts = analysis_time_series(item)
     empty = {
         "speed": "데이터부족",
         "annual_rate": None,
@@ -1536,7 +1563,12 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
         )
         return empty
 
-    if len(pts) < 2 or item.first_qty is None or item.last_qty is None:
+    series_first = pts[0].quantity if pts else None
+    series_last = pts[-1].quantity if pts else None
+    current_qty = item.current_qty
+    if current_qty is None:
+        current_qty = series_last
+    if len(pts) < 2 or series_first is None or series_last is None:
         return empty
 
     dec = decrease_only_rate_stats(pts)
@@ -1560,7 +1592,11 @@ def estimate_depletion(item: StockItem) -> dict[str, Any]:
         deplete_2 = False
         deplete_ym = DORMANT_STOCK_CATEGORY
     else:
-        years_left = item.last_qty / recent_annual_rate if item.last_qty > 0 else 0.0
+        years_left = (
+            float(current_qty) / recent_annual_rate
+            if current_qty is not None and float(current_qty) > 0
+            else 0.0
+        )
         if recent_annual_rate >= 40:
             speed = "빠름"
         elif recent_annual_rate >= 10:
@@ -5927,8 +5963,8 @@ def build_scatter3d_record(
     if not item.has_stock_change:
         return None
 
-    pts = item.corrected_points
-    if len(pts) < 2 or item.first_qty is None or item.last_qty is None:
+    pts = analysis_time_series(item)
+    if len(pts) < 2:
         return None
 
     flag = (ai_flags or {}).get(item.manage_no) if ai_flags else None

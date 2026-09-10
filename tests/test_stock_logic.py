@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 
@@ -20,6 +21,7 @@ from stock_logic import (  # noqa: E402
     build_ai_prompt,
     build_scatter3d_record,
     build_scatter3d_records,
+    collapse_to_year_end,
     discover_timeseries_pairs,
     estimate_depletion,
     items_for_ai_analysis,
@@ -1022,6 +1024,56 @@ def test_acceleration_seven_tiers_and_no_cap():
     assert low["low_volume_intermittent"] is True
 
 
+def test_same_year_raw_changes_enable_analysis():
+    """동일 연도 내 수량 변동만 있어도 AI 분석 대상·분양속도가 산출되어야 한다.
+
+    연도말 붕괴로 corrected_points가 1개만 남아 has_stock_change=False /
+    데이터부족으로 분석이 통째로 스킵되던 회귀를 방지한다.
+    """
+    from stock_logic import (
+        analysis_time_series,
+        collect_ai_analysis_flags,
+        estimate_depletion,
+        items_for_ai_analysis,
+        process_excel,
+    )
+
+    # 단위 케이스: 2024년 안에서만 감소
+    raw = [
+        StockPoint(date(2024, 1, 1), 300.0),
+        StockPoint(date(2024, 4, 10), 220.0),
+        StockPoint(date(2024, 8, 1), 200.0),
+    ]
+    ye = collapse_to_year_end(raw)
+    corr, n = apply_retroactive_correction(raw)
+    item = StockItem(
+        manage_no="SAME-Y",
+        name_ko="동일연도감소",
+        std_type="표준생약",
+        raw_points=raw,
+        year_end_points=ye,
+        corrected_points=corr,
+        correction_count=n,
+    )
+    assert len(item.corrected_points) == 1
+    assert item.has_stock_change is True
+    assert len(analysis_time_series(item)) >= 2
+    stats = estimate_depletion(item)
+    assert stats["speed"] != "데이터부족"
+    assert stats["annual_rate"] is not None and stats["annual_rate"] > 0
+    assert stats["years_left"] is not None
+    assert items_for_ai_analysis([item]) == [item]
+
+    # 저장소 샘플 엑셀(동일 연도 시계열)도 분석 대상이 0이 아니어야 한다
+    sample = Path(__file__).resolve().parents[1] / "sample" / "테스트파일1.xlsx"
+    if sample.exists():
+        data = process_excel(sample)
+        targets = items_for_ai_analysis(data["stock_items"])
+        assert len(targets) >= 1
+        flags = collect_ai_analysis_flags(data["stock_items"])
+        assert len(flags.get("by_code") or {}) >= 1
+
+
 def test_coverage_long_low_and_manufacture_reduce():
     from stock_logic import (
         LONG_LOW_DEMAND_CATEGORY,
@@ -1571,6 +1623,7 @@ if __name__ == "__main__":
         test_scatter3d_records_from_sample,
         test_deplete_ym_uses_today_not_past_survey_date,
         test_acceleration_seven_tiers_and_no_cap,
+        test_same_year_raw_changes_enable_analysis,
         test_coverage_long_low_and_manufacture_reduce,
         test_manufacture_need_score_excludes_reliability,
         test_compendium_herb_vs_origin_and_hwonchogeun_khp,

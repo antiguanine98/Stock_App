@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.68
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.69
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.68"
+APP_VERSION = "v1.69"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 서버 확인 최신 Flash — 탐색 실패 시에도 이 기본값으로 연결
@@ -2461,7 +2461,18 @@ class MainWindow(QMainWindow):
         self._pending_excel_paths = []
         failed = list(data.get("failed_files") or [])
         stock_items = list(data.get("stock_items") or [])
-        data["ai_flags"] = collect_ai_analysis_flags(stock_items)
+        try:
+            data["ai_flags"] = collect_ai_analysis_flags(stock_items)
+        except Exception as exc:
+            log_gemini("ERROR", f"재고 플래그 산출 실패: {exc}", exc)
+            data["ai_flags"] = {}
+            if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+                QMessageBox.warning(
+                    self,
+                    "분석 지표 산출 오류",
+                    "재고 파일은 로드했지만 분석 지표 산출 중 오류가 발생했습니다.\n"
+                    f"{exc}\n\n표/차트는 사용할 수 있으나 AI 분석 전에 파일을 확인해 주세요.",
+                )
         data["ai_mentioned_codes"] = []
         self.inventory_data = data
         self._refresh_compendium_match()
@@ -3229,12 +3240,20 @@ class MainWindow(QMainWindow):
         key = self.api_key_input.text().strip()
         stock_items = data.get("stock_items") or []
         changed = [it for it in stock_items if it.has_stock_change]
-        if "ai_flags" not in data:
-            data["ai_flags"] = collect_ai_analysis_flags(stock_items)
-        match = data.get("compendium_match") or {}
-        data["ai_flags"] = attach_compendium_match_to_flags(
-            data.get("ai_flags"), match, items=stock_items
-        )
+        try:
+            if "ai_flags" not in data or not data.get("ai_flags"):
+                data["ai_flags"] = collect_ai_analysis_flags(stock_items)
+            match = data.get("compendium_match") or {}
+            data["ai_flags"] = attach_compendium_match_to_flags(
+                data.get("ai_flags"), match, items=stock_items
+            )
+        except Exception as exc:
+            log_gemini("ERROR", f"AI 분석 준비 실패: {exc}", exc)
+            self.chat_view.setMarkdown(
+                f"**AI 분석 준비 실패**\n\n재고 지표 산출 중 오류가 발생했습니다.\n\n`{exc}`"
+            )
+            self._scroll_chat_to_bottom()
+            return
         self._chat_history.clear()
         self._initial_report = ""
         if hasattr(self, "btn_dl_word"):
@@ -3248,7 +3267,10 @@ class MainWindow(QMainWindow):
         self._set_chat_enabled(False)
         if not changed:
             self.chat_view.setMarkdown(
-                "분석 대상 없음\n\n수량 변화가 있는 품목이 없어 AI 분석을 건너뛰었습니다."
+                "**분석 대상 없음**\n\n"
+                "변경일자/재고량 시계열에서 수량 변동이 감지된 품목이 없어 "
+                "AI 분석을 건너뛰었습니다.\n\n"
+                "엑셀에 `변경일자N`/`재고량N` 쌍과 실제 수량 변화가 있는지 확인해 주세요."
             )
             self._scroll_chat_to_bottom()
             return
@@ -3315,37 +3337,41 @@ class MainWindow(QMainWindow):
         self._chat_busy = False
         clear_cancel_gemini()
         self._chat_history.clear()
-        flags, match = self._report_context_for_sections()
-        text = ensure_mandatory_report_sections(text, flags=flags, match_result=match)
-        self._initial_report = text
-        self._report_expanded_ids.clear()
-        self._report_sections = split_markdown_report_sections(
-            text, flags=flags, match_result=match
-        )
-        self._report_section_key = (
-            "summary"
-            if any(s["id"] == "summary" for s in self._report_sections)
-            else (self._report_sections[0]["id"] if self._report_sections else "all")
-        )
-        self._rebuild_report_nav()
-        self._render_report_html()
-        self.btn_dl_word.setEnabled(True)
-        self.btn_dl_pdf.setEnabled(True)
-        self.chat_view.setMarkdown(
-            "*표준 분석 리포트가 왼쪽에 준비되었습니다. 추가 질문을 입력해 주세요.*"
-        )
-        self._scroll_chat_to_bottom()
-        self._set_chat_enabled(True)
-        self._set_api_status(True, f"연결됨 ({get_active_gemini_model()})")
-        if self.inventory_data is not None:
-            codes = [
-                it.manage_no
-                for it in (self.inventory_data.get("stock_items") or [])
-                if getattr(it, "manage_no", None)
-            ]
-            mentioned = extract_mentioned_codes_from_report(text, codes)
-            self.inventory_data["ai_mentioned_codes"] = mentioned
-            self._refresh_3d()
+        try:
+            flags, match = self._report_context_for_sections()
+            text = ensure_mandatory_report_sections(text, flags=flags, match_result=match)
+            self._initial_report = text
+            self._report_expanded_ids.clear()
+            self._report_sections = split_markdown_report_sections(
+                text, flags=flags, match_result=match
+            )
+            self._report_section_key = (
+                "summary"
+                if any(s["id"] == "summary" for s in self._report_sections)
+                else (self._report_sections[0]["id"] if self._report_sections else "all")
+            )
+            self._rebuild_report_nav()
+            self._render_report_html()
+            self.btn_dl_word.setEnabled(True)
+            self.btn_dl_pdf.setEnabled(True)
+            self.chat_view.setMarkdown(
+                "*표준 분석 리포트가 왼쪽에 준비되었습니다. 추가 질문을 입력해 주세요.*"
+            )
+            self._scroll_chat_to_bottom()
+            self._set_chat_enabled(True)
+            self._set_api_status(True, f"연결됨 ({get_active_gemini_model()})")
+            if self.inventory_data is not None:
+                codes = [
+                    it.manage_no
+                    for it in (self.inventory_data.get("stock_items") or [])
+                    if getattr(it, "manage_no", None)
+                ]
+                mentioned = extract_mentioned_codes_from_report(text, codes)
+                self.inventory_data["ai_mentioned_codes"] = mentioned
+                self._refresh_3d()
+        except Exception as exc:
+            log_gemini("ERROR", f"리포트 후처리 실패: {exc}", exc)
+            self._on_report_error(f"리포트 후처리 중 오류: {exc}")
 
     def _on_report_error(self, message: str) -> None:
         self._set_ai_progress(None)
