@@ -278,7 +278,15 @@ def test_decrease_only_excludes_increases():
     )
     stats = estimate_depletion(item)
     assert stats["increase_segments_excluded"] >= 1
-    assert stats["acceleration"] in ("급가속", "증가", "안정", "감소")
+    assert stats["acceleration"] in (
+        "신규수요",
+        "급증",
+        "증가",
+        "안정",
+        "감소",
+        "급감",
+        "분석불가/자료부족",
+    )
     assert stats["stock_value"] == 70 * 500
 
 
@@ -428,56 +436,54 @@ def test_split_markdown_report_sections():
     from stock_logic import split_markdown_report_sections, _report_section_short_label
 
     md = (
-        "## 1페이지 요약 대시보드 (핵심 KPI)\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
-        "## 소진 예상 기간\n\n내용A\n\n"
-        "### 재고 없음(미보유)\n\n제로품목\n\n"
-        "## 차년도 제조검토대상\n\n내용B\n\n"
-        "## 공정서 DB 매칭 및 수재 현황\n\n"
-        "### 공정서 미보유 표준품 전수\n\n지황\n"
+        "## 종합현황 대시보드\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
+        "## 제조 시급 품목 리스트\n\n내용A\n\n"
+        "## 과다재고 및 제조 축소 권고 품목\n\n축소내용\n\n"
+        "## 공정서 미확보 표준생약 개발 대상\n\n지황\n\n"
+        "## 로드맵 총괄 제안\n\n유지 확대\n"
     )
     secs = split_markdown_report_sections(md)
     by_id = {s["id"]: s for s in secs}
-    assert by_id["summary"]["short"] == "요약"
-    assert by_id["deplete"]["short"] == "소진"
-    assert by_id["missing"]["short"] == "미보유"
-    assert "제로품목" in by_id["missing"]["markdown"] or "지황" in by_id["missing"]["markdown"]
-    assert by_id["manufacture"]["short"] == "검토"
-    assert "내용B" in by_id["manufacture"]["markdown"]
-    assert by_id["compendium"]["short"] == "공정서"
-    # 고정 버튼용 섹션은 본문 없어도 항상 존재 — 가속은 빈 플레이스홀더 대신 표 본문
-    assert by_id["accel"]["short"] == "가속"
-    assert "분양 가속 모니터링" in by_id["accel"]["markdown"]
-    assert "본문이 없습니다" not in by_id["accel"]["markdown"]
-    assert "| 가속도 |" in by_id["accel"]["markdown"]
-    assert _report_section_short_label("모니터링 대상") == "가속"
-    assert _report_section_short_label("재고 없음(미보유)") == "미보유"
-    assert _report_section_short_label("차년도 제조검토대상") == "검토"
+    assert by_id["summary"]["short"] == "현황"
+    assert by_id["urgent"]["short"] == "시급"
+    assert by_id["reduce"]["short"] == "축소"
+    assert by_id["develop"]["short"] == "개발"
+    assert by_id["roadmap"]["short"] == "로드맵"
+    assert "본문이 없습니다" not in by_id["urgent"]["markdown"]
+    assert _report_section_short_label("제조 시급 품목") == "시급"
+    assert _report_section_short_label("공정서 미확보") == "개발"
+    assert _report_section_short_label("로드맵 총괄 제안") == "로드맵"
 
 
 def test_ensure_mandatory_report_sections():
-    """소진·제조검토·미보유·가속 등 필수 섹션이 항상 본문을 갖는다."""
+    """요약형 5섹션(현황·시급·축소·개발·로드맵)이 항상 본문을 갖는다."""
     from stock_logic import (
         build_mandatory_section_markdown,
         ensure_mandatory_report_sections,
         split_markdown_report_sections,
         ZERO_STOCK_CATEGORY,
+        MANUFACTURE_REDUCE_RECOMMENDATION,
     )
 
     flags = {
         "dashboard": {
-            "kpis": [{"label": "대상품목 수", "display": "3종"}],
+            "kpis": [
+                {"key": "managed", "label": "대상품목 수", "value": 3, "display": "3종"}
+            ],
             "summary_lines": ["요약"],
         },
         "depletion_category_items": {
-            "1년 이내": [
+            "긴급제조(<1년)": [
                 {
                     "name_ko": "소진품A",
                     "manage_no": "D-001",
                     "std_type": "표준생약",
                     "last_qty": 10,
+                    "years_left": 0.5,
                     "deplete_ym": "2026년 12월",
-                    "depletion_category": "1년 이내",
+                    "depletion_category": "긴급제조(<1년)",
                     "risk_grade": "위험",
+                    "priority_score": 80,
                 }
             ],
             ZERO_STOCK_CATEGORY: [
@@ -499,14 +505,26 @@ def test_ensure_mandatory_report_sections():
                     "manage_no": "M-001",
                     "std_type": "표준생약",
                     "last_qty": 50,
-                    "priority_score": 0.82,
+                    "years_left": 1.5,
+                    "priority_score": 82,
                     "deplete_ym": "2028년 01월",
-                    "depletion_category": "3년 이내",
-                    "risk_grade": "경계",
+                    "depletion_category": "제조준비(1~2년)",
+                    "risk_grade": "위험",
                 }
             ],
             "지표성분": [],
         },
+        "manufacture_reduce_items": [
+            {
+                "name_ko": "과다품",
+                "manage_no": "O-001",
+                "std_type": "표준생약",
+                "coverage_years": 20,
+                "recent_rate": 0.2,
+                "manufacture_reduce": True,
+                "recommendation": MANUFACTURE_REDUCE_RECOMMENDATION,
+            }
+        ],
         "monitoring_targets": [],
         "missing_compendium_items": [
             {
@@ -514,93 +532,100 @@ def test_ensure_mandatory_report_sections():
                 "origin_ko": "한국",
                 "origin_en": "Korea",
                 "pharmacopoeia": "KP",
+                "pharmacopoeia_kind": "KP",
             }
         ],
+        "missing_herb_items": [
+            {"name_ko": "미보유품", "origin_count": 1, "pharmacopoeia_kind": "KP"}
+        ],
+        "compendium_stats": {
+            "herb_total": 10,
+            "herb_held": 8,
+            "herb_missing": 2,
+            "herb_coverage_pct": 80.0,
+            "origin_total": 12,
+            "origin_held": 9,
+            "origin_missing": 3,
+            "origin_coverage_pct": 75.0,
+        },
     }
-    match = {"stats": {"compendium_total": 1, "inventory_matched": 0, "auto_corrected": 0, "missing_count": 1}}
+    match = {
+        "stats": flags["compendium_stats"],
+        "missing_herb_items": flags["missing_herb_items"],
+        "missing_items": flags["missing_compendium_items"],
+    }
 
     bare = "## 기타 분석\n\nAI가 쓴 본문만 있음.\n"
     filled = ensure_mandatory_report_sections(bare, flags=flags, match_result=match)
-    assert "소진품A" in filled
-    assert "검토품" in filled
-    assert "제로품" in filled
+    assert "종합현황 대시보드" in filled
+    assert "소진품A" in filled or "검토품" in filled
+    assert "과다품" in filled
     assert "미보유품" in filled
-    assert "대상품목 수" in filled
+    assert "로드맵 총괄 제안" in filled
     assert "본문이 없습니다" not in filled
 
     secs = split_markdown_report_sections(filled, flags=flags, match_result=match)
     by_id = {s["id"]: s for s in secs}
-    for key in ("summary", "deplete", "missing", "manufacture", "accel", "compendium"):
+    for key in ("summary", "urgent", "reduce", "develop", "roadmap"):
         assert key in by_id, key
         assert "본문이 없습니다" not in by_id[key]["markdown"], key
-    assert "소진품A" in by_id["deplete"]["markdown"]
-    assert "검토품" in by_id["manufacture"]["markdown"]
-    assert "제로품" in by_id["missing"]["markdown"] or "미보유품" in by_id["missing"]["markdown"]
-    assert build_mandatory_section_markdown("deplete", flags).startswith("## 소진 예상")
+    assert "소진품A" in by_id["urgent"]["markdown"] or "검토품" in by_id["urgent"]["markdown"]
+    assert "과다품" in by_id["reduce"]["markdown"]
+    assert "미보유품" in by_id["develop"]["markdown"]
+    assert build_mandatory_section_markdown("urgent", flags).startswith("## 제조 시급")
 
 
-def test_truncated_ai_tables_replaced_with_full_list():
-    """AI가 중략으로 줄인 표는 정량 전수 표로 교체한다."""
+def test_truncated_ai_tables_replaced_with_slim_list():
+    """AI 중략 표는 요약형 개발 대상 표로 교체된다."""
     from stock_logic import (
         ensure_mandatory_report_sections,
         split_markdown_report_sections,
-        ZERO_STOCK_CATEGORY,
     )
 
-    zero_rows = [
-        {
-            "name_ko": f"제로{i}",
-            "manage_no": f"Z-{i:03d}",
-            "std_type": "표준생약",
-            "last_qty": 0,
-            "deplete_ym": "-",
-            "depletion_category": ZERO_STOCK_CATEGORY,
-            "risk_grade": "재고없음",
-        }
-        for i in range(1, 24)
-    ]
     miss_rows = [
         {
             "name_ko": f"미보유{i}",
             "origin_ko": "한국",
             "origin_en": "Korea",
             "pharmacopoeia": "KP",
+            "pharmacopoeia_kind": "KP",
         }
         for i in range(1, 6)
     ]
     flags = {
-        "depletion_category_items": {ZERO_STOCK_CATEGORY: zero_rows},
+        "dashboard": {
+            "kpis": [{"key": "managed", "label": "대상품목 수", "value": 1, "display": "1종"}],
+            "summary_lines": ["요약"],
+        },
+        "depletion_category_items": {},
         "missing_compendium_items": miss_rows,
+        "missing_herb_items": [
+            {"name_ko": f"미보유{i}", "origin_count": 1, "pharmacopoeia_kind": "KP"}
+            for i in range(1, 6)
+        ],
         "manufacture_candidates": {},
         "monitoring_targets": [],
+        "compendium_stats": {"herb_missing": 5, "origin_missing": 5},
     }
     truncated = (
-        "## 미보유(재고 없음·공정서 미보유)\n\n"
-        "### 재고 없음(미보유) (23건)\n\n"
-        "| # | 한글명 | 관리번호 | 유형 | 재고 | 소진예상일시 | 소진구간 | 위험등급 |\n"
-        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
-        "| 1 | 제로1 | Z-001 | 표준생약 | 0 | - | 재고 없음(미보유) | 재고없음 |\n"
-        "| ... | (중략) | ... | ... | ... | ... | ... | ... |\n"
-        "| 23 | 제로23 | Z-023 | 표준생약 | 0 | - | 재고 없음(미보유) | 재고없음 |\n\n"
-        "### 공정서 미보유 표준품 (5건)\n\n"
-        "| # | 한글명 | 기원(한글) | 기원(영문) | 공정서 |\n"
-        "| --- | --- | --- | --- | --- |\n"
-        "| 1 | 미보유1 | 한국 | Korea | KP |\n"
-        "| ... | (중략) | ... | ... | ... |\n"
-        "| 5 | 미보유5 | 한국 | Korea | KP |\n"
+        "## 공정서 미확보 표준생약 개발 대상\n\n"
+        "| # | 생약명(한글) | 기원행수 | 공정서 |\n"
+        "| --- | --- | --- | --- |\n"
+        "| 1 | 미보유1 | 1 | KP |\n"
+        "| ... | (중략) | ... | ... |\n"
+        "| 5 | 미보유5 | 1 | KP |\n"
     )
     filled = ensure_mandatory_report_sections(truncated, flags=flags)
     assert "(중략)" not in filled
-    assert "제로12" in filled
     assert "미보유3" in filled
     secs = split_markdown_report_sections(filled, flags=flags)
-    missing = next(s for s in secs if s["id"] == "missing")
-    assert "(중략)" not in missing["markdown"]
-    assert missing["markdown"].count("| 제로") >= 23
+    develop = next(s for s in secs if s["id"] == "develop")
+    assert "(중략)" not in develop["markdown"]
+    assert "미보유1" in develop["markdown"]
 
 
 def test_ensure_accel_monitoring_section_always_has_body():
-    """AI 리포트에 가속 섹션이 없거나 빈 표여도 정량 표를 항상 채운다."""
+    """요약형 리포트에서도 필수 섹션 본문이 비지 않는다."""
     from stock_logic import (
         ensure_accel_monitoring_in_report,
         format_accel_monitoring_markdown,
@@ -614,7 +639,7 @@ def test_ensure_accel_monitoring_section_always_has_body():
             "manage_no": "A-001",
             "std_type": "표준생약",
             "last_qty": 120,
-            "acceleration": "급가속",
+            "acceleration": "급증",
             "acceleration_ratio": 2.5,
             "annual_rate": 40.0,
             "deplete_ym": "2027년 03월",
@@ -634,41 +659,26 @@ def test_ensure_accel_monitoring_section_always_has_body():
         },
     ]
 
-    # 1) 섹션 자체가 없는 리포트
-    bare = "## 1페이지 요약 대시보드\n\n요약입니다.\n\n## 소진 예상\n\n소진 내용\n"
+    bare = "## 종합현황 대시보드\n\n요약입니다.\n\n## 제조 시급 품목 리스트\n\n소진 내용\n"
     filled = ensure_accel_monitoring_in_report(bare, monitoring)
-    assert "## 분양 가속 모니터링" in filled
-    assert "가속품A" in filled and "급가속" in filled
-    assert "증가품B" in filled
-    secs = split_markdown_report_sections(filled, monitoring=monitoring)
-    accel = next(s for s in secs if s["id"] == "accel")
-    assert "본문이 없습니다" not in accel["markdown"]
-    assert "| 가속품A |" in accel["markdown"] or "가속품A" in accel["markdown"]
-    assert accel["markdown"].count("|") >= 10
+    assert "본문이 없습니다" not in filled
+    md = format_accel_monitoring_markdown(monitoring)
+    assert "가속품A" in md and "급증" in md
+    assert "| 가속도 |" in md
 
-    # 2) 빈 헤딩만 있는 경우
-    empty_heading = bare + "\n## 분양 가속 모니터링\n\n"
-    filled2 = ensure_accel_monitoring_in_report(empty_heading, monitoring)
-    assert "가속품A" in filled2
-    assert filled2.count("## 분양 가속 모니터링") == 1
-
-    # 3) 빈 표만 있는 경우
-    empty_table = (
-        bare
-        + "\n## 분양 가속 모니터링\n\n"
-        + "| # | 한글명 | 가속도 |\n| --- | --- | --- |\n"
+    secs = split_markdown_report_sections(
+        filled,
+        flags={
+            "monitoring_targets": monitoring,
+            "dashboard": {"kpis": [], "summary_lines": []},
+        },
     )
-    filled3 = ensure_accel_monitoring_in_report(empty_table, monitoring)
-    assert "A-001" in filled3 and "2.50" in filled3
+    assert {s["id"] for s in secs} >= {"summary", "urgent", "reduce", "develop", "roadmap"}
 
-    # 4) 모니터링 0건이어도 본문(해당 없음)은 존재
+    filled0 = ensure_accel_monitoring_in_report(bare, [])
+    assert "본문이 없습니다" not in filled0
     zero = format_accel_monitoring_markdown([])
     assert "해당 없음" in zero
-    assert "| 가속도 |" in zero
-    filled0 = ensure_accel_monitoring_in_report(bare, [])
-    assert "해당 없음" in filled0
-    assert "본문이 없습니다" not in filled0
-
 
 
 def test_markdown_report_renders_tables_as_html():
@@ -964,17 +974,190 @@ def test_deplete_ym_uses_today_not_past_survey_date():
         corrected_points=[
             StockPoint(date(2015, 1, 1), 300),
             StockPoint(date(2018, 6, 1), 120),
-            StockPoint(date(2020, 1, 1), 100),
+            StockPoint(date(2020, 1, 1), 40),
         ],
     )
     stats = estimate_depletion(item)
     assert stats["years_left"] is not None
     assert stats["deplete_ym"] is not None
-    year = int(str(stats["deplete_ym"]).split("년")[0])
-    month = int(str(stats["deplete_ym"]).split("년")[1].replace("월", "").strip())
+    ym = str(stats["deplete_ym"])
+    if "장기저수요" in ym or "휴면재고" in ym:
+        assert stats["years_left"] >= 15.0 or stats.get("recent_annual_rate") in (None, 0)
+        return
+    year = int(ym.split("년")[0])
+    month = int(ym.split("년")[1].replace("월", "").strip())
     target = date(year, month, 1)
     today = date.today().replace(day=1)
     assert target >= today
+
+
+def test_acceleration_seven_tiers_and_no_cap():
+    from stock_logic import acceleration_from_rates
+
+    new = acceleration_from_rates(0.0, 5.0)
+    assert new["label"] == "신규수요"
+    assert new["ratio"] is None  # Cap 3.0 제거
+    assert new["is_surge"] is True
+
+    surge = acceleration_from_rates(10.0, 25.0)
+    assert surge["label"] == "급증" and abs(surge["ratio"] - 2.5) < 1e-9
+
+    up = acceleration_from_rates(10.0, 15.0)
+    assert up["label"] == "증가"
+
+    stable = acceleration_from_rates(10.0, 10.0)
+    assert stable["label"] == "안정"
+
+    down = acceleration_from_rates(10.0, 6.0)
+    assert down["label"] == "감소"
+
+    crash = acceleration_from_rates(10.0, 4.0)
+    assert crash["label"] == "급감"
+
+    empty = acceleration_from_rates(0.0, 0.0)
+    assert empty["label"] == "분석불가/자료부족"
+
+    low = acceleration_from_rates(0.2, 0.5)
+    assert low["label"] == "급증"
+    assert low["low_volume_intermittent"] is True
+
+
+def test_coverage_long_low_and_manufacture_reduce():
+    from stock_logic import (
+        LONG_LOW_DEMAND_CATEGORY,
+        DORMANT_STOCK_CATEGORY,
+        MANUFACTURE_REDUCE_RECOMMENDATION,
+        collect_ai_analysis_flags,
+        estimate_depletion,
+        format_deplete_ym,
+        select_long_term_low_items,
+    )
+
+    assert format_deplete_ym(20.0, recent_rate=1.0) == LONG_LOW_DEMAND_CATEGORY
+    assert format_deplete_ym(None, recent_rate=0.0) == DORMANT_STOCK_CATEGORY
+
+    # 재고 많음 + 최근 저분양 → 장기저수요 + 과다재고 → 제조 축소/보존
+    item = StockItem(
+        manage_no="LOW-01",
+        name_ko="저분양과다",
+        std_type="표준생약",
+        unit_price=1000,
+        corrected_points=[
+            StockPoint(date(2018, 1, 1), 500),
+            StockPoint(date(2019, 1, 1), 499),
+            StockPoint(date(2020, 1, 1), 498),
+            StockPoint(date(2021, 1, 1), 497),
+            StockPoint(date(2022, 1, 1), 496.5),
+            StockPoint(date(2023, 1, 1), 496),
+            StockPoint(date(2024, 1, 1), 495.5),
+            StockPoint(date(2025, 1, 1), 495),
+        ],
+    )
+    stats = estimate_depletion(item)
+    assert stats["long_term_low"] is True
+    assert stats["overstock"] is True
+    assert stats["manufacture_reduce"] is True
+    assert stats["deplete_ym"] == LONG_LOW_DEMAND_CATEGORY
+    assert stats["depletion_category"] == LONG_LOW_DEMAND_CATEGORY
+
+    rows = select_long_term_low_items([item])
+    assert len(rows) >= 1
+    assert rows[0]["recommendation"] == MANUFACTURE_REDUCE_RECOMMENDATION
+    flags = collect_ai_analysis_flags([item])
+    assert len(flags.get("manufacture_reduce_items") or []) >= 1
+
+
+def test_manufacture_need_score_excludes_reliability():
+    from stock_logic import (
+        apply_manufacture_need_scores,
+        estimate_depletion,
+        get_depletion_stats,
+        manufacturing_priority_score,
+    )
+
+    # 동일 커버리지·수요·가속도에서 신뢰도만 달라도 점수 동일
+    a = manufacturing_priority_score(
+        years_left=2.0,
+        acceleration_label="급증",
+        demand_percentile=0.8,
+        pharmacopoeia_weight=1.0,
+        reliability_score=1.0,
+    )
+    b = manufacturing_priority_score(
+        years_left=2.0,
+        acceleration_label="급증",
+        demand_percentile=0.8,
+        pharmacopoeia_weight=1.0,
+        reliability_score=0.25,
+    )
+    assert a == b
+    assert 0 <= a <= 100
+
+    items = []
+    for i, qty in enumerate((80, 60, 40)):
+        items.append(
+            StockItem(
+                manage_no=f"P{i}",
+                name_ko=f"점수{i}",
+                std_type="표준생약",
+                corrected_points=[
+                    StockPoint(date(2021, 1, 1), qty + 60),
+                    StockPoint(date(2022, 1, 1), qty + 40),
+                    StockPoint(date(2023, 1, 1), qty + 20),
+                    StockPoint(date(2024, 1, 1), qty),
+                ],
+            )
+        )
+    cache = {}
+    for it in items:
+        get_depletion_stats(it, cache)
+    apply_manufacture_need_scores(
+        items,
+        cache,
+        match_result={"by_manage_no": {"P0": "KP", "P1": "KHP"}, "by_label": {}},
+    )
+    s0 = cache["P0"]["priority_score"]
+    s1 = cache["P1"]["priority_score"]
+    assert s0 > s1  # KP 가중치
+    assert "reliability" in cache["P0"]
+    assert cache["P0"]["pharmacopoeia_weight"] == 1.0
+    assert cache["P1"]["pharmacopoeia_weight"] == 0.5
+
+
+def test_compendium_herb_vs_origin_and_hwonchogeun_khp():
+    from stock_logic import (
+        CompendiumEntry,
+        StockItem,
+        format_compendium_stats_markdown,
+        match_compendium_inventory,
+        _normalize_compendium_pharmacopoeia,
+    )
+
+    assert _normalize_compendium_pharmacopoeia("훤초근", "") == "KHP"
+    assert _normalize_compendium_pharmacopoeia("훤초근", "KP") == "KP"
+
+    entries = [
+        CompendiumEntry(name_ko="감초", origin_ko="기원A", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="감초", origin_ko="기원B", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="당귀", origin_ko="기원C", pharmacopoeia="KHP"),
+        CompendiumEntry(name_ko="훤초근", origin_ko="기원D", pharmacopoeia=""),
+    ]
+    items = [StockItem(manage_no="1", name_ko="감초", std_type="표준생약")]
+    match = match_compendium_inventory(entries, items)
+    st = match["stats"]
+    assert st["herb_total"] == 3  # 감초·당귀·훤초근
+    assert st["origin_total"] == 4
+    assert st["herb_held"] == 1
+    assert st["herb_missing"] == 2
+    assert st["origin_held"] == 1
+    assert st["origin_missing"] == 3
+    assert any(e.pharmacopoeia == "KHP" for e in entries if e.name_ko == "훤초근")
+    md = format_compendium_stats_markdown(match)
+    assert "품목 기준" in md and "기원식물 기준" in md
+    assert "품목 확보율" in md and "기원 확보율" in md
+    # 미보유를 기원 전체로만 왜곡하지 않음
+    assert "미보유 생약 수: **2건**" in md
+    assert "미확보 기원 수: **3건**" in md
 
 
 def test_strip_duplicate_auto_summary_opinion():
@@ -1205,8 +1388,8 @@ def test_report_nav_has_no_other_tab():
     from stock_logic import split_markdown_report_sections
 
     md = (
-        "## 1페이지 요약 대시보드\n\n요약본문\n\n"
-        "## 소진 예상\n\n소진본문\n\n"
+        "## 종합현황 대시보드\n\n요약본문\n\n"
+        "## 제조 시급 품목 리스트\n\n소진본문\n\n"
         "## 예기치 않은 잔여 섹션\n\n잔여본문\n"
     )
     secs = split_markdown_report_sections(md)
@@ -1302,7 +1485,7 @@ def test_export_docx_markdown_table_as_grid():
 
 
 def test_export_docx_handles_large_table_as_plain_lines():
-    """대량 표도 무한루프 없이 Table로 저장."""
+    """대량 표는 상한으로 잘라 Table Grid로 저장(프리징 방지)."""
     import tempfile
     from pathlib import Path
     from docx import Document
@@ -1315,7 +1498,50 @@ def test_export_docx_handles_large_table_as_plain_lines():
         export_markdown_report_to_docx(md, out)
         doc = Document(str(out))
         assert len(doc.tables) == 1
-        assert len(doc.tables[0].rows) == 501  # header + 500 data
+        # MAX_TABLE_ROWS=80 + 상한 안내 행
+        assert len(doc.tables[0].rows) == 81
+        assert "상한" in doc.tables[0].rows[-1].cells[0].text
+
+
+def test_slim_report_five_sections_no_full_catalog_blowup():
+    """요약형 리포트는 5섹션이며 전수 장문 헤딩을 주입하지 않는다."""
+    from stock_logic import (
+        ensure_mandatory_report_sections,
+        format_appendix_full_catalog_markdown,
+        INCLUDE_REPORT_APPENDIX_DEFAULT,
+    )
+
+    flags = {
+        "dashboard": {
+            "kpis": [{"key": "managed", "label": "대상품목 수", "value": 2, "display": "2종"}],
+            "summary_lines": ["의견"],
+        },
+        "depletion_category_items": {
+            "긴급제조(<1년)": [
+                {"name_ko": f"시급{i}", "manage_no": f"U{i}", "years_left": 0.5, "priority_score": 90 - i}
+                for i in range(30)
+            ]
+        },
+        "manufacture_candidates": {},
+        "monitoring_targets": [{"name_ko": "가속1", "acceleration": "급증"}],
+        "missing_herb_items": [
+            {"name_ko": f"미보{i}", "pharmacopoeia_kind": "KP", "origin_count": 1}
+            for i in range(40)
+        ],
+        "compendium_stats": {"herb_missing": 40, "origin_missing": 40},
+    }
+    filled = ensure_mandatory_report_sections("", flags=flags)
+    assert "## 종합현황 대시보드" in filled
+    assert "## 제조 시급 품목 리스트" in filled
+    assert "## 로드맵 총괄 제안" in filled
+    assert INCLUDE_REPORT_APPENDIX_DEFAULT is False
+    assert "부록(별첨) — 전수 목록" not in filled or "생략" in filled
+    # TOP20만
+    assert "시급19" in filled
+    assert "시급29" not in filled
+    appendix = format_appendix_full_catalog_markdown(flags)
+    assert "부록" in appendix
+
 
 
 if __name__ == "__main__":
@@ -1334,7 +1560,7 @@ if __name__ == "__main__":
         test_markdown_report_renders_tables_as_html,
         test_split_markdown_report_sections,
         test_ensure_mandatory_report_sections,
-        test_truncated_ai_tables_replaced_with_full_list,
+        test_truncated_ai_tables_replaced_with_slim_list,
         test_ensure_accel_monitoring_section_always_has_body,
         test_manufacture_candidates_always_top10_by_score,
         test_compendium_missing_set_and_followup_filter,
@@ -1344,6 +1570,10 @@ if __name__ == "__main__":
         test_scatter_cat_label,
         test_scatter3d_records_from_sample,
         test_deplete_ym_uses_today_not_past_survey_date,
+        test_acceleration_seven_tiers_and_no_cap,
+        test_coverage_long_low_and_manufacture_reduce,
+        test_manufacture_need_score_excludes_reliability,
+        test_compendium_herb_vs_origin_and_hwonchogeun_khp,
         test_strip_duplicate_auto_summary_opinion,
         test_manufacture_section_always_has_priority_formula,
         test_unique_missing_compendium_examples,
@@ -1358,6 +1588,7 @@ if __name__ == "__main__":
         test_export_markdown_report_to_docx,
         test_export_docx_markdown_table_as_grid,
         test_export_docx_handles_large_table_as_plain_lines,
+        test_slim_report_five_sections_no_full_catalog_blowup,
     ]
     failed = 0
     for fn in tests:
