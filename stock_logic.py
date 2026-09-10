@@ -2244,20 +2244,381 @@ def format_accel_monitoring_markdown(monitoring: list[dict[str, Any]] | None) ->
     return "\n".join(lines)
 
 
+REPORT_URGENT_TOP_N = 20
+REPORT_REDUCE_TOP_N = 15
+REPORT_DEVELOP_TOP_N_PER_KIND = 25
+INCLUDE_REPORT_APPENDIX_DEFAULT = False
+
 MANDATORY_REPORT_SECTION_ORDER = (
     "summary",
-    "deplete",
-    "missing",
-    "manufacture",
-    "accel",
-    "compendium",
+    "urgent",
+    "reduce",
+    "develop",
+    "roadmap",
 )
-
 
 _CATALOG_SECTION_KEYS = frozenset(
-    {"deplete", "missing", "manufacture", "accel", "compendium"}
+    {"urgent", "reduce", "develop", "deplete", "missing", "manufacture", "accel", "compendium"}
 )
+_SLIM_QUANT_SECTION_KEYS = frozenset({"summary", "urgent", "reduce", "develop"})
 _TRUNCATION_CELL_MARKERS = ("...", "…", "(중략)", "중략", "(생략)", "생략")
+
+
+def _collect_urgent_rows(
+    flags: dict[str, Any] | None,
+    *,
+    limit: int = REPORT_URGENT_TOP_N,
+) -> list[dict[str, Any]]:
+    """커버리지 1~2년(긴급제조·제조준비) 시급 품목 TOP N."""
+    f = flags or {}
+    cat = f.get("depletion_category_items") or {}
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for bucket in ("긴급제조(<1년)", "제조준비(1~2년)"):
+        for r in cat.get(bucket) or []:
+            key = str(r.get("manage_no") or r.get("label") or r.get("name_ko") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows.append(dict(r))
+    # fallback: manufacture candidates with years_left <= 2
+    if len(rows) < limit:
+        mfg = f.get("manufacture_candidates") or {}
+        for bucket in (mfg.get("표준생약") or []) + (mfg.get("지표성분") or []):
+            yl = bucket.get("years_left")
+            if not isinstance(yl, (int, float)) or yl > 2.0:
+                continue
+            key = str(bucket.get("manage_no") or bucket.get("label") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows.append(dict(bucket))
+    rows.sort(
+        key=lambda r: (
+            float(r["years_left"]) if isinstance(r.get("years_left"), (int, float)) else 999.0,
+            -float(r.get("priority_score") or 0),
+        )
+    )
+    return rows[:limit]
+
+
+def _collect_reduce_rows(
+    flags: dict[str, Any] | None,
+    *,
+    limit: int = REPORT_REDUCE_TOP_N,
+) -> list[dict[str, Any]]:
+    """과다재고·제조 축소/보존 검토 상위 N."""
+    f = flags or {}
+    rows = list(f.get("manufacture_reduce_items") or [])
+    if not rows:
+        rows = [
+            r
+            for r in (f.get("long_term_low_items") or [])
+            if r.get("manufacture_reduce") or r.get("overstock")
+        ]
+    rows = sorted(
+        rows,
+        key=lambda r: (
+            0 if r.get("manufacture_reduce") else 1,
+            -float(r.get("stock_value") or 0),
+            -float(r.get("coverage_years") or r.get("years_left") or 0),
+        ),
+    )
+    return rows[:limit]
+
+
+def _collect_develop_rows_by_kind(
+    flags: dict[str, Any] | None,
+    match_result: dict[str, Any] | None = None,
+    *,
+    limit_per_kind: int = REPORT_DEVELOP_TOP_N_PER_KIND,
+) -> dict[str, list[dict[str, Any]]]:
+    """공정서 미확보 생약 — KP/KHP 분리 (품목 기준 우선)."""
+    f = flags or {}
+    mr = match_result or f.get("compendium_match") or {}
+    herbs = list(mr.get("missing_herb_items") or f.get("missing_herb_items") or [])
+    if not herbs:
+        # 기원 미확보에서 품목명 고유화
+        origins = list(f.get("missing_compendium_items") or mr.get("missing_items") or [])
+        seen: set[str] = set()
+        for r in origins:
+            name = str((r.get("name_ko") if isinstance(r, dict) else "") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            herbs.append(r if isinstance(r, dict) else {"name_ko": name})
+
+    by_kind: dict[str, list[dict[str, Any]]] = {"KP": [], "KHP": [], "기타": []}
+    for r in herbs:
+        kind = str(r.get("pharmacopoeia_kind") or "").upper()
+        if kind == "KP":
+            bucket = "KP"
+        elif kind == "KHP" or "KHP" in str(r.get("pharmacopoeia") or "").upper():
+            bucket = "KHP"
+        else:
+            ph = str(r.get("pharmacopoeia") or "")
+            if "생약규격집" in ph or "약전외" in ph:
+                bucket = "KHP"
+            elif "약전" in ph or ph.upper() == "KP":
+                bucket = "KP"
+            else:
+                bucket = "기타"
+        if len(by_kind[bucket]) >= limit_per_kind:
+            continue
+        by_kind[bucket].append(r)
+    return by_kind
+
+
+def format_slim_dashboard_markdown(
+    flags: dict[str, Any] | None = None,
+    match_result: dict[str, Any] | None = None,
+) -> str:
+    """① 종합현황 대시보드 — 핵심 지표만 (전수 목록 없음)."""
+    f = flags or {}
+    dashboard = f.get("dashboard") or {}
+    kpis = list(dashboard.get("kpis") or [])
+    mr = match_result or f.get("compendium_match") or {}
+    st = (mr.get("stats") if isinstance(mr, dict) else None) or f.get("compendium_stats") or {}
+    cat = f.get("depletion_category_items") or {}
+
+    managed = next((k for k in kpis if k.get("key") == "managed"), None)
+    total_n = int((managed or {}).get("value") or 0)
+    urgent_1_3 = (
+        len(cat.get("긴급제조(<1년)") or [])
+        + len(cat.get("제조준비(1~2년)") or [])
+        + len(cat.get("제조검토(2~3년)") or [])
+    )
+    urgent_1_2 = len(cat.get("긴급제조(<1년)") or []) + len(cat.get("제조준비(1~2년)") or [])
+    long_low_n = len(cat.get(LONG_LOW_DEMAND_CATEGORY) or []) + len(
+        cat.get("과다재고검토(10~15년)") or []
+    )
+    reduce_n = len(f.get("manufacture_reduce_items") or [])
+    herb_pct = st.get("herb_coverage_pct")
+    origin_pct = st.get("origin_coverage_pct")
+    herb_txt = (
+        f"{st.get('herb_held', '-')}/{st.get('herb_total', '-')} "
+        f"({herb_pct if herb_pct is not None else '-'}%)"
+    )
+    origin_txt = (
+        f"{st.get('origin_held', '-')}/{st.get('origin_total', '-')}"
+        f" ({origin_pct if origin_pct is not None else '-'}%)"
+    )
+
+    lines = [
+        "## 종합현황 대시보드",
+        "",
+        "요약형 핵심 지표 (10~15페이지 보고서 · 전수 목록은 부록에서 선택)",
+        "",
+        "| 지표 | 값 |",
+        "| --- | --- |",
+        f"| 전체 품목 수 | {total_n}종 |",
+        f"| 공정서 품목 확보율 | {herb_txt} |",
+        f"| 공정서 기원 확보율 | {origin_txt} |",
+        f"| 재고 커버리지 1~2년(시급) | {urgent_1_2}종 |",
+        f"| 재고 커버리지 1~3년(긴급~검토) | {urgent_1_3}종 |",
+        f"| 과다재고·장기저수요 | {long_low_n}종 |",
+        f"| 제조 축소/보존 검토 | {reduce_n}종 |",
+        "",
+    ]
+    # 보조 KPI(환산·신뢰도 등) — 최대 6개
+    extra_keys = {"total_value", "reliability_ab", "accel", "zero_stock", "manufacture"}
+    extras = [k for k in kpis if k.get("key") in extra_keys][:6]
+    if extras:
+        lines.append("### 보조 지표")
+        lines.append("")
+        lines.append("| 지표 | 값 |")
+        lines.append("| --- | --- |")
+        for k in extras:
+            lines.append(f"| {k.get('label')} | {k.get('display')} |")
+        lines.append("")
+    lines.append("### 자동 종합 의견")
+    for s in dashboard.get("summary_lines") or []:
+        lines.append(f"- {s}")
+    if not dashboard.get("summary_lines"):
+        lines.append("- (종합 의견 없음)")
+    return "\n".join(lines)
+
+
+def format_urgent_manufacture_markdown(
+    flags: dict[str, Any] | None = None,
+    *,
+    limit: int = REPORT_URGENT_TOP_N,
+) -> str:
+    """② 제조 시급 품목 TOP N (1~2년 이내 소진)."""
+    rows = _collect_urgent_rows(flags, limit=limit)
+    lines = [
+        "## 제조 시급 품목 리스트",
+        "",
+        f"재고 커버리지 1~2년 이내 소진 예상 TOP {limit} "
+        f"(실제 {len(rows)}건 · 전수 아님)",
+        "",
+        f"{PRIORITY_FORMULA_KO}",
+        "",
+    ]
+    if rows:
+        lines.extend(_manufacture_rows_to_markdown_table(rows))
+    else:
+        lines.append("(해당 없음 — 1~2년 이내 시급 품목 0건)")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_overstock_reduce_markdown(
+    flags: dict[str, Any] | None = None,
+    *,
+    limit: int = REPORT_REDUCE_TOP_N,
+) -> str:
+    """③ 과다재고·제조 축소 권고 TOP N."""
+    rows = _collect_reduce_rows(flags, limit=limit)
+    lines = [
+        "## 과다재고 및 제조 축소 권고 품목",
+        "",
+        f"장기 저분양 ∩ 과다재고(커버리지≥15년) 등 상위 {limit}건 "
+        f"(실제 {len(rows)}건)",
+        "",
+        "| # | 한글명 | 관리번호 | 유형 | 커버리지(년) | 최근분양 | 권고 |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    if not rows:
+        lines.append("| - | (해당 없음) | - | - | - | - | - |")
+        lines.append("")
+        return "\n".join(lines)
+    for i, r in enumerate(rows, 1):
+        cov = r.get("coverage_years", r.get("years_left"))
+        cov_txt = f"{cov:.1f}" if isinstance(cov, (int, float)) else "-"
+        rr = r.get("recent_rate", r.get("annual_rate"))
+        rr_txt = f"{rr:.2f}" if isinstance(rr, (int, float)) else "-"
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(i),
+                    str(r.get("name_ko") or r.get("label") or "-").replace("|", "/"),
+                    str(r.get("manage_no") or "-").replace("|", "/"),
+                    str(r.get("std_type") or "-").replace("|", "/"),
+                    cov_txt,
+                    rr_txt,
+                    str(r.get("recommendation") or MANUFACTURE_REDUCE_RECOMMENDATION).replace(
+                        "|", "/"
+                    ),
+                ]
+            )
+            + " |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_develop_targets_markdown(
+    flags: dict[str, Any] | None = None,
+    match_result: dict[str, Any] | None = None,
+    *,
+    limit_per_kind: int = REPORT_DEVELOP_TOP_N_PER_KIND,
+) -> str:
+    """④ 공정서 미확보 표준생약 개발 대상 (KP/KHP 분리, 상한)."""
+    by_kind = _collect_develop_rows_by_kind(
+        flags, match_result, limit_per_kind=limit_per_kind
+    )
+    st = (
+        (match_result or {}).get("stats")
+        or (flags or {}).get("compendium_stats")
+        or {}
+    )
+    lines = [
+        "## 공정서 미확보 표준생약 개발 대상",
+        "",
+        f"품목 기준 미보유 {st.get('herb_missing', '-')}건 · "
+        f"기원 미확보 {st.get('origin_missing', '-')}건 중 "
+        f"KP/KHP 각 최대 {limit_per_kind}건만 수록 (전수 생략)",
+        "",
+    ]
+    for kind in ("KP", "KHP", "기타"):
+        rows = by_kind.get(kind) or []
+        if kind == "기타" and not rows:
+            continue
+        lines.append(f"### {kind} 수재 미확보 ({len(rows)}건)")
+        lines.append("")
+        if not rows:
+            lines.append("(해당 없음)")
+            lines.append("")
+            continue
+        lines.append("| # | 생약명(한글) | 기원행수 | 공정서 |")
+        lines.append("| --- | --- | --- | --- |")
+        for i, r in enumerate(rows, 1):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(i),
+                        str(r.get("name_ko") or r.get("name_en") or "-").replace("|", "/"),
+                        str(r.get("origin_count") or "-"),
+                        str(
+                            r.get("pharmacopoeia_kind") or r.get("pharmacopoeia") or kind
+                        ).replace("|", "/"),
+                    ]
+                )
+                + " |"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def format_roadmap_markdown(
+    flags: dict[str, Any] | None = None,
+    match_result: dict[str, Any] | None = None,
+) -> str:
+    """⑤ 로드맵 총괄 제안 — 유지/확대/신규/축소 골격."""
+    f = flags or {}
+    urgent_n = len(_collect_urgent_rows(f, limit=9999))
+    reduce_n = len(_collect_reduce_rows(f, limit=9999))
+    by_kind = _collect_develop_rows_by_kind(f, match_result, limit_per_kind=9999)
+    develop_n = sum(len(v) for v in by_kind.values())
+    accel_n = len(f.get("monitoring_targets") or [])
+    lines = [
+        "## 로드맵 총괄 제안",
+        "",
+        "유지 · 확대 · 신규 · 축소 관점의 실행 로드맵 (요약형).",
+        "",
+        "### 유지",
+        f"- 커버리지 적정(5~10년) 구간 품목은 현 재고·분양 패턴을 유지 모니터링합니다.",
+        f"- 분양 가속도 '안정' 품목은 기존 제조 주기·로트 규모를 유지합니다.",
+        "",
+        "### 확대",
+        f"- 제조 시급(1~2년) 후보 {urgent_n}종: 차기 제조 물량·일정을 앞당기는 확대를 검토합니다.",
+        f"- 분양 가속(신규수요·급증·증가) {accel_n}종: 수요 증가에 맞춘 생산 확대를 검토합니다.",
+        "",
+        "### 신규",
+        f"- 공정서 미확보 개발 대상(표본) {develop_n}종: KP/KHP 분리 목록을 기준으로 "
+        "표준생약 신규 확보 우선순위를 수립합니다.",
+        "",
+        "### 축소",
+        f"- 제조 축소/보존 검토 {reduce_n}종: 장기 저분양·과다재고 품목은 차기 제조 물량 축소·보존을 권고합니다.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def format_appendix_full_catalog_markdown(
+    flags: dict[str, Any] | None = None,
+    match_result: dict[str, Any] | None = None,
+) -> str:
+    """부록(별첨) — 전수 목록. 기본 리포트에서는 생략."""
+    f = flags or {}
+    lines = [
+        "## 부록(별첨) — 전수 목록",
+        "",
+        "본 부록은 요약 보고서에서 생략된 전수 표를 포함합니다.",
+        "",
+        format_depletion_markdown(f.get("depletion_category_items")),
+        "",
+        format_accel_monitoring_markdown(f.get("monitoring_targets")),
+        "",
+        format_manufacture_review_markdown(f.get("manufacture_candidates")),
+        "",
+        format_compendium_stats_markdown(match_result or f.get("compendium_match")),
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def _report_section_is_truncated(markdown: str) -> bool:
@@ -2595,29 +2956,43 @@ def build_mandatory_section_markdown(
     section_key: str,
     flags: dict[str, Any] | None = None,
     match_result: dict[str, Any] | None = None,
+    *,
+    include_appendix: bool = INCLUDE_REPORT_APPENDIX_DEFAULT,
 ) -> str:
-    """고정 리포트 탭용 섹션 본문을 ai_flags·공정서 매칭에서 생성."""
+    """고정 리포트 탭용 섹션 본문 — 요약형 5섹션(+선택 부록)."""
     f = flags or {}
     if section_key == "summary":
-        dashboard = f.get("dashboard") or {}
-        if dashboard.get("kpis"):
-            return format_kpi_dashboard_markdown(dashboard)
-        return "## 1페이지 요약 대시보드 (핵심 KPI)\n\n(요약 KPI 데이터 없음)"
-    if section_key == "deplete":
-        return format_depletion_markdown(f.get("depletion_category_items"))
-    if section_key == "missing":
-        cat = f.get("depletion_category_items") or {}
-        zero_rows = cat.get(ZERO_STOCK_CATEGORY) or []
-        miss_rows = f.get("missing_compendium_items") or []
-        return format_missing_markdown(zero_rows, miss_rows)
-    if section_key == "manufacture":
-        return _ensure_manufacture_priority_formula(
-            format_manufacture_review_markdown(f.get("manufacture_candidates"))
+        return format_slim_dashboard_markdown(f, match_result)
+    if section_key == "urgent":
+        return format_urgent_manufacture_markdown(f)
+    if section_key == "reduce":
+        return format_overstock_reduce_markdown(f)
+    if section_key == "develop":
+        return format_develop_targets_markdown(f, match_result)
+    if section_key == "roadmap":
+        return format_roadmap_markdown(f, match_result)
+    if section_key == "appendix":
+        if include_appendix:
+            return format_appendix_full_catalog_markdown(f, match_result)
+        return (
+            "## 부록(별첨) — 전수 목록\n\n"
+            "_요약 보고서에서는 전수 목록을 생략합니다. "
+            "챗봇에서 전수/전체 요청 시 실시간으로 제공합니다._\n"
         )
-    if section_key == "accel":
-        return format_accel_monitoring_markdown(f.get("monitoring_targets"))
+    # 구버전 키 호환 → 슬림 섹션으로 리다이렉트
+    if section_key == "deplete":
+        return format_urgent_manufacture_markdown(f)
+    if section_key == "manufacture":
+        return _ensure_manufacture_priority_formula(format_urgent_manufacture_markdown(f))
+    if section_key == "missing":
+        return format_develop_targets_markdown(f, match_result)
     if section_key == "compendium":
-        return format_compendium_stats_markdown(match_result)
+        return format_develop_targets_markdown(f, match_result)
+    if section_key == "accel":
+        # 가속은 로드맵·현황에 요약 반영 — 전수 표 대신 상위 요약만
+        mon = list(f.get("monitoring_targets") or [])[:10]
+        body = format_accel_monitoring_markdown(mon)
+        return body.replace("생략 없음", f"상위 {len(mon)}건만 수록")
     return ""
 
 
@@ -2628,20 +3003,23 @@ def _mandatory_section_has_source_data(
 ) -> bool:
     f = flags or {}
     if section_key == "summary":
-        return bool((f.get("dashboard") or {}).get("kpis"))
-    if section_key == "deplete":
-        cat = f.get("depletion_category_items") or {}
-        return any(len(cat.get(c) or []) for c in DEPLETION_CATEGORY_ORDER if c != ZERO_STOCK_CATEGORY)
-    if section_key == "missing":
-        cat = f.get("depletion_category_items") or {}
-        return bool(cat.get(ZERO_STOCK_CATEGORY)) or bool(f.get("missing_compendium_items"))
-    if section_key == "manufacture":
-        mfg = f.get("manufacture_candidates") or {}
-        return bool(mfg.get("표준생약")) or bool(mfg.get("지표성분"))
+        return bool((f.get("dashboard") or {}).get("kpis")) or bool(f.get("by_code"))
+    if section_key in ("urgent", "deplete", "manufacture"):
+        return bool(_collect_urgent_rows(f, limit=1)) or bool(
+            (f.get("manufacture_candidates") or {}).get("표준생약")
+        ) or bool((f.get("manufacture_candidates") or {}).get("지표성분"))
+    if section_key == "reduce":
+        return bool(_collect_reduce_rows(f, limit=1)) or bool(f.get("long_term_low_items"))
+    if section_key in ("develop", "missing", "compendium"):
+        return bool(match_result) or bool(f.get("missing_compendium_items")) or bool(
+            f.get("missing_herb_items")
+        )
+    if section_key == "roadmap":
+        return bool(f.get("dashboard") or f.get("by_code"))
     if section_key == "accel":
         return bool(f.get("monitoring_targets"))
-    if section_key == "compendium":
-        return match_result is not None
+    if section_key == "appendix":
+        return False
     return False
 
 
@@ -2651,16 +3029,20 @@ def _section_needs_mandatory_inject(
     flags: dict[str, Any] | None,
     match_result: dict[str, Any] | None,
 ) -> bool:
-    """빈 본문·중략 표이거나, 목록 섹션은 정량 전수 표로 항상 교체."""
+    """빈·중략 본문 또는 슬림 정량 섹션은 앱 산출 표로 교체."""
     raw = raw_section or ""
     if raw_section is None or _report_section_body_is_empty(raw):
         return True
     if _report_section_is_truncated(raw):
         return True
-    if section_key in _CATALOG_SECTION_KEYS and _mandatory_section_has_source_data(
+    # 요약형 정량 섹션: 소스 데이터가 있으면 항상 슬림 표로 교체(전수 폭주 방지)
+    if section_key in _SLIM_QUANT_SECTION_KEYS and _mandatory_section_has_source_data(
         section_key, flags, match_result
     ):
         return True
+    # 로드맵: AI 서술이 있으면 유지, 없을 때만 골격 주입
+    if section_key == "roadmap":
+        return False
     if _mandatory_section_has_source_data(section_key, flags, match_result):
         if not _report_section_has_item_rows(raw):
             return True
@@ -2671,15 +3053,25 @@ def ensure_mandatory_report_sections(
     md_text: str,
     flags: dict[str, Any] | None = None,
     match_result: dict[str, Any] | None = None,
+    *,
+    include_appendix: bool = INCLUDE_REPORT_APPENDIX_DEFAULT,
 ) -> str:
-    """리포트 필수 섹션(요약·소진·미보유·제조검토·가속·공정서) 본문을 항상 채운다."""
+    """요약형 필수 섹션(현황·시급·축소·개발·로드맵) 본문을 항상 채운다."""
     text = (md_text or "").strip()
     to_inject: list[tuple[str, str]] = []
     for key in MANDATORY_REPORT_SECTION_ORDER:
-        built = build_mandatory_section_markdown(key, flags, match_result)
+        built = build_mandatory_section_markdown(
+            key, flags, match_result, include_appendix=include_appendix
+        )
         raw = _extract_raw_section(text, key) if text else None
         if _section_needs_mandatory_inject(key, raw, flags, match_result):
             to_inject.append((key, built))
+
+    if include_appendix:
+        appendix = build_mandatory_section_markdown(
+            "appendix", flags, match_result, include_appendix=True
+        )
+        to_inject.append(("appendix", appendix))
 
     if not to_inject:
         return text
@@ -2687,15 +3079,14 @@ def ensure_mandatory_report_sections(
     cleaned = text
     for key, _ in to_inject:
         cleaned = _strip_section_blocks(cleaned, key)
+    # 구버전 장문 섹션 헤딩도 제거해 중복 폭주 방지
+    for legacy in ("deplete", "missing", "manufacture", "accel", "compendium"):
+        cleaned = _strip_section_blocks(cleaned, legacy)
     if any(key == "summary" for key, _ in to_inject):
         cleaned = _strip_auto_summary_opinion_blocks(cleaned)
 
     summary_blocks = [body for key, body in to_inject if key == "summary"]
-    tail_blocks = [
-        _ensure_manufacture_priority_formula(body) if key == "manufacture" else body
-        for key, body in to_inject
-        if key != "summary"
-    ]
+    tail_blocks = [body for key, body in to_inject if key != "summary"]
 
     parts: list[str] = []
     if summary_blocks:
@@ -3505,9 +3896,7 @@ def build_ai_prompt(
     if flags is None:
         flags = collect_ai_analysis_flags(items)
     as_of = date.today()
-    dashboard = flags.get("dashboard") or build_kpi_dashboard(items, flags)
-    # compendium_* 원문 장문은 토큰 폭주 원인 — 통계는 diet JSON에만 반영
-    _ = (compendium_context, compendium_match_report)
+    _ = (compendium_context, compendium_match_report, flags.get("dashboard") if flags else None)
 
     lines = [
         "너는 대한민국 약전(KP)·생약규격집(KHP) 생약표준품 수석 데이터 분석가이다.",
@@ -3517,16 +3906,19 @@ def build_ai_prompt(
         "- 아래 Token Diet 요약만 근거로 분석하세요. 전수 목록·엑셀 원행·추이는 제공되지 않습니다.",
         "- 수치를 임의로 바꾸거나 없는 품목을 지어내지 마세요.",
         "- 서술: ①현황 수치 → ②원인 → ③권고. '제언' 섹션 금지.",
-        "- 전수 표(소진·미보유·모니터링)는 앱이 리포트에 자동 주입하므로 모델은 요약 해석만 작성.",
+        "- 보고서는 10~15페이지 요약형입니다. 전수 품목 나열 금지.",
+        "- 정량 표(시급 TOP20·축소 TOP15·개발 대상)는 앱이 주입하므로 모델은 해석·로드맵만 작성.",
         "",
-        "[출력]",
-        "1. 최상단 ## 1페이지 요약 대시보드 (아래 KPI 표를 그대로 포함, 종합의견 5줄 내외 1회)",
-        "2. ## 소진 예상 / ## 미보유 / ## 차년도 제조 검토 / ## 분양 가속 모니터링 / "
-        "## 공정서 DB 매칭 및 수재 현황 헤딩으로 핵심 이슈만 서술",
-        f"3. 제조우선순위 공식 인용: {PRIORITY_FORMULA_KO}",
+        "[출력 — 요약형 5섹션만]",
+        "1. ## 종합현황 대시보드 — 핵심 KPI 해석 5줄 내외 (표 재구성 금지)",
+        "2. ## 제조 시급 품목 — TOP20 의미·위험 요인 요약",
+        "3. ## 과다재고 및 제조 축소 권고 — 상위 품목 시사점",
+        "4. ## 공정서 미확보 개발 대상 — KP/KHP 분리 우선순위 제언",
+        "5. ## 로드맵 총괄 제안 — 유지/확대/신규/축소 각 3~5문장",
+        f"6. 제조필요도 공식 인용: {PRIORITY_FORMULA_KO}",
         "",
-        "[1페이지 요약 대시보드(핵심 KPI)]",
-        format_kpi_dashboard_markdown(dashboard),
+        "[종합현황 대시보드(핵심 KPI)]",
+        format_slim_dashboard_markdown(flags, None),
         "",
         build_ai_token_diet_block(flags, items),
         "",
@@ -4304,12 +4696,48 @@ def _collapse_comma_items_html(
 
 CANONICAL_REPORT_NAV = (
     # (key, short_label, title_keywords) — 앞쪽 키워드 우선
-    ("summary", "요약", ("대시보드", "KPI", "요약")),
-    ("deplete", "소진", ("소진 예상", "소진기간", "소진 기간", "소진구간", "소진")),
-    ("missing", "미보유", ("미보유", "재고 없음", "재고없음", "부재")),
-    ("manufacture", "검토", ("제조검토", "제조 검토", "우선검토", "제조")),
-    ("accel", "가속", ("분양 가속 모니터링", "모니터링", "급가속", "분양 가속", "가속")),
-    ("compendium", "공정서", ("공정서", "수재", "매칭")),
+    ("summary", "현황", ("종합현황", "대시보드", "KPI", "요약")),
+    (
+        "urgent",
+        "시급",
+        (
+            "제조 시급",
+            "시급 품목",
+            "긴급제조",
+            "제조준비",
+            "소진 예상",
+            "소진기간",
+            "소진 기간",
+            "소진구간",
+            "소진",
+            "차년도 제조",
+            "제조검토",
+            "제조 검토",
+            "제조",
+        ),
+    ),
+    (
+        "reduce",
+        "축소",
+        ("과다재고", "제조 축소", "축소 권고", "장기 저분양", "보존 검토", "축소"),
+    ),
+    (
+        "develop",
+        "개발",
+        (
+            "미확보",
+            "개발 대상",
+            "공정서 미보유",
+            "미보유",
+            "재고 없음",
+            "재고없음",
+            "공정서 DB",
+            "공정서",
+            "수재",
+            "매칭",
+        ),
+    ),
+    ("roadmap", "로드맵", ("로드맵", "총괄 제안", "유지/확대", "권고안", "로드 맵")),
 )
 
 
@@ -4363,12 +4791,11 @@ def split_markdown_report_sections(
     for key, short, _ in CANONICAL_REPORT_NAV:
         parts = buckets.get(key) or []
         title = {
-            "summary": "1페이지 요약 대시보드",
-            "deplete": "소진 예상",
-            "missing": "미보유(재고 없음·공정서 미보유)",
-            "manufacture": "차년도 제조 검토",
-            "accel": "분양 가속 모니터링",
-            "compendium": "공정서 DB 매칭",
+            "summary": "종합현황 대시보드",
+            "urgent": "제조 시급 품목 리스트",
+            "reduce": "과다재고 및 제조 축소 권고 품목",
+            "develop": "공정서 미확보 표준생약 개발 대상",
+            "roadmap": "로드맵 총괄 제안",
         }.get(key, short)
         built = build_mandatory_section_markdown(key, flags, match_result)
         if parts:
@@ -4379,8 +4806,6 @@ def split_markdown_report_sections(
                 body = _strip_auto_summary_opinion_blocks(body)
             if _section_needs_mandatory_inject(key, body, flags, match_result):
                 body = built
-            elif key == "manufacture":
-                body = _ensure_manufacture_priority_formula(body)
         else:
             body = built
         sections.append(
@@ -4998,17 +5423,22 @@ def format_chat_analysis_maps_json(flags: dict[str, Any] | None) -> str:
     )
 
 
-def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
+def export_markdown_report_to_docx(
+    md_text: str,
+    path: str | Path,
+    *,
+    progress_callback: Any = None,
+) -> None:
     """AI 리포트 → Word(.docx): 맑은 고딕 + 마크다운 표→Table Grid.
 
     표 블록은 버퍼로 모아 격자 표로 생성하고, 구분선(|---|---|)은 건너뛴다.
-    행 상한으로 UI 프리징을 방지한다.
+    progress_callback(i, total)을 줄 파싱 루프에서 호출해 UI 프리징을 방지한다.
     """
     try:
         from docx import Document
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from docx.oxml.ns import qn
-        from docx.shared import Pt
+        from docx.shared import Pt, Cm
     except ImportError as exc:
         raise RuntimeError(
             "Word 내보내기에 python-docx가 필요합니다. pip install python-docx"
@@ -5019,10 +5449,26 @@ def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
         raise ValueError("내보낼 리포트 본문이 비어 있습니다.")
 
     FONT_KO = "맑은 고딕"
-    MAX_LINES = 8000
-    MAX_TABLE_ROWS = 1500
+    MAX_LINES = 4000  # 요약형 보고서 상한 (전수 폭주 차단)
+    MAX_TABLE_ROWS = 80
+    PUMP_EVERY = 15
 
     doc = Document()
+    try:
+        for section in doc.sections:
+            section.top_margin = Cm(1.5)
+            section.bottom_margin = Cm(1.5)
+            section.left_margin = Cm(1.5)
+            section.right_margin = Cm(1.5)
+    except Exception:
+        pass
+
+    def _pump(i: int = 0, total: int = 0) -> None:
+        if callable(progress_callback):
+            try:
+                progress_callback(i, total)
+            except Exception:
+                pass
 
     def _set_run_font(run, *, bold: bool | None = None, size_pt: float | None = None) -> None:
         run.font.name = FONT_KO
@@ -5064,9 +5510,10 @@ def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
     lines = text.splitlines()
     if len(lines) > MAX_LINES:
         lines = lines[:MAX_LINES]
-        lines.append("… (이하 생략 — 내보내기 안전 상한)")
+        lines.append("… (이하 생략 — 요약형 내보내기 안전 상한)")
 
     table_buffer: list[list[str]] = []
+    total_lines = len(lines)
 
     def _is_separator_row(cells: list[str]) -> bool:
         if not cells:
@@ -5102,12 +5549,14 @@ def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
             return
         if len(parsed) > MAX_TABLE_ROWS:
             parsed = parsed[:MAX_TABLE_ROWS]
-            parsed.append(["… (표 행 상한으로 이하 생략)"] + [""] * (max(len(r) for r in parsed) - 1))
+            parsed.append(
+                ["… (표 행 상한으로 이하 생략)"]
+                + [""] * (max(len(r) for r in parsed) - 1)
+            )
 
         max_cols = max(len(r) for r in parsed)
         if max_cols <= 0:
             return
-        # 열 수 맞추기
         normalized = [r + [""] * (max_cols - len(r)) for r in parsed]
         tbl = doc.add_table(rows=len(normalized), cols=max_cols)
         try:
@@ -5125,18 +5574,25 @@ def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
                 if i == 0:
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     _set_cell_shading(cell)
-        doc.add_paragraph("")  # 표 다음 여백
+            if i and i % 10 == 0:
+                _pump(i, len(normalized))
+        doc.add_paragraph("")
 
-    for line in lines:
+    for idx, line in enumerate(lines):
+        if idx % PUMP_EVERY == 0:
+            _pump(idx, total_lines)
         stripped = line.strip()
         if stripped.startswith("|") and "|" in stripped[1:]:
-            # |a|b| 또는 |a|b 형태 모두 허용
             raw = stripped
             if raw.endswith("|"):
                 cols = [c.strip() for c in raw.strip("|").split("|")]
             else:
                 parts = raw.split("|")
-                cols = [c.strip() for c in parts[1:]] if parts[0] == "" else [c.strip() for c in parts]
+                cols = (
+                    [c.strip() for c in parts[1:]]
+                    if parts[0] == ""
+                    else [c.strip() for c in parts]
+                )
             table_buffer.append(cols)
             continue
 
@@ -5167,6 +5623,7 @@ def export_markdown_report_to_docx(md_text: str, path: str | Path) -> None:
     if table_buffer:
         flush_table(table_buffer)
 
+    _pump(total_lines, total_lines)
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(out))

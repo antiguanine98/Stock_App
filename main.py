@@ -1,5 +1,5 @@
 """
-생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.67
+생약표준품 재고 분석 및 소급 보정 시스템 (PyQt6) v1.68
 """
 
 from __future__ import annotations
@@ -116,7 +116,7 @@ def _writable_dir() -> Path:
 
 CONFIG_PATH = _writable_dir() / "config.json"
 VIEWER_HTML_PATH = _app_dir() / "viewer.html"
-APP_VERSION = "v1.67"
+APP_VERSION = "v1.68"
 AUTHOR_CREDIT = "made by 2026MFDSyouthinternKYHLCY"
 
 # 서버 확인 최신 Flash — 탐색 실패 시에도 이 기본값으로 연결
@@ -2893,7 +2893,7 @@ class MainWindow(QMainWindow):
         )
 
     def _download_report_word(self) -> None:
-        """AI 리포트를 Word(.docx)로 저장 — 본문 검사·경량 변환·WaitCursor."""
+        """AI 리포트를 Word(.docx)로 저장 — Table Grid·맑은 고딕·WaitCursor·processEvents."""
         from PyQt6.QtWidgets import QFileDialog
 
         placeholder_hints = (
@@ -2930,10 +2930,16 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith(".docx"):
             path += ".docx"
 
+        def _pump(_i: int = 0, _n: int = 0) -> None:
+            QApplication.processEvents()
+
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            export_markdown_report_to_docx(report_text, path)
-            QApplication.processEvents()
+            _pump()
+            export_markdown_report_to_docx(
+                report_text, path, progress_callback=_pump
+            )
+            _pump()
             QMessageBox.information(self, "완료", "Word 파일 저장이 완료되었습니다.")
             self.statusBar().showMessage(f"Word 저장 완료: {path}", 5000)
         except Exception as exc:
@@ -2944,10 +2950,19 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def _download_report_pdf(self) -> None:
-        """현재 렌더링된 리포트 서식을 PDF로 저장 (QPdfWriter)."""
+        """리포트 뷰어 서식을 QPdfWriter/QTextDocument로 A4·여백 15mm PDF 저장."""
         from PyQt6.QtWidgets import QFileDialog
 
-        if not self._initial_report:
+        placeholder_hints = (
+            "생약표준품 분양·소진 예측 AI 리포트가 여기에 표시됩니다",
+            "엑셀 업로드 후",
+        )
+        report_text = (self._initial_report or "").strip()
+        if (
+            not report_text
+            or any(h in report_text for h in placeholder_hints)
+            or len(report_text) < 40
+        ):
             QMessageBox.information(self, "안내", "먼저 AI 분석 리포트를 생성해 주세요.")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -2960,28 +2975,38 @@ class MainWindow(QMainWindow):
             return
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
+            QApplication.processEvents()
             writer = QPdfWriter(path)
             writer.setTitle("생약표준품 AI 분석 리포트")
             writer.setPageLayout(
                 QPageLayout(
                     QPageSize(QPageSize.PageSizeId.A4),
                     QPageLayout.Orientation.Portrait,
-                    QMarginsF(12, 12, 12, 12),
+                    QMarginsF(15, 15, 15, 15),
                     QPageLayout.Unit.Millimeter,
                 )
             )
+            QApplication.processEvents()
             html = markdown_report_to_collapsible_html(
-                self._initial_report,
+                report_text,
                 expanded_ids=set(self._report_expanded_ids),
             )
+            QApplication.processEvents()
             doc = QTextDocument()
             doc.setDefaultFont(QFont("Malgun Gothic", 10))
             doc.setHtml(html)
+            QApplication.processEvents()
             doc.print(writer)
+            QApplication.processEvents()
             self.statusBar().showMessage(f"PDF 저장 완료: {path}", 5000)
+            QMessageBox.information(self, "완료", "PDF 파일 저장이 완료되었습니다.")
         except Exception as exc:
             QMessageBox.critical(self, "PDF 저장 실패", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _show_report_find_bar(self) -> None:
         self.report_find_bar.show()
