@@ -1651,6 +1651,148 @@ def test_thin_roadmap_replaced_with_pillars_and_examples():
     assert _roadmap_section_is_thin(full) is False
 
 
+
+def test_compendium_en_first_match_and_failures():
+    """영문명 우선 매칭 + 미매칭은 match_failures로 분리."""
+    from stock_logic import CompendiumEntry, StockItem, match_compendium_inventory
+
+    entries = [
+        CompendiumEntry(name_ko="감초", name_en="Glycyrrhizae Radix", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="당귀", name_en="Angelicae Gigantis Radix", pharmacopoeia="KP"),
+    ]
+    items = [
+        # 한글명은 다르지만 영문명으로 매칭되어야 함
+        StockItem(manage_no="G1", name_ko="감초추출물", name_en="Glycyrrhizae Radix", balance=5),
+        StockItem(manage_no="U1", name_ko="미등록생약", name_en="Unknown Herba", balance=2),
+    ]
+    match = match_compendium_inventory(entries, items)
+    types = [c["match_type"] for c in match["corrections"]]
+    assert "fuzzy_en" in types
+    assert match["stats"]["match_failure_count"] == 1
+    assert len(match["match_failures"]) == 1
+    assert match["match_failures"][0]["name_en"] == "Unknown Herba"
+    assert match["stats"]["missing_count"] == 1  # 당귀 미보유
+
+
+def test_compendium_origin_exception_excluded_from_missing():
+    from stock_logic import (
+        CompendiumEntry,
+        StockItem,
+        format_compendium_stats_markdown,
+        match_compendium_inventory,
+    )
+
+    entries = [
+        CompendiumEntry(name_ko="감초", name_en="Glycyrrhizae Radix", pharmacopoeia="KP"),
+        CompendiumEntry(
+            name_ko="예외약",
+            name_en="Excepta Herba",
+            pharmacopoeia="KP",
+            origin_ko="그 변종",
+            is_origin_exception=True,
+        ),
+    ]
+    items = [StockItem(manage_no="G1", name_ko="감초", name_en="Glycyrrhizae Radix", balance=1)]
+    match = match_compendium_inventory(entries, items)
+    assert match["stats"]["origin_exception_count"] == 1
+    assert all(e.name_ko != "예외약" for e in match["missing"])
+    assert match["stats"]["missing_count"] == 0
+    md = format_compendium_stats_markdown(match)
+    assert "기원 예외" in md
+
+
+def test_compendium_std_ref_ab_groups_from_columns():
+    import pandas as pd
+    from stock_logic import _parse_compendium_entries, format_compendium_stats_markdown, match_compendium_inventory, StockItem
+
+    df = pd.DataFrame(
+        [
+            {
+                "생약명(한글)": "감초",
+                "생약명(영어)": "Glycyrrhizae Radix",
+                "기원(한글)": "콩과",
+                "확인시험 표준품 1": "감초표준품",
+                "정량법 표준품1": "",
+                "공정서": "KP",
+            },
+            {
+                "생약명(한글)": "황기",
+                "생약명(영어)": "Astragali Radix",
+                "기원(한글)": "콩과",
+                "확인시험 표준품 1": "",
+                "정량법 표준품1": "",
+                "공정서": "KP",
+            },
+        ]
+    )
+    entries = _parse_compendium_entries(df)
+    assert entries[0].std_group == "A" and entries[0].std_ox == "O"
+    assert entries[1].std_group == "B" and entries[1].std_ox == "X"
+    items = [StockItem(manage_no="1", name_ko="감초", name_en="Glycyrrhizae Radix", balance=1)]
+    match = match_compendium_inventory(entries, items)
+    assert match["stats"]["std_group_a_count"] == 1
+    assert match["stats"]["std_group_b_count"] == 1
+    md = format_compendium_stats_markdown(match)
+    assert "표준품 명시" in md and "(A)" in md
+
+
+def test_successor_lot_excluded_from_manufacture_and_urgent():
+    from datetime import date
+    from stock_logic import (
+        StockItem,
+        StockPoint,
+        build_lot_succession_map,
+        group_by_depletion_category_items,
+        is_superseded_lot,
+        select_manufacture_candidates,
+        select_monitoring_targets,
+    )
+
+    old = StockItem(
+        manage_no="LOT2013",
+        name_ko="작약",
+        name_en="Paeoniae Radix",
+        balance=5,
+        std_type="표준생약",
+        registered_date=date(2013, 1, 1),
+    )
+    new = StockItem(
+        manage_no="LOT2015",
+        name_ko="작약",
+        name_en="Paeoniae Radix",
+        balance=40,
+        std_type="표준생약",
+        registered_date=date(2015, 1, 1),
+    )
+    old.corrected_points = [
+        StockPoint(date(2013, 1, 1), 200),
+        StockPoint(date(2014, 1, 1), 80),
+        StockPoint(date(2015, 1, 1), 5),
+    ]
+    new.corrected_points = [
+        StockPoint(date(2015, 1, 1), 100),
+        StockPoint(date(2016, 1, 1), 70),
+        StockPoint(date(2017, 1, 1), 40),
+    ]
+    succ = build_lot_succession_map([old, new])
+    assert is_superseded_lot(old, succ)
+    assert not is_superseded_lot(new, succ)
+
+    mfg = select_manufacture_candidates([old, new])
+    mfg_nos = {r["manage_no"] for rows in mfg.values() for r in rows}
+    assert "LOT2013" not in mfg_nos
+    assert "LOT2015" in mfg_nos
+
+    mon = select_monitoring_targets([old, new])
+    mon_nos = {r["manage_no"] for r in mon}
+    assert "LOT2013" not in mon_nos
+
+    cats = group_by_depletion_category_items([old, new])
+    urgent = cats.get("긴급제조(<1년)") or []
+    urgent_nos = {r.get("manage_no") for r in urgent}
+    assert "LOT2013" not in urgent_nos
+
+
 if __name__ == "__main__":
     import traceback
 
