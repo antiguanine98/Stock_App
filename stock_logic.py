@@ -1757,11 +1757,14 @@ def group_by_depletion_category(
     '재고 없음(미보유)'은 한글명 단위 — 동일 한글명에 재고가 있으면 제외.
     """
     name_map = name_ko_map or build_name_ko_stock_map(items)
+    succession = build_lot_succession_map(items)
     buckets: dict[str, list[str]] = {k: [] for k in DEPLETION_CATEGORY_ORDER}
     seen_zero_names: set[str] = set()
     for it in items_for_ai_analysis(items):
         stats = get_depletion_stats(it, stats_cache)
         key = stats["depletion_category"]
+        if key == "긴급제조(<1년)" and is_superseded_lot(it, succession):
+            continue
         if key == ZERO_STOCK_CATEGORY:
             if not is_name_level_zero_stock(it, name_map):
                 continue
@@ -1786,10 +1789,13 @@ def group_by_depletion_category_items(
     '재고 없음(미보유)'은 한글명 단위 — 동일 한글명에 재고가 하나라도 있으면 제외.
     """
     name_map = name_ko_map or build_name_ko_stock_map(items)
+    succession = build_lot_succession_map(items)
     buckets: dict[str, list[dict[str, Any]]] = {k: [] for k in DEPLETION_CATEGORY_ORDER}
     for it in items_for_ai_analysis(items):
         stats = get_depletion_stats(it, stats_cache)
         key = stats["depletion_category"]
+        if key == "긴급제조(<1년)" and is_superseded_lot(it, succession):
+            continue
         if key == ZERO_STOCK_CATEGORY:
             if not is_name_level_zero_stock(it, name_map):
                 # 로트 재고 0이어도 동일 한글명에 잔여 재고가 있으면 미보유에서 제외
@@ -1831,6 +1837,114 @@ def group_by_risk_grade(
     return buckets
 
 
+
+def lot_year_hint(item: StockItem) -> int:
+    """로트 연도 힌트: 등록일자 → 시계열 최대 연도 → 관리번호 내 4자리 연도."""
+    reg = getattr(item, "registered_date", None)
+    if reg is not None:
+        try:
+            return int(reg.year)
+        except Exception:
+            pass
+    for pts_name in ("corrected_points", "year_end_points", "raw_points"):
+        pts = getattr(item, pts_name, None) or []
+        years = []
+        for p in pts:
+            d = getattr(p, "change_date", None)
+            if d is not None:
+                try:
+                    years.append(int(d.year))
+                except Exception:
+                    pass
+        if years:
+            return max(years)
+    m = re.search(r"(19|20)\d{2}", str(getattr(item, "manage_no", "") or ""))
+    if m:
+        return int(m.group(0))
+    return -1
+
+
+def english_name_key(item: StockItem) -> str:
+    """동일 기원(영문명) 판정 키 — 영문명이 있을 때만 유효."""
+    en = _cell_str(getattr(item, "name_en", None)).strip()
+    if not en:
+        return ""
+    return _norm_key(en)
+
+
+def build_lot_succession_map(items: list[StockItem]) -> dict[str, Any]:
+    """영문명 동일 로트 중 더 새 연도가 있으면 구로트를 후속보유로 표시.
+
+    A2: 동일 기원 확인은 영문명 일치. 후속 로트가 있는 구로트는
+    1년 이내 소진·차년도 제조·급가속 대상에서 제외한다.
+    """
+    groups: dict[str, list[StockItem]] = defaultdict(list)
+    for it in items:
+        key = english_name_key(it)
+        if key:
+            groups[key].append(it)
+
+    superseded: set[str] = set()
+    successor_of: dict[str, str] = {}
+    details: list[dict[str, Any]] = []
+
+    for key, lots in groups.items():
+        if len(lots) < 2:
+            continue
+        ranked = sorted(
+            lots,
+            key=lambda it: (lot_year_hint(it), str(it.manage_no or ""), str(it.label or "")),
+            reverse=True,
+        )
+        best = ranked[0]
+        best_year = lot_year_hint(best)
+        if best_year < 0:
+            continue
+        for old in ranked[1:]:
+            old_year = lot_year_hint(old)
+            if old_year < 0 or old_year >= best_year:
+                continue
+            mno = str(old.manage_no or old.label or "")
+            if not mno:
+                continue
+            superseded.add(mno)
+            successor_of[mno] = str(best.manage_no or best.label or "")
+            details.append(
+                {
+                    "manage_no": old.manage_no,
+                    "name_ko": old.name_ko,
+                    "name_en": _cell_str(getattr(old, "name_en", None)),
+                    "lot_year": old_year,
+                    "successor_manage_no": best.manage_no,
+                    "successor_year": best_year,
+                    "has_successor_lot": True,
+                }
+            )
+
+    return {
+        "superseded_manage_nos": superseded,
+        "successor_of": successor_of,
+        "details": details,
+        "superseded_count": len(superseded),
+    }
+
+
+def is_superseded_lot(
+    item: StockItem,
+    succession: dict[str, Any] | None = None,
+    items: list[StockItem] | None = None,
+) -> bool:
+    """후속 로트가 있는 구로트 여부."""
+    if succession is None:
+        succession = build_lot_succession_map(items or [item])
+    superseded = succession.get("superseded_manage_nos") or set()
+    mno = str(item.manage_no or "")
+    if mno and mno in superseded:
+        return True
+    label = str(item.label or "")
+    return bool(label and label in superseded)
+
+
 def select_manufacture_candidates(
     items: list[StockItem],
     limit_per_type: int = MANUFACTURE_CANDIDATE_LIMIT,
@@ -1843,10 +1957,13 @@ def select_manufacture_candidates(
     """
     result: dict[str, list[dict[str, Any]]] = {"표준생약": [], "지표성분": []}
     scored: list[tuple[float, StockItem, dict[str, Any]]] = []
+    succession = build_lot_succession_map(items)
     for it in items:
         if it.std_type not in result:
             continue
         if is_zero_stock(it):
+            continue
+        if is_superseded_lot(it, succession):
             continue
         stats = get_depletion_stats(it, stats_cache)
         if stats.get("stock_zero"):
@@ -1906,9 +2023,12 @@ def select_monitoring_targets(
     신규수요·급증은 전량 반환. 증가는 그 뒤에 이어서 포함.
     """
     surge_rows: list[dict[str, Any]] = []
+    succession = build_lot_succession_map(items)
     increase_rows: list[dict[str, Any]] = []
     for it in items:
         if is_zero_stock(it):
+            continue
+        if is_superseded_lot(it, succession):
             continue
         stats = get_depletion_stats(it, stats_cache)
         if stats.get("stock_zero"):
@@ -3917,6 +4037,8 @@ def attach_compendium_match_to_flags(
         out.setdefault("missing_compendium_items", [])
         out.setdefault("missing_herb_items", [])
         out.setdefault("name_en_match_map", {})
+        out.setdefault("match_failures", [])
+        out.setdefault("origin_exception_items", [])
         return out
     out["compendium_match"] = match_result
     out["compendium_stats"] = match_result.get("stats") or {}
@@ -3929,6 +4051,8 @@ def attach_compendium_match_to_flags(
         ]
     out["missing_compendium_items"] = list(items_miss or [])
     out["missing_herb_items"] = list(match_result.get("missing_herb_items") or [])
+    out["match_failures"] = list(match_result.get("match_failures") or [])
+    out["origin_exception_items"] = list(match_result.get("origin_exception_items") or [])
 
     if items:
         stats_cache: dict[str, dict[str, Any]] = {}
@@ -3984,6 +4108,12 @@ def attach_compendium_match_to_flags(
             "origin_held": st.get("origin_held"),
             "origin_missing": st.get("origin_missing"),
             "origin_coverage_pct": st.get("origin_coverage_pct"),
+            "match_failure_count": st.get("match_failure_count"),
+            "origin_exception_count": st.get("origin_exception_count"),
+            "std_group_a_count": st.get("std_group_a_count"),
+            "std_group_b_count": st.get("std_group_b_count"),
+            "std_group_a_held": st.get("std_group_a_held"),
+            "std_group_b_held": st.get("std_group_b_held"),
         }
         out["chat_analysis_maps"] = refreshed
     return out
@@ -5050,6 +5180,18 @@ COMPENDIUM_ORIGIN_EN_KEYS = ("기원(영어)", "기원(영문)", "origin_en", "O
 COMPENDIUM_PHARMACOPOEIA_KEYS = ("공정서", "수재공정서", "pharmacopoeia", "Pharmacopoeia", "KP", "KHP")
 COMPENDIUM_CODE_KEYS = ("관리번호", "품목코드", "코드", "code", "Code")
 
+# 기원 예외 — 띄어쓰기까지 정확히 일치해야 함 (공정서 미보유 판정에서 제외)
+ORIGIN_EXCEPTION_PHRASES: tuple[str, ...] = (
+    "기타 동속 근연식물",
+    "그 변종",
+    "기타 동속식물",
+    "기타동속근연식물",
+    "기타 동속근연식물",
+    "동속근연식물",
+    "기타 동속 식물",
+    "그 재배변종",
+)
+
 
 @dataclass
 class CompendiumEntry:
@@ -5058,7 +5200,26 @@ class CompendiumEntry:
     origin_ko: str = ""
     origin_en: str = ""
     pharmacopoeia: str = ""
+    # 확인시험/정량법 표준품 명시 여부 (A: 하나라도 값 있음, B: 전부 공란)
+    has_identity_std: bool = False
+    has_assay_std: bool = False
+    std_ref_count: int = 0
+    is_origin_exception: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_any_std_ref(self) -> bool:
+        """(A) 확인시험·정량법 표준품이 하나라도 명시된 품목."""
+        return bool(self.has_identity_std or self.has_assay_std)
+
+    @property
+    def std_group(self) -> str:
+        """A=표준품 명시, B=표준품 미사용(칸 전부 공란)."""
+        return "A" if self.has_any_std_ref else "B"
+
+    @property
+    def std_ox(self) -> str:
+        return "O" if self.has_any_std_ref else "X"
 
 
 def _norm_key(s: Any) -> str:
@@ -5105,7 +5266,44 @@ def _missing_compendium_row(e: CompendiumEntry, index: int = 0) -> dict[str, Any
         "norm_ko": _norm_key(e.name_ko),
         "norm_en": _norm_key(e.name_en),
         "label": e.name_ko or e.name_en or f"entry-{index}",
+        "std_group": e.std_group,
+        "std_ox": e.std_ox,
+        "std_ref_count": int(e.std_ref_count),
+        "has_identity_std": bool(e.has_identity_std),
+        "has_assay_std": bool(e.has_assay_std),
+        "is_origin_exception": bool(e.is_origin_exception),
     }
+
+
+def _is_origin_exception_phrase(origin_ko: str) -> bool:
+    """기원 예외 문구 — 띄어쓰기까지 정확 일치."""
+    return (origin_ko or "").strip() in ORIGIN_EXCEPTION_PHRASES
+
+
+def _find_std_ref_columns(columns: Sequence[str]) -> tuple[list[str], list[str]]:
+    """확인시험 표준품* / 정량법 표준품* 컬럼 목록."""
+    identity_cols: list[str] = []
+    assay_cols: list[str] = []
+    for col in columns:
+        s = str(col)
+        compact = re.sub(r"\s+", "", s)
+        if "확인시험" in s and "표준품" in s:
+            identity_cols.append(s)
+        elif "정량법" in s and "표준품" in s:
+            assay_cols.append(s)
+        elif re.search(r"확인시험표준품", compact):
+            identity_cols.append(s)
+        elif re.search(r"정량법표준품", compact):
+            assay_cols.append(s)
+    return identity_cols, assay_cols
+
+
+def _count_filled_std_refs(row: pd.Series, cols: Sequence[str]) -> int:
+    n = 0
+    for col in cols:
+        if _cell_field(row, col):
+            n += 1
+    return n
 
 
 def _pick_column(columns: Sequence[str], keywords: Sequence[str]) -> Optional[str]:
@@ -5132,6 +5330,7 @@ def _parse_compendium_entries(df: pd.DataFrame) -> list[CompendiumEntry]:
     col_orig_ko = _pick_column(columns, COMPENDIUM_ORIGIN_KO_KEYS)
     col_orig_en = _pick_column(columns, COMPENDIUM_ORIGIN_EN_KEYS)
     col_pharm = _pick_column(columns, COMPENDIUM_PHARMACOPOEIA_KEYS)
+    identity_cols, assay_cols = _find_std_ref_columns(columns)
 
     entries: list[CompendiumEntry] = []
     for _, row in df.iterrows():
@@ -5139,16 +5338,23 @@ def _parse_compendium_entries(df: pd.DataFrame) -> list[CompendiumEntry]:
         name_en = _cell_field(row, col_en)
         if not name_ko and not name_en:
             continue
+        origin_ko = _cell_field(row, col_orig_ko)
+        id_n = _count_filled_std_refs(row, identity_cols)
+        assay_n = _count_filled_std_refs(row, assay_cols)
         raw = {str(c): row.get(c) for c in columns if not str(c).startswith("_")}
         entries.append(
             CompendiumEntry(
                 name_ko=name_ko,
                 name_en=name_en,
-                origin_ko=_cell_field(row, col_orig_ko),
+                origin_ko=origin_ko,
                 origin_en=_cell_field(row, col_orig_en),
                 pharmacopoeia=_normalize_compendium_pharmacopoeia(
                     name_ko, _cell_field(row, col_pharm)
                 ),
+                has_identity_std=id_n > 0,
+                has_assay_std=assay_n > 0,
+                std_ref_count=id_n + assay_n,
+                is_origin_exception=_is_origin_exception_phrase(origin_ko),
                 raw=raw,
             )
         )
@@ -5234,7 +5440,7 @@ def match_compendium_inventory(
     """공정서 entries ↔ 재고 품목 매칭.
 
     재고 측은 영문명(없으면 한글명)이 같으면 1건으로 그룹화한 뒤 매칭한다.
-    매칭 키: 한글명 exact/fuzzy, 영문명 fuzzy, 한글명↔기원 교차.
+    매칭 키 우선순위: 영문명 → 한글명 exact/fuzzy → 한글명↔기원 교차.
     """
     for e in entries:
         e.pharmacopoeia = _normalize_compendium_pharmacopoeia(e.name_ko, e.pharmacopoeia)
@@ -5244,6 +5450,7 @@ def match_compendium_inventory(
     by_label: dict[str, str] = {}
     matched_entry_ids: set[int] = set()
     name_en_match_map: dict[str, dict[str, Any]] = {}
+    match_failures: list[dict[str, Any]] = []
 
     by_exact_ko: dict[str, list[CompendiumEntry]] = defaultdict(list)
     by_norm_ko: dict[str, list[CompendiumEntry]] = defaultdict(list)
@@ -5310,7 +5517,13 @@ def match_compendium_inventory(
         hit: Optional[CompendiumEntry] = None
         match_type = ""
 
-        if stock_ko and stock_ko in by_exact_ko:
+        # A1: 영문명 우선 → 한글명 → 한글명↔기원 교차
+        if stock_en:
+            ne = _norm_key(stock_en)
+            if ne and ne in by_norm_en:
+                hit = _pick_first(by_norm_en[ne])
+                match_type = "fuzzy_en"
+        if hit is None and stock_ko and stock_ko in by_exact_ko:
             cands = by_exact_ko[stock_ko]
             hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
             match_type = "exact_ko"
@@ -5320,11 +5533,6 @@ def match_compendium_inventory(
                 cands = by_norm_ko[nk]
                 hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
                 match_type = "fuzzy_ko"
-        if hit is None and stock_en:
-            ne = _norm_key(stock_en)
-            if ne and ne in by_norm_en:
-                hit = _pick_first(by_norm_en[ne])
-                match_type = "fuzzy_en"
         if hit is None and stock_ko:
             nk = _norm_key(stock_ko)
             if nk and nk in by_norm_origin_ko:
@@ -5347,6 +5555,16 @@ def match_compendium_inventory(
                             break
 
         if hit is None:
+            match_failures.append(
+                {
+                    "identity_key": group_key,
+                    "name_ko": stock_ko,
+                    "name_en": stock_en,
+                    "manage_nos": [it.manage_no for it in group_items if it.manage_no],
+                    "lot_count": len(group_items),
+                    "reason": "매칭 실패/확인 필요",
+                }
+            )
             continue
 
         matched_entry_ids.add(id(hit))
@@ -5398,8 +5616,17 @@ def match_compendium_inventory(
                 }
             )
 
+    # 기원 예외는 미보유 판정에서 제외하고 별도 목록으로 관리
+    origin_exception_entries = [e for e in entries if e.is_origin_exception]
+    origin_exception_items = [
+        _missing_compendium_row(e, i)
+        for i, e in enumerate(origin_exception_entries, 1)
+    ]
+
     missing: list[CompendiumEntry] = [
-        e for e in entries if id(e) not in matched_entry_ids
+        e
+        for e in entries
+        if id(e) not in matched_entry_ids and not e.is_origin_exception
     ]
     missing_items = [
         _missing_compendium_row(e, i) for i, e in enumerate(missing, 1)
@@ -5407,21 +5634,34 @@ def match_compendium_inventory(
     auto_corrected = sum(
         1
         for c in name_en_match_map.values()
-        if c.get("match_type") and c.get("match_type") != "exact_ko"
+        if c.get("match_type") and c.get("match_type") not in ("exact_ko", "fuzzy_en")
     )
     exact_matched = sum(
-        1 for c in name_en_match_map.values() if c.get("match_type") == "exact_ko"
+        1
+        for c in name_en_match_map.values()
+        if c.get("match_type") in ("exact_ko", "fuzzy_en")
+    )
+    en_matched = sum(
+        1 for c in name_en_match_map.values() if c.get("match_type") == "fuzzy_en"
     )
 
+    # A/B 표준품 명시 그룹 (확인시험·정량법 표준품 컬럼)
+    group_a = [e for e in entries if e.std_group == "A"]
+    group_b = [e for e in entries if e.std_group == "B"]
+    group_a_held = sum(1 for e in group_a if id(e) in matched_entry_ids)
+    group_b_held = sum(1 for e in group_b if id(e) in matched_entry_ids)
+
     # ① 품목(생약명 한글) 기준 · ② 기원식물(행) 기준 분리 집계
+    # 기원 예외 행은 미보유/커버리지 분모에서 제외
+    eligible_entries = [e for e in entries if not e.is_origin_exception]
     herb_names: dict[str, list[CompendiumEntry]] = defaultdict(list)
-    for e in entries:
+    for e in eligible_entries:
         key = (e.name_ko or "").strip() or (e.name_en or "").strip()
         if key:
             herb_names[key].append(e)
     herb_total = len(herb_names)
     held_herbs: set[str] = set()
-    for e in entries:
+    for e in eligible_entries:
         if id(e) in matched_entry_ids:
             key = (e.name_ko or "").strip() or (e.name_en or "").strip()
             if key:
@@ -5430,8 +5670,8 @@ def match_compendium_inventory(
     herb_missing = max(0, herb_total - herb_held)
     herb_rate = round(100.0 * herb_held / herb_total, 1) if herb_total else 0.0
 
-    origin_total = len(entries)
-    origin_held = len(matched_entry_ids)
+    origin_total = len(eligible_entries)
+    origin_held = sum(1 for e in eligible_entries if id(e) in matched_entry_ids)
     origin_missing = max(0, origin_total - origin_held)
     origin_rate = round(100.0 * origin_held / origin_total, 1) if origin_total else 0.0
 
@@ -5451,14 +5691,16 @@ def match_compendium_inventory(
     ]
 
     stats = {
-        "compendium_total": origin_total,  # 기원(행) 수 — 구호환
+        "compendium_total": origin_total,  # 기원(행) 수 — 구호환(예외 제외)
         "inventory_matched": len(name_en_match_map),
         "inventory_matched_lots": len(corrections),
         "unique_inventory_groups": unique_inventory_groups,
         "entries_matched": origin_held,
         "exact_matched": exact_matched,
+        "en_matched": en_matched,
         "auto_corrected": auto_corrected,
         "missing_count": origin_missing,  # 기원 미확보 (구호환)
+        "match_failure_count": len(match_failures),
         # 품목(생약명) 기준
         "herb_total": herb_total,
         "herb_held": herb_held,
@@ -5469,6 +5711,15 @@ def match_compendium_inventory(
         "origin_held": origin_held,
         "origin_missing": origin_missing,
         "origin_coverage_pct": origin_rate,
+        # 기원 예외
+        "origin_exception_count": len(origin_exception_entries),
+        # A/B 표준품 그룹
+        "std_group_a_count": len(group_a),
+        "std_group_b_count": len(group_b),
+        "std_group_a_held": group_a_held,
+        "std_group_b_held": group_b_held,
+        "std_group_a_ox": "O" if group_a else "X",
+        "std_group_b_ox": "X",
     }
 
     return {
@@ -5476,6 +5727,8 @@ def match_compendium_inventory(
         "missing": missing,
         "missing_items": missing_items,
         "missing_herb_items": missing_herb_items,
+        "match_failures": match_failures,
+        "origin_exception_items": origin_exception_items,
         "stats": stats,
         "by_manage_no": by_manage_no,
         "by_label": by_label,
@@ -5786,6 +6039,10 @@ def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str
 
     groups_n = int(stats.get("unique_inventory_groups") or stats.get("inventory_matched") or 0)
     lots_n = int(stats.get("inventory_matched_lots") or stats.get("inventory_matched") or 0)
+    fail_n = int(stats.get("match_failure_count") or 0)
+    exc_n = int(stats.get("origin_exception_count") or 0)
+    std_a_n = int(stats.get("std_group_a_count") or 0)
+    std_b_n = int(stats.get("std_group_b_count") or 0)
     lines = [
         "## 공정서 DB 매칭 및 수재 현황",
         "",
@@ -5805,6 +6062,9 @@ def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str
         "",
         f"- 재고 엑셀 매칭 품목군(영문명 기준): **{groups_n}건** / 매칭 로트 **{lots_n}건**",
         f"- 기원(한글/영문) 기반 자동 보정 매칭: **{auto_n}건**",
+        f"- 매칭 실패/확인 필요: **{fail_n}건**",
+        f"- 기원 예외(미보유 제외): **{exc_n}건**",
+        f"- 표준품 명시(A)/미사용(B): **{std_a_n}/{std_b_n}건**",
         f"- 미보유 대표 예시: {ex_txt}",
         "",
         f"### 공정서 미보유 생약(품목) ({herb_miss}건)",
@@ -5835,6 +6095,55 @@ def format_compendium_stats_markdown(match_result: dict[str, Any] | None) -> str
         dict_rows = [
             r if isinstance(r, dict) else _missing_compendium_row(r, i)
             for i, r in enumerate(missing_items, 1)
+        ]
+        lines.extend(_missing_rows_to_markdown_table(dict_rows))
+    else:
+        lines.append("(해당 없음)")
+    lines.extend(
+        [
+            "",
+            "### 표준품 명시 구분 (확인시험·정량법)",
+            "",
+            f"- (A) 표준품 명시: **{int(stats.get('std_group_a_count') or 0)}건** "
+            f"(확보 {int(stats.get('std_group_a_held') or 0)}건, "
+            f"{stats.get('std_group_a_ox') or 'O'})",
+            f"- (B) 표준품 미사용: **{int(stats.get('std_group_b_count') or 0)}건** "
+            f"(확보 {int(stats.get('std_group_b_held') or 0)}건, "
+            f"{stats.get('std_group_b_ox') or 'X'})",
+            "",
+            f"### 매칭 실패/확인 필요 ({int(stats.get('match_failure_count') or 0)}건)",
+            "",
+        ]
+    )
+    match_failures = match_result.get("match_failures") or []
+    if match_failures:
+        lines.append("| # | 한글명 | 영문명 | 관리번호 | 로트수 |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for i, r in enumerate(match_failures, 1):
+            mnos = ", ".join(str(x) for x in (r.get("manage_nos") or [])[:5]) or "-"
+            lines.append(
+                f"| {i} | {str(r.get('name_ko') or '-').replace('|', '/')} | "
+                f"{str(r.get('name_en') or '-').replace('|', '/')} | "
+                f"{mnos.replace('|', '/')} | {r.get('lot_count') or '-'} |"
+            )
+    else:
+        lines.append("(해당 없음)")
+
+    exc_n = int(stats.get("origin_exception_count") or 0)
+    lines.extend(
+        [
+            "",
+            f"### 기원 예외 목록 ({exc_n}건)",
+            "",
+            "- 기원 문구가 예외 표현인 항목은 공정서 미보유 집계에서 제외합니다.",
+            "",
+        ]
+    )
+    exc_items = match_result.get("origin_exception_items") or []
+    if exc_items:
+        dict_rows = [
+            r if isinstance(r, dict) else _missing_compendium_row(r, i)
+            for i, r in enumerate(exc_items, 1)
         ]
         lines.extend(_missing_rows_to_markdown_table(dict_rows))
     else:
