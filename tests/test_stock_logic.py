@@ -1168,12 +1168,11 @@ def test_manufacture_need_score_excludes_reliability():
         cache,
         match_result={"by_manage_no": {"P0": "KP", "P1": "KHP"}, "by_label": {}},
     )
-    s0 = cache["P0"]["priority_score"]
-    s1 = cache["P1"]["priority_score"]
-    assert s0 > s1  # KP 가중치
-    assert "reliability" in cache["P0"]
+    # KP·KHP 공정서 중요도 동등(1.0)
     assert cache["P0"]["pharmacopoeia_weight"] == 1.0
-    assert cache["P1"]["pharmacopoeia_weight"] == 0.5
+    assert cache["P1"]["pharmacopoeia_weight"] == 1.0
+    assert "reliability" in cache["P0"]
+    assert cache["P0"]["priority_score"] > 0
 
 
 def test_compendium_herb_vs_origin_and_hwonchogeun_khp():
@@ -1588,9 +1587,10 @@ def test_slim_report_five_sections_no_full_catalog_blowup():
     assert "## 로드맵 총괄 제안" in filled
     assert INCLUDE_REPORT_APPENDIX_DEFAULT is False
     assert "부록(별첨) — 전수 목록" not in filled or "생략" in filled
-    # TOP20만
+    # 리포트 본문 전수 수록 (TOP 축약 없음)
     assert "시급19" in filled
-    assert "시급29" not in filled
+    assert "시급29" in filled
+    assert "전수" in filled
     appendix = format_appendix_full_catalog_markdown(flags)
     assert "부록" in appendix
 
@@ -1791,6 +1791,131 @@ def test_successor_lot_excluded_from_manufacture_and_urgent():
     urgent = cats.get("긴급제조(<1년)") or []
     urgent_nos = {r.get("manage_no") for r in urgent}
     assert "LOT2013" not in urgent_nos
+
+
+
+def test_khp_pharmacopoeia_weight_equals_kp():
+    from stock_logic import _pharmacopoeia_importance_weight, PRIORITY_FORMULA_KO
+
+    assert _pharmacopoeia_importance_weight("KP") == 1.0
+    assert _pharmacopoeia_importance_weight("KHP") == 1.0
+    assert _pharmacopoeia_importance_weight("생약규격집") == 1.0
+    assert "KHP=1.0" in PRIORITY_FORMULA_KO
+
+
+def test_compendium_alias_match_duchung_gwallaruin():
+    """두충·괄루인 alias/괄호 정규화로 KP 수재 누락 방지."""
+    from stock_logic import CompendiumEntry, StockItem, match_compendium_inventory
+
+    entries = [
+        CompendiumEntry(name_ko="두충(杜仲)", name_en="Eucommiae Cortex", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="괄루인", name_en="Trichosanthis Semen", pharmacopoeia="KP"),
+    ]
+    items = [
+        StockItem(manage_no="D1", name_ko="두충", balance=1),
+        StockItem(manage_no="G1", name_ko="과루인", balance=1),
+    ]
+    match = match_compendium_inventory(entries, items)
+    matched = {c["matched_name_ko"] for c in match["corrections"]}
+    assert any("두충" in n for n in matched)
+    assert any("괄루인" in n for n in matched)
+    assert match["stats"]["missing_count"] == 0
+
+
+def test_develop_targets_by_origin_not_herb_name():
+    """신규/개발 대상은 기원 단위로 집계·전수 표기."""
+    from stock_logic import (
+        _collect_develop_rows_by_kind,
+        format_develop_targets_markdown,
+    )
+
+    flags = {
+        "missing_compendium_items": [
+            {
+                "name_ko": "감초",
+                "origin_ko": "기원A",
+                "origin_en": "Origin A",
+                "pharmacopoeia_kind": "KP",
+                "has_identity_std": True,
+            },
+            {
+                "name_ko": "감초",
+                "origin_ko": "기원B",
+                "origin_en": "Origin B",
+                "pharmacopoeia_kind": "KP",
+                "has_identity_std": False,
+            },
+        ],
+        "missing_herb_items": [
+            {"name_ko": "감초", "origin_count": 2, "pharmacopoeia_kind": "KP"}
+        ],
+        "compendium_stats": {"herb_missing": 1, "origin_missing": 2},
+    }
+    by = _collect_develop_rows_by_kind(flags)
+    assert len(by["KP"]) == 2  # 생약 1종이 아니라 기원 2건
+    md = format_develop_targets_markdown(flags)
+    assert "기원A" in md and "기원B" in md
+    assert "확인시험" in md
+    assert "| 유 |" in md or "| 유" in md
+    assert "전수 2건" in md or "전수 **2건**" in md or "전수 2건" in md.replace("*", "")
+
+
+def test_overstock_reduce_sorted_by_coverage_desc():
+    from stock_logic import format_overstock_reduce_markdown
+
+    flags = {
+        "manufacture_reduce_items": [
+            {
+                "name_ko": "낮음",
+                "manage_no": "L",
+                "std_type": "표준생약",
+                "coverage_years": 16,
+                "recent_rate": 5.0,
+                "manufacture_reduce": True,
+                "recommendation": "축소",
+            },
+            {
+                "name_ko": "높음",
+                "manage_no": "H",
+                "std_type": "표준생약",
+                "coverage_years": 40,
+                "recent_rate": 0.2,
+                "manufacture_reduce": True,
+                "recommendation": "축소",
+            },
+        ]
+    }
+    md = format_overstock_reduce_markdown(flags)
+    assert "정렬 기준" in md and "재고 커버리지" in md
+    assert md.index("| 1 | 높음 |") < md.index("| 2 | 낮음 |")
+
+
+def test_missing_table_includes_identity_test_column():
+    from stock_logic import _missing_rows_to_markdown_table
+
+    rows = [
+        {
+            "name_ko": "가자",
+            "origin_ko": "가",
+            "origin_en": "-",
+            "pharmacopoeia_kind": "KP",
+            "has_identity_std": True,
+        },
+        {
+            "name_ko": "갈근",
+            "origin_ko": "나",
+            "origin_en": "-",
+            "pharmacopoeia_kind": "KP",
+            "has_identity_std": False,
+        },
+    ]
+    lines = _missing_rows_to_markdown_table(rows)
+    header = lines[0]
+    assert "확인시험" in header
+    body = "\n".join(lines)
+    assert "가자" in body and "유" in body
+    assert "갈근" in body and "무" in body
+
 
 
 if __name__ == "__main__":
