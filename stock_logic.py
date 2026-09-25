@@ -80,7 +80,7 @@ PRIORITY_FORMULA_KO = (
     "  · 최근수요량 내부백분위(0~1): 보유 품목 간 최근 3년 연평균 분양량 백분위\n"
     "  · 가속도점수(0~1): 신규수요·급증=1.0 / 증가=0.75 / 안정=0.4 / "
     "감소=0.2 / 급감=0.1 / 분석불가=0\n"
-    "  · 공정서중요도(0~1): KP=1.0(10점) / KHP=0.5(5점) / 그 외=0\n"
+    "  · 공정서중요도(0~1): KP=1.0(10점) / KHP=1.0(10점) / 그 외=0\n"
     "  · 데이터 신뢰도(A~D)는 점수에 미포함 — 별도 '신뢰도' 열로 병기"
 )
 MANUFACTURE_REDUCE_RECOMMENDATION = "제조 축소/보존 검토"
@@ -1294,7 +1294,7 @@ def _accel_score_from_label(label: Optional[str]) -> float:
 
 
 def _pharmacopoeia_importance_weight(pharm: Any) -> float:
-    """공정서중요도 0~1: KP=1.0, KHP=0.5."""
+    """공정서중요도 0~1: KP=1.0, KHP=1.0 (동등)."""
     if not pharm:
         return 0.0
     text = str(pharm).strip()
@@ -1304,10 +1304,10 @@ def _pharmacopoeia_importance_weight(pharm: Any) -> float:
     if kind == "KP":
         return 1.0
     if kind == "KHP":
-        return 0.5
+        return 1.0
     upper = text.upper()
     if "KHP" in upper or "생약규격집" in text or "약전외" in text:
-        return 0.5
+        return 1.0
     if re.search(r"(?<![A-Z])KP(?![A-Z])", upper) or "대한민국약전" in text:
         return 1.0
     return 0.0
@@ -2084,7 +2084,7 @@ def select_monitoring_targets(
 
 def select_long_term_low_items(
     items: list[StockItem],
-    limit: int = 40,
+    limit: int = 10_000,
     stats_cache: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """장기 저분양·과다재고·제조 축소/보존 검토 품목."""
@@ -2124,10 +2124,20 @@ def select_long_term_low_items(
                 "recommendation": recommendation,
             }
         )
+    def _cov(r: dict[str, Any]) -> float:
+        v = r.get("coverage_years", r.get("years_left"))
+        return float(v) if isinstance(v, (int, float)) else -1.0
+
+    def _rate(r: dict[str, Any]) -> float:
+        v = r.get("recent_rate", r.get("annual_rate"))
+        return float(v) if isinstance(v, (int, float)) else 1e18
+
     rows.sort(
         key=lambda r: (
             0 if r.get("manufacture_reduce") else 1,
-            -float(r["stock_value"] or 0),
+            -_cov(r),
+            _rate(r),
+            str(r.get("name_ko") or ""),
         )
     )
     return rows[:limit] if limit else rows
@@ -2400,9 +2410,10 @@ def format_accel_monitoring_markdown(monitoring: list[dict[str, Any]] | None) ->
     return "\n".join(lines)
 
 
-REPORT_URGENT_TOP_N = 20
-REPORT_REDUCE_TOP_N = 15
-REPORT_DEVELOP_TOP_N_PER_KIND = 25
+# 리포트 본문·상세 표는 전수 수록 (축약/TOP N 생략 금지)
+REPORT_URGENT_TOP_N = 10_000
+REPORT_REDUCE_TOP_N = 10_000
+REPORT_DEVELOP_TOP_N_PER_KIND = 10_000
 INCLUDE_REPORT_APPENDIX_DEFAULT = False
 
 MANDATORY_REPORT_SECTION_ORDER = (
@@ -2472,15 +2483,57 @@ def _collect_reduce_rows(
             for r in (f.get("long_term_low_items") or [])
             if r.get("manufacture_reduce") or r.get("overstock")
         ]
+    def _cov(r: dict[str, Any]) -> float:
+        v = r.get("coverage_years", r.get("years_left"))
+        return float(v) if isinstance(v, (int, float)) else -1.0
+
+    def _rate(r: dict[str, Any]) -> float:
+        v = r.get("recent_rate", r.get("annual_rate"))
+        return float(v) if isinstance(v, (int, float)) else 1e18
+
     rows = sorted(
         rows,
         key=lambda r: (
             0 if r.get("manufacture_reduce") else 1,
-            -float(r.get("stock_value") or 0),
-            -float(r.get("coverage_years") or r.get("years_left") or 0),
+            -_cov(r),
+            _rate(r),
+            str(r.get("name_ko") or ""),
         ),
     )
-    return rows[:limit]
+    return rows if limit is None or limit >= 10_000 else rows[:limit]
+
+
+def _identity_test_ox(row: dict[str, Any]) -> str:
+    """확인시험(또는 지표성분 규격) 보유 여부 — 유/무."""
+    if row.get("has_identity_std") or row.get("has_assay_std") or row.get("has_any_std_ref"):
+        return "유"
+    ox = str(row.get("std_ox") or "").upper()
+    if ox == "O":
+        return "유"
+    if ox == "X":
+        return "무"
+    flag = row.get("identity_test") or row.get("확인시험")
+    if flag in ("유", "무"):
+        return str(flag)
+    if flag is True or str(flag).upper() in ("O", "Y", "YES", "TRUE", "1"):
+        return "유"
+    if flag is False or str(flag).upper() in ("X", "N", "NO", "FALSE", "0"):
+        return "무"
+    return "무"
+
+
+def _pharmacopoeia_bucket(row: dict[str, Any]) -> str:
+    kind = str(row.get("pharmacopoeia_kind") or "").upper()
+    if kind == "KP":
+        return "KP"
+    if kind == "KHP" or "KHP" in str(row.get("pharmacopoeia") or "").upper():
+        return "KHP"
+    ph = str(row.get("pharmacopoeia") or "")
+    if "생약규격집" in ph or "약전외" in ph:
+        return "KHP"
+    if "약전" in ph or ph.upper() == "KP":
+        return "KP"
+    return "기타"
 
 
 def _collect_develop_rows_by_kind(
@@ -2489,37 +2542,36 @@ def _collect_develop_rows_by_kind(
     *,
     limit_per_kind: int = REPORT_DEVELOP_TOP_N_PER_KIND,
 ) -> dict[str, list[dict[str, Any]]]:
-    """공정서 미확보 생약 — KP/KHP 분리 (품목 기준 우선)."""
+    """공정서 미확보 — 기원명(기원식물) 단위로 KP/KHP 분리.
+
+    동일 생약명이라도 미확보 기원은 개별 행으로 유지한다.
+    """
     f = flags or {}
     mr = match_result or f.get("compendium_match") or {}
-    herbs = list(mr.get("missing_herb_items") or f.get("missing_herb_items") or [])
-    if not herbs:
-        # 기원 미확보에서 품목명 고유화
-        origins = list(f.get("missing_compendium_items") or mr.get("missing_items") or [])
-        seen: set[str] = set()
-        for r in origins:
-            name = str((r.get("name_ko") if isinstance(r, dict) else "") or "").strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            herbs.append(r if isinstance(r, dict) else {"name_ko": name})
+    # 기원(행) 기준 전수 — 생약명 고유화하지 않음
+    origins = list(
+        f.get("missing_compendium_items")
+        or mr.get("missing_items")
+        or []
+    )
+    if not origins:
+        # 구호환: 품목 단위만 있으면 그대로 사용
+        origins = list(mr.get("missing_herb_items") or f.get("missing_herb_items") or [])
 
     by_kind: dict[str, list[dict[str, Any]]] = {"KP": [], "KHP": [], "기타": []}
-    for r in herbs:
-        kind = str(r.get("pharmacopoeia_kind") or "").upper()
-        if kind == "KP":
-            bucket = "KP"
-        elif kind == "KHP" or "KHP" in str(r.get("pharmacopoeia") or "").upper():
-            bucket = "KHP"
-        else:
-            ph = str(r.get("pharmacopoeia") or "")
-            if "생약규격집" in ph or "약전외" in ph:
-                bucket = "KHP"
-            elif "약전" in ph or ph.upper() == "KP":
-                bucket = "KP"
-            else:
-                bucket = "기타"
-        if len(by_kind[bucket]) >= limit_per_kind:
+    seen: set[str] = set()
+    for r0 in origins:
+        r = dict(r0) if isinstance(r0, dict) else {"name_ko": str(r0)}
+        name = str(r.get("name_ko") or r.get("name_en") or "").strip()
+        origin = str(r.get("origin_ko") or r.get("origin_en") or "").strip()
+        code = str(r.get("manage_no") or r.get("index") or "").strip()
+        dedupe = f"{_norm_key(name)}|{_norm_key(origin)}|{code}"
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        r["identity_test"] = _identity_test_ox(r)
+        bucket = _pharmacopoeia_bucket(r)
+        if limit_per_kind is not None and len(by_kind[bucket]) >= limit_per_kind:
             continue
         by_kind[bucket].append(r)
     return by_kind
@@ -2600,13 +2652,12 @@ def format_urgent_manufacture_markdown(
     *,
     limit: int = REPORT_URGENT_TOP_N,
 ) -> str:
-    """② 제조 시급 품목 TOP N (1~2년 이내 소진)."""
+    """② 제조 시급 품목 전수 (1~2년 이내 소진)."""
     rows = _collect_urgent_rows(flags, limit=limit)
     lines = [
         "## 제조 시급 품목 리스트",
         "",
-        f"재고 커버리지 1~2년 이내 소진 예상 TOP {limit} "
-        f"(실제 {len(rows)}건 · 전수 아님)",
+        f"재고 커버리지 1~2년 이내 소진 예상 **전수 {len(rows)}건** (생략 없음)",
         "",
         f"{PRIORITY_FORMULA_KO}",
         "",
@@ -2624,13 +2675,13 @@ def format_overstock_reduce_markdown(
     *,
     limit: int = REPORT_REDUCE_TOP_N,
 ) -> str:
-    """③ 과다재고·제조 축소 권고 TOP N."""
+    """③ 과다재고·제조 축소 권고 (전수)."""
     rows = _collect_reduce_rows(flags, limit=limit)
     lines = [
         "## 과다재고 및 제조 축소 권고 품목",
         "",
-        f"장기 저분양 ∩ 과다재고(커버리지≥15년) 등 상위 {limit}건 "
-        f"(실제 {len(rows)}건)",
+        f"장기 저분양 ∩ 과다재고(커버리지≥15년) 등 **전수 {len(rows)}건**",
+        "[정렬 기준: 재고 커버리지(연수) 높은 순 → 최근 연평균 분양량 낮은 순]",
         "",
         "| # | 한글명 | 관리번호 | 유형 | 커버리지(년) | 최근분양 | 권고 |",
         "| --- | --- | --- | --- | --- | --- | --- |",
@@ -2671,7 +2722,7 @@ def format_develop_targets_markdown(
     *,
     limit_per_kind: int = REPORT_DEVELOP_TOP_N_PER_KIND,
 ) -> str:
-    """④ 공정서 미확보 표준생약 개발 대상 (KP/KHP 분리, 상한)."""
+    """④ 공정서 미확보 표준생약 개발 대상 — 기원 단위 전수 (KP/KHP 분리)."""
     by_kind = _collect_develop_rows_by_kind(
         flags, match_result, limit_per_kind=limit_per_kind
     )
@@ -2680,12 +2731,14 @@ def format_develop_targets_markdown(
         or (flags or {}).get("compendium_stats")
         or {}
     )
+    total_n = sum(len(v) for v in by_kind.values())
     lines = [
         "## 공정서 미확보 표준생약 개발 대상",
         "",
-        f"품목 기준 미보유 {st.get('herb_missing', '-')}건 · "
-        f"기원 미확보 {st.get('origin_missing', '-')}건 중 "
-        f"KP/KHP 각 최대 {limit_per_kind}건만 수록 (전수 생략)",
+        f"기원식물(행) 기준 미확보 **전수 {total_n}건** "
+        f"(품목 미보유 {st.get('herb_missing', '-')}건 · "
+        f"기원 미확보 {st.get('origin_missing', '-')}건 · 생략 없음)",
+        "동일 생약이라도 미확보 기원은 개별 항목으로 구분합니다.",
         "",
     ]
     for kind in ("KP", "KHP", "기타"):
@@ -2698,8 +2751,8 @@ def format_develop_targets_markdown(
             lines.append("(해당 없음)")
             lines.append("")
             continue
-        lines.append("| # | 생약명(한글) | 기원행수 | 공정서 |")
-        lines.append("| --- | --- | --- | --- |")
+        lines.append("| # | 생약명(한글) | 기원(한글) | 기원(영문) | 공정서 | 확인시험 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
         for i, r in enumerate(rows, 1):
             lines.append(
                 "| "
@@ -2707,10 +2760,12 @@ def format_develop_targets_markdown(
                     [
                         str(i),
                         str(r.get("name_ko") or r.get("name_en") or "-").replace("|", "/"),
-                        str(r.get("origin_count") or "-"),
+                        str(r.get("origin_ko") or "-").replace("|", "/"),
+                        str(r.get("origin_en") or "-").replace("|", "/"),
                         str(
                             r.get("pharmacopoeia_kind") or r.get("pharmacopoeia") or kind
                         ).replace("|", "/"),
+                        _identity_test_ox(r),
                     ]
                 )
                 + " |"
@@ -2719,16 +2774,23 @@ def format_develop_targets_markdown(
     return "\n".join(lines)
 
 
+
+
 def _roadmap_example_names(rows: list[dict[str, Any]], *, limit: int = 3) -> str:
-    """로드맵 문장용 품목명 예시 (최대 limit개)."""
+    """로드맵 문장용 품목명 예시 (최대 limit개). 기원명이 있으면 함께 표기."""
     names: list[str] = []
     seen: set[str] = set()
     for r in rows:
         name = str(r.get("name_ko") or r.get("label") or "").strip()
-        if not name or name in seen:
+        origin = str(r.get("origin_ko") or "").strip()
+        if origin and origin not in ("-", name):
+            label = f"{name}({origin})" if name else origin
+        else:
+            label = name
+        if not label or label in seen:
             continue
-        seen.add(name)
-        names.append(name)
+        seen.add(label)
+        names.append(label)
         if len(names) >= limit:
             break
     return ", ".join(names)
@@ -2804,11 +2866,11 @@ def format_roadmap_markdown(
         "",
         "### 신규",
         (
-            f"- 공정서 미확보 개발 대상 {develop_n}종: KP/KHP 분리 목록을 기준으로 "
+            f"- 공정서 미확보 개발 대상 {develop_n}건(기원 단위): KP/KHP 분리 목록을 기준으로 "
             "표준생약 신규 확보 우선순위를 수립합니다."
             + (f" (예: {develop_ex})" if develop_ex else "")
         ),
-        "- 미확보 품목은 기원·공정서 중요도를 반영해 연간 개발 파이프라인에 편성합니다.",
+        "- 미확보 기원식물은 생약명과 별도로 구분·집계하며, 공정서 중요도를 반영해 연간 개발 파이프라인에 편성합니다.",
         "",
         "### 축소",
         (
@@ -3612,7 +3674,7 @@ def _rows_to_markdown_table(
 
 
 def _missing_rows_to_markdown_table(rows: list[dict[str, Any]]) -> list[str]:
-    headers = ["#", "한글명", "기원(한글)", "기원(영문)", "공정서"]
+    headers = ["#", "한글명", "기원(한글)", "기원(영문)", "공정서", "확인시험"]
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
@@ -3626,6 +3688,7 @@ def _missing_rows_to_markdown_table(rows: list[dict[str, Any]]) -> list[str]:
             str(
                 r.get("pharmacopoeia_kind") or r.get("pharmacopoeia") or "-"
             ).replace("|", "/"),
+            _identity_test_ox(r),
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return lines
@@ -5234,6 +5297,83 @@ def _norm_key(s: Any) -> str:
     return text
 
 
+def _strip_parenthetical(s: Any) -> str:
+    """괄호/대괄호 속 부기(한자·기원 등) 제거."""
+    if _is_empty(s):
+        return ""
+    text = str(s)
+    text = re.sub(r"[\(（\[].*?[\)）\]]", "", text)
+    return text.strip()
+
+
+# 주요 품목 alias — 정규화 키 기준 (두충·괄루인 등 KP 수재 누락 방지)
+_COMPENDIUM_ALIAS_PAIRS: tuple[tuple[str, str], ...] = (
+    ("두충", "杜仲"),
+    ("두충", "Eucommia"),
+    ("두충", "Eucommiae Cortex"),
+    ("두충", "EucommiaeCortex"),
+    ("괄루인", "과루인"),
+    ("괄루인", "瓜蔞仁"),
+    ("괄루인", "괄루仁"),
+    ("괄루인", "과루仁"),
+    ("괄루인", "Trichosanthis Semen"),
+    ("괄루인", "Trichosanthes"),
+)
+
+
+def _compendium_alias_map() -> dict[str, set[str]]:
+    """정규화 키 → 동일 품목으로 취급할 키 집합."""
+    groups: dict[str, set[str]] = {}
+    for canon, alias in _COMPENDIUM_ALIAS_PAIRS:
+        ck = _norm_key(canon)
+        ak = _norm_key(alias)
+        if not ck or not ak:
+            continue
+        bucket = groups.setdefault(ck, {ck})
+        bucket.add(ak)
+        groups[ak] = bucket
+    return groups
+
+
+_COMPENDIUM_ALIAS_MAP: dict[str, set[str]] | None = None
+
+
+def _alias_keys_for(norm: str) -> list[str]:
+    global _COMPENDIUM_ALIAS_MAP
+    if not norm:
+        return []
+    if _COMPENDIUM_ALIAS_MAP is None:
+        _COMPENDIUM_ALIAS_MAP = _compendium_alias_map()
+    group = _COMPENDIUM_ALIAS_MAP.get(norm)
+    if not group:
+        return [norm]
+    return sorted(group, key=lambda x: (len(x), x))
+
+
+def _name_match_keys(s: Any) -> list[str]:
+    """매칭 키 후보: 전체 정규화 → 괄호 제거 정규화 → alias 확장."""
+    raw = "" if _is_empty(s) else str(s).strip()
+    if not raw:
+        return []
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def _add(k: str) -> None:
+        if k and k not in seen:
+            seen.add(k)
+            keys.append(k)
+
+    _add(_norm_key(raw))
+    stripped = _strip_parenthetical(raw)
+    if stripped and stripped != raw:
+        _add(_norm_key(stripped))
+    for k in list(keys):
+        for ak in _alias_keys_for(k):
+            _add(ak)
+    return keys
+
+
+
 def _pharmacopoeia_kind(pharm: str) -> str:
     """공정서 구분: KP / KHP / 기타."""
     tag = _pharmacopoeia_tag_from_text(pharm)
@@ -5461,20 +5601,19 @@ def match_compendium_inventory(
     for e in entries:
         if e.name_ko:
             by_exact_ko[e.name_ko.strip()].append(e)
-            nk = _norm_key(e.name_ko)
-            if nk:
+            stripped_ko = _strip_parenthetical(e.name_ko)
+            if stripped_ko and stripped_ko != e.name_ko.strip():
+                by_exact_ko[stripped_ko].append(e)
+            for nk in _name_match_keys(e.name_ko):
                 by_norm_ko[nk].append(e)
         if e.name_en:
-            ne = _norm_key(e.name_en)
-            if ne:
+            for ne in _name_match_keys(e.name_en):
                 by_norm_en[ne].append(e)
         if e.origin_ko:
-            no = _norm_key(e.origin_ko)
-            if no:
+            for no in _name_match_keys(e.origin_ko):
                 by_norm_origin_ko[no].append(e)
         if e.origin_en:
-            noe = _norm_key(e.origin_en)
-            if noe:
+            for noe in _name_match_keys(e.origin_en):
                 by_norm_origin_en[noe].append(e)
 
     def _pick_first(cands: list[CompendiumEntry]) -> Optional[CompendiumEntry]:
@@ -5518,40 +5657,55 @@ def match_compendium_inventory(
         match_type = ""
 
         # A1: 영문명 우선 → 한글명 → 한글명↔기원 교차
+        # 정규화(괄호·띄어쓰기·특수문자 제거) + alias(두충/괄루인 등)
         if stock_en:
-            ne = _norm_key(stock_en)
-            if ne and ne in by_norm_en:
-                hit = _pick_first(by_norm_en[ne])
-                match_type = "fuzzy_en"
-        if hit is None and stock_ko and stock_ko in by_exact_ko:
-            cands = by_exact_ko[stock_ko]
-            hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
-            match_type = "exact_ko"
+            for ne in _name_match_keys(stock_en):
+                if ne in by_norm_en:
+                    hit = _pick_first(by_norm_en[ne])
+                    match_type = "fuzzy_en"
+                    break
         if hit is None and stock_ko:
-            nk = _norm_key(stock_ko)
-            if nk and nk in by_norm_ko:
-                cands = by_norm_ko[nk]
-                hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
-                match_type = "fuzzy_ko"
+            for cand_name in (stock_ko, _strip_parenthetical(stock_ko)):
+                if cand_name and cand_name in by_exact_ko:
+                    cands = by_exact_ko[cand_name]
+                    hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
+                    match_type = "exact_ko"
+                    break
         if hit is None and stock_ko:
-            nk = _norm_key(stock_ko)
-            if nk and nk in by_norm_origin_ko:
-                hit = _pick_first(by_norm_origin_ko[nk])
-                match_type = "name_origin_ko"
-            elif nk and nk in by_norm_origin_en:
-                hit = _pick_first(by_norm_origin_en[nk])
-                match_type = "name_origin_en"
-            else:
-                for ok, cands in by_norm_origin_ko.items():
-                    if nk and (nk in ok or ok in nk) and len(nk) >= 2:
-                        hit = _pick_first(cands)
-                        match_type = "name_origin_ko"
+            for nk in _name_match_keys(stock_ko):
+                if nk in by_norm_ko:
+                    cands = by_norm_ko[nk]
+                    hit = _pick_by_origin(cands, stock_ko) if len(cands) > 1 else _pick_first(cands)
+                    match_type = "fuzzy_ko"
+                    break
+        if hit is None and stock_ko:
+            keys = _name_match_keys(stock_ko)
+            for nk in keys:
+                if nk in by_norm_origin_ko:
+                    hit = _pick_first(by_norm_origin_ko[nk])
+                    match_type = "name_origin_ko"
+                    break
+                if nk in by_norm_origin_en:
+                    hit = _pick_first(by_norm_origin_en[nk])
+                    match_type = "name_origin_en"
+                    break
+            if hit is None:
+                for nk in keys:
+                    for ok, cands in by_norm_origin_ko.items():
+                        if nk and (nk in ok or ok in nk) and len(nk) >= 2:
+                            hit = _pick_first(cands)
+                            match_type = "name_origin_ko"
+                            break
+                    if hit is not None:
                         break
                 if hit is None:
-                    for oe, cands in by_norm_origin_en.items():
-                        if nk and (nk in oe or oe in nk) and len(nk) >= 2:
-                            hit = _pick_first(cands)
-                            match_type = "name_origin_en"
+                    for nk in keys:
+                        for oe, cands in by_norm_origin_en.items():
+                            if nk and (nk in oe or oe in nk) and len(nk) >= 2:
+                                hit = _pick_first(cands)
+                                match_type = "name_origin_en"
+                                break
+                        if hit is not None:
                             break
 
         if hit is None:
