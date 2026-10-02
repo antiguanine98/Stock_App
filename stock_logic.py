@@ -5312,12 +5312,21 @@ _COMPENDIUM_ALIAS_PAIRS: tuple[tuple[str, str], ...] = (
     ("두충", "Eucommia"),
     ("두충", "Eucommiae Cortex"),
     ("두충", "EucommiaeCortex"),
+    ("두충", "두충엽"),
     ("괄루인", "과루인"),
     ("괄루인", "瓜蔞仁"),
     ("괄루인", "괄루仁"),
     ("괄루인", "과루仁"),
     ("괄루인", "Trichosanthis Semen"),
     ("괄루인", "Trichosanthes"),
+    ("센나엽", "센나"),
+    ("센나엽", "Sennae Folium"),
+    ("센나엽", "Senna"),
+    ("울금", "Curcumae Radix"),
+    ("울금", "Curcuma"),
+    ("육계", "Cinnamomi Cortex"),
+    ("육계", "Cinnamomum"),
+    ("육계", "계피"),
 )
 
 
@@ -5350,8 +5359,47 @@ def _alias_keys_for(norm: str) -> list[str]:
     return sorted(group, key=lambda x: (len(x), x))
 
 
+# 생약 부위 접미사 — 두충/두충엽, 센나/센나엽 등 포괄 매칭용
+_HERB_PART_SUFFIXES: tuple[str, ...] = (
+    "근경",
+    "근피",
+    "과피",
+    "종인",
+    "종자",
+    "뿌리",
+    "껍질",
+    "줄기",
+    "열매",
+    "엽",
+    "잎",
+    "근",
+    "피",
+    "인",
+    "씨",
+    "과",
+    "화",
+    "꽃",
+    "경",
+    "자",
+)
+
+
+def _stem_keys(norm: str) -> list[str]:
+    """정규화 키에서 부위 접미사를 벗긴 어간 키 후보."""
+    if not norm or len(norm) < 3:
+        return []
+    out: list[str] = []
+    for suf in _HERB_PART_SUFFIXES:
+        ns = _norm_key(suf)
+        if ns and norm.endswith(ns) and len(norm) - len(ns) >= 2:
+            stem = norm[: -len(ns)]
+            if stem:
+                out.append(stem)
+    return out
+
+
 def _name_match_keys(s: Any) -> list[str]:
-    """매칭 키 후보: 전체 정규화 → 괄호 제거 정규화 → alias 확장."""
+    """매칭 키 후보: 정규화 → 괄호 제거 → 부위 어간 → alias 확장."""
     raw = "" if _is_empty(s) else str(s).strip()
     if not raw:
         return []
@@ -5368,8 +5416,13 @@ def _name_match_keys(s: Any) -> list[str]:
     if stripped and stripped != raw:
         _add(_norm_key(stripped))
     for k in list(keys):
+        for stem in _stem_keys(k):
+            _add(stem)
+    for k in list(keys):
         for ak in _alias_keys_for(k):
             _add(ak)
+            for stem in _stem_keys(ak):
+                _add(stem)
     return keys
 
 
@@ -5573,14 +5626,73 @@ def _pharmacopoeia_tag_from_text(pharm: str) -> str:
     return " ".join(f"[{t} 수재]" for t in tags)
 
 
+
+def _entry_identity_keys(e: "CompendiumEntry") -> list[str]:
+    """공정서 행의 보유 판정용 키(생약명·기원 한글/영문)."""
+    keys: list[str] = []
+    seen: set[str] = set()
+    for val in (e.name_ko, e.name_en, e.origin_ko, e.origin_en):
+        for k in _name_match_keys(val):
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+    return keys
+
+
+def _build_held_inventory_keys(items: list["StockItem"]) -> set[str]:
+    """수량 > 0 인 재고의 생약명·영문명 정규화 키 집합.
+
+    확인시험/정량법 표준품 지정, 휴면 로트, 신뢰도 등급은 무시한다.
+    """
+    held: set[str] = set()
+    for it in items:
+        if is_zero_stock(it):
+            continue
+        qty = it.current_qty
+        if qty is not None:
+            try:
+                if float(qty) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        for val in (
+            getattr(it, "name_ko", None),
+            getattr(it, "name_en", None),
+        ):
+            for k in _name_match_keys(val):
+                held.add(k)
+    return held
+
+
+def _entry_is_held_by_inventory(
+    e: "CompendiumEntry",
+    held_keys: set[str],
+) -> bool:
+    """공정서 행이 실재고(수량>0) 생약명/기원명과 매칭되면 확보.
+
+    키는 정규화·괄호제거·부위어간·alias가 이미 확장된 집합이므로
+    집합 교집합만으로 판정한다 (과도한 부분문자열 매칭 금지).
+    """
+    if not held_keys:
+        return False
+    for k in _entry_identity_keys(e):
+        if k in held_keys:
+            return True
+    return False
+
+
 def match_compendium_inventory(
     entries: list[CompendiumEntry],
     items: list[StockItem],
 ) -> dict[str, Any]:
     """공정서 entries ↔ 재고 품목 매칭.
 
-    재고 측은 영문명(없으면 한글명)이 같으면 1건으로 그룹화한 뒤 매칭한다.
-    매칭 키 우선순위: 영문명 → 한글명 exact/fuzzy → 한글명↔기원 교차.
+    미확보 판정(최우선): 수량>0 재고의 생약명·영문명·기원명이
+    공정서 수재 항목(품목명/기원명)과 정규화·부위어간·alias로 매칭되면
+    무조건 확보로 보고 미확보 목록에서 제외한다.
+    (확인시험/정량법 표준품 지정·휴면·신뢰도 조건은 사용하지 않음)
+
+    재고 측 그룹화·공정서 태그 보정은 영문명 우선 매칭을 유지한다.
     """
     for e in entries:
         e.pharmacopoeia = _normalize_compendium_pharmacopoeia(e.name_ko, e.pharmacopoeia)
@@ -5646,6 +5758,19 @@ def match_compendium_inventory(
             return scored[0][1]
         return _pick_first(cands)
 
+    # --- 보유 판정 (최우선·단순): 수량>0 재고의 생약명/영문명 키 ---
+    # 확인시험·정량법 표준품 지정, 휴면, 신뢰도 등은 미확보 판정에 사용하지 않음.
+    # 0재고 로트와의 이름 매칭은 태그 보정용 matched_entry_ids에만 쓰고,
+    # 미확보/확보 집계는 held_entry_ids(실물 재고)만 사용한다.
+    held_inv_keys = _build_held_inventory_keys(items)
+    held_entry_ids: set[int] = set()
+    for e in entries:
+        if e.is_origin_exception:
+            continue
+        if _entry_is_held_by_inventory(e, held_inv_keys):
+            held_entry_ids.add(id(e))
+            matched_entry_ids.add(id(e))
+
     groups = build_name_en_inventory_groups(items)
     unique_inventory_groups = len(groups)
 
@@ -5709,19 +5834,32 @@ def match_compendium_inventory(
                             break
 
         if hit is None:
-            match_failures.append(
-                {
-                    "identity_key": group_key,
-                    "name_ko": stock_ko,
-                    "name_en": stock_en,
-                    "manage_nos": [it.manage_no for it in group_items if it.manage_no],
-                    "lot_count": len(group_items),
-                    "reason": "매칭 실패/확인 필요",
-                }
-            )
+            # 수량>0 재고만 매칭 실패로 기록 (0재고 로트는 미보유 판정과 무관)
+            if any(not is_zero_stock(it) for it in group_items):
+                match_failures.append(
+                    {
+                        "identity_key": group_key,
+                        "name_ko": stock_ko,
+                        "name_en": stock_en,
+                        "manage_nos": [it.manage_no for it in group_items if it.manage_no],
+                        "lot_count": len(group_items),
+                        "reason": "매칭 실패/확인 필요",
+                    }
+                )
             continue
 
         matched_entry_ids.add(id(hit))
+        # 실물 재고(수량>0) 그룹이면 동일 생약명 공정서 행도 확보로 표시
+        if any(not is_zero_stock(it) for it in group_items):
+            hit_keys = set(_name_match_keys(hit.name_ko)) | set(_name_match_keys(hit.name_en))
+            if hit_keys:
+                for e in entries:
+                    if e.is_origin_exception:
+                        continue
+                    ek = set(_name_match_keys(e.name_ko)) | set(_name_match_keys(e.name_en))
+                    if hit_keys & ek:
+                        held_entry_ids.add(id(e))
+                        matched_entry_ids.add(id(e))
         tag = _pharmacopoeia_tag_from_text(hit.pharmacopoeia)
         short = ""
         if tag:
@@ -5780,7 +5918,7 @@ def match_compendium_inventory(
     missing: list[CompendiumEntry] = [
         e
         for e in entries
-        if id(e) not in matched_entry_ids and not e.is_origin_exception
+        if id(e) not in held_entry_ids and not e.is_origin_exception
     ]
     missing_items = [
         _missing_compendium_row(e, i) for i, e in enumerate(missing, 1)
@@ -5802,8 +5940,8 @@ def match_compendium_inventory(
     # A/B 표준품 명시 그룹 (확인시험·정량법 표준품 컬럼)
     group_a = [e for e in entries if e.std_group == "A"]
     group_b = [e for e in entries if e.std_group == "B"]
-    group_a_held = sum(1 for e in group_a if id(e) in matched_entry_ids)
-    group_b_held = sum(1 for e in group_b if id(e) in matched_entry_ids)
+    group_a_held = sum(1 for e in group_a if id(e) in held_entry_ids)
+    group_b_held = sum(1 for e in group_b if id(e) in held_entry_ids)
 
     # ① 품목(생약명 한글) 기준 · ② 기원식물(행) 기준 분리 집계
     # 기원 예외 행은 미보유/커버리지 분모에서 제외
@@ -5816,7 +5954,7 @@ def match_compendium_inventory(
     herb_total = len(herb_names)
     held_herbs: set[str] = set()
     for e in eligible_entries:
-        if id(e) in matched_entry_ids:
+        if id(e) in held_entry_ids:
             key = (e.name_ko or "").strip() or (e.name_en or "").strip()
             if key:
                 held_herbs.add(key)
@@ -5825,7 +5963,7 @@ def match_compendium_inventory(
     herb_rate = round(100.0 * herb_held / herb_total, 1) if herb_total else 0.0
 
     origin_total = len(eligible_entries)
-    origin_held = sum(1 for e in eligible_entries if id(e) in matched_entry_ids)
+    origin_held = sum(1 for e in eligible_entries if id(e) in held_entry_ids)
     origin_missing = max(0, origin_total - origin_held)
     origin_rate = round(100.0 * origin_held / origin_total, 1) if origin_total else 0.0
 

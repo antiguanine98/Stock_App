@@ -1200,15 +1200,15 @@ def test_compendium_herb_vs_origin_and_hwonchogeun_khp():
     assert st["origin_total"] == 4
     assert st["herb_held"] == 1
     assert st["herb_missing"] == 2
-    assert st["origin_held"] == 1
-    assert st["origin_missing"] == 3
+    # 실재고 생약명 매칭 시 동일 생약의 전 기원 행을 확보로 본다
+    assert st["origin_held"] == 2
+    assert st["origin_missing"] == 2
     assert any(e.pharmacopoeia == "KHP" for e in entries if e.name_ko == "훤초근")
     md = format_compendium_stats_markdown(match)
     assert "품목 기준" in md and "기원식물 기준" in md
     assert "품목 확보율" in md and "기원 확보율" in md
-    # 미보유를 기원 전체로만 왜곡하지 않음
     assert "미보유 생약 수: **2건**" in md
-    assert "미확보 기원 수: **3건**" in md
+    assert "미확보 기원 수: **2건**" in md
 
 
 def test_strip_duplicate_auto_summary_opinion():
@@ -1915,6 +1915,58 @@ def test_missing_table_includes_identity_test_column():
     body = "\n".join(lines)
     assert "가자" in body and "유" in body
     assert "갈근" in body and "무" in body
+
+
+
+
+def test_held_inventory_excludes_from_missing_despite_no_std_ref():
+    """실물 재고(수량>0)가 있으면 확인시험 표준품 미지정이어도 미확보 제외."""
+    from stock_logic import CompendiumEntry, StockItem, match_compendium_inventory
+
+    entries = [
+        CompendiumEntry(
+            name_ko="두충(杜仲)",
+            name_en="Eucommiae Cortex",
+            pharmacopoeia="KP",
+            has_identity_std=False,
+            has_assay_std=False,
+        ),
+        CompendiumEntry(
+            name_ko="괄루인",
+            name_en="Trichosanthis Semen",
+            pharmacopoeia="KP",
+            has_identity_std=False,
+        ),
+        CompendiumEntry(name_ko="센나엽", name_en="Sennae Folium", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="울금", name_en="Curcumae Radix", pharmacopoeia="KP"),
+        CompendiumEntry(name_ko="육계", name_en="Cinnamomi Cortex", pharmacopoeia="KHP"),
+        CompendiumEntry(name_ko="미보유전용", pharmacopoeia="KP"),
+    ]
+    items = [
+        StockItem(manage_no="1", name_ko="두충엽", balance=10),
+        StockItem(manage_no="2", name_ko="과루인", balance=3),
+        StockItem(manage_no="3", name_ko="센나", balance=2),
+        StockItem(manage_no="4", name_ko="울금", balance=1),
+        StockItem(manage_no="5", name_ko="육계", balance=4),
+        StockItem(manage_no="6", name_ko="미보유전용", balance=0),
+    ]
+    match = match_compendium_inventory(entries, items)
+    missing_names = {e.name_ko for e in match["missing"]}
+    assert "두충(杜仲)" not in missing_names
+    assert "괄루인" not in missing_names
+    assert "센나엽" not in missing_names
+    assert "울금" not in missing_names
+    assert "육계" not in missing_names
+    assert "미보유전용" in missing_names
+    assert match["stats"]["missing_count"] == 1
+
+
+def test_plant_part_stem_matching_keys():
+    from stock_logic import _name_match_keys
+
+    keys = _name_match_keys("두충엽")
+    assert "두충" in keys
+    assert "두충엽" in keys
 
 
 
