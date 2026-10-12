@@ -2410,8 +2410,8 @@ def format_accel_monitoring_markdown(monitoring: list[dict[str, Any]] | None) ->
     return "\n".join(lines)
 
 
-# 리포트 본문·상세 표는 전수 수록 (축약/TOP N 생략 금지)
-REPORT_URGENT_TOP_N = 10_000
+# 시급: 표준생약·지표성분 각 Need Score TOP N / 축소·제조(미확보)는 전수
+REPORT_URGENT_TOP_N = 20
 REPORT_REDUCE_TOP_N = 10_000
 REPORT_DEVELOP_TOP_N_PER_KIND = 10_000
 INCLUDE_REPORT_APPENDIX_DEFAULT = False
@@ -2431,12 +2431,23 @@ _SLIM_QUANT_SECTION_KEYS = frozenset({"summary", "urgent", "reduce", "develop"})
 _TRUNCATION_CELL_MARKERS = ("...", "…", "(중략)", "중략", "(생략)", "생략")
 
 
+def _urgent_row_std_type(row: dict[str, Any]) -> str:
+    """시급 행의 표준품구분 정규화 값."""
+    raw = row.get("std_type") or row.get("표준품구분") or ""
+    return normalize_std_type(raw) or str(raw or "").strip()
+
+
 def _collect_urgent_rows(
     flags: dict[str, Any] | None,
     *,
-    limit: int = REPORT_URGENT_TOP_N,
+    limit: int | None = REPORT_URGENT_TOP_N,
+    std_type: str | None = None,
 ) -> list[dict[str, Any]]:
-    """커버리지 1~2년(긴급제조·제조준비) 시급 품목 TOP N."""
+    """커버리지 1~2년(긴급제조·제조준비) 시급 품목.
+
+    정렬: 제조 필요도 점수(Need Score) 내림차순.
+    std_type이 있으면 해당 유형만, limit이 None이면 전수.
+    """
     f = flags or {}
     cat = f.get("depletion_category_items") or {}
     rows: list[dict[str, Any]] = []
@@ -2449,7 +2460,8 @@ def _collect_urgent_rows(
             seen.add(key)
             rows.append(dict(r))
     # fallback: manufacture candidates with years_left <= 2
-    if len(rows) < limit:
+    need_fallback = limit is None or len(rows) < limit
+    if need_fallback:
         mfg = f.get("manufacture_candidates") or {}
         for bucket in (mfg.get("표준생약") or []) + (mfg.get("지표성분") or []):
             yl = bucket.get("years_left")
@@ -2460,13 +2472,35 @@ def _collect_urgent_rows(
                 continue
             seen.add(key)
             rows.append(dict(bucket))
+    if std_type:
+        want = normalize_std_type(std_type) or std_type
+        rows = [r for r in rows if _urgent_row_std_type(r) == want]
     rows.sort(
         key=lambda r: (
-            float(r["years_left"]) if isinstance(r.get("years_left"), (int, float)) else 999.0,
             -float(r.get("priority_score") or 0),
+            float(r["years_left"]) if isinstance(r.get("years_left"), (int, float)) else 999.0,
+            str(r.get("name_ko") or r.get("label") or ""),
         )
     )
+    if limit is None:
+        return rows
     return rows[:limit]
+
+
+def _collect_urgent_rows_by_std_type(
+    flags: dict[str, Any] | None,
+    *,
+    limit_per_type: int = REPORT_URGENT_TOP_N,
+) -> dict[str, list[dict[str, Any]]]:
+    """시급 품목을 표준생약 / 지표성분 TOP N으로 분리."""
+    return {
+        "표준생약": _collect_urgent_rows(
+            flags, limit=limit_per_type, std_type="표준생약"
+        ),
+        "지표성분": _collect_urgent_rows(
+            flags, limit=limit_per_type, std_type="지표성분"
+        ),
+    }
 
 
 def _collect_reduce_rows(
@@ -2615,8 +2649,6 @@ def format_slim_dashboard_markdown(
     lines = [
         "## 종합현황 대시보드",
         "",
-        "요약형 핵심 지표 (10~15페이지 보고서 · 전수 목록은 부록에서 선택)",
-        "",
         "| 지표 | 값 |",
         "| --- | --- |",
         f"| 전체 품목 수 | {total_n}종 |",
@@ -2639,11 +2671,7 @@ def format_slim_dashboard_markdown(
         for k in extras:
             lines.append(f"| {k.get('label')} | {k.get('display')} |")
         lines.append("")
-    lines.append("### 자동 종합 의견")
-    for s in dashboard.get("summary_lines") or []:
-        lines.append(f"- {s}")
-    if not dashboard.get("summary_lines"):
-        lines.append("- (종합 의견 없음)")
+    # 로드맵·종합 의견은 현황 탭에 넣지 않음 (로드맵 탭과 중복 방지)
     return "\n".join(lines)
 
 
@@ -2652,20 +2680,37 @@ def format_urgent_manufacture_markdown(
     *,
     limit: int = REPORT_URGENT_TOP_N,
 ) -> str:
-    """② 제조 시급 품목 전수 (1~2년 이내 소진)."""
-    rows = _collect_urgent_rows(flags, limit=limit)
+    """② 제조 시급 — 표준생약 TOP N · 지표성분 TOP N (Need Score 내림차순)."""
+    by_type = _collect_urgent_rows_by_std_type(flags, limit_per_type=limit)
+    std_rows = by_type.get("표준생약") or []
+    ind_rows = by_type.get("지표성분") or []
     lines = [
         "## 제조 시급 품목 리스트",
         "",
-        f"재고 커버리지 1~2년 이내 소진 예상 **전수 {len(rows)}건** (생략 없음)",
+        "재고 커버리지 1~2년 이내 소진 예상 · "
+        f"**표준생약 TOP {limit}** / **지표성분 TOP {limit}** "
+        "(제조 필요도 점수 높은 순)",
         "",
         f"{PRIORITY_FORMULA_KO}",
         "",
+        f"### 표준생약 TOP {limit} ({len(std_rows)}건)",
+        "",
     ]
-    if rows:
-        lines.extend(_manufacture_rows_to_markdown_table(rows))
+    if std_rows:
+        lines.extend(_manufacture_rows_to_markdown_table(std_rows))
     else:
-        lines.append("(해당 없음 — 1~2년 이내 시급 품목 0건)")
+        lines.append("(해당 없음)")
+    lines.extend(
+        [
+            "",
+            f"### 지표성분 TOP {limit} ({len(ind_rows)}건)",
+            "",
+        ]
+    )
+    if ind_rows:
+        lines.extend(_manufacture_rows_to_markdown_table(ind_rows))
+    else:
+        lines.append("(해당 없음)")
     lines.append("")
     return "\n".join(lines)
 
@@ -2722,7 +2767,7 @@ def format_develop_targets_markdown(
     *,
     limit_per_kind: int = REPORT_DEVELOP_TOP_N_PER_KIND,
 ) -> str:
-    """④ 공정서 미확보 표준생약 개발 대상 — 기원 단위 전수 (KP/KHP 분리)."""
+    """④ 공정서 미확보 표준생약 제조 대상 — 기원 단위 전수 (KP/KHP 분리)."""
     by_kind = _collect_develop_rows_by_kind(
         flags, match_result, limit_per_kind=limit_per_kind
     )
@@ -2733,7 +2778,7 @@ def format_develop_targets_markdown(
     )
     total_n = sum(len(v) for v in by_kind.values())
     lines = [
-        "## 공정서 미확보 표준생약 개발 대상",
+        "## 공정서 미확보 표준생약 제조 대상",
         "",
         f"기원식물(행) 기준 미확보 **전수 {total_n}건** "
         f"(품목 미보유 {st.get('herb_missing', '-')}건 · "
@@ -2829,7 +2874,7 @@ def format_roadmap_markdown(
     reduce_rows = _collect_reduce_rows(f, limit=5)
     by_kind = _collect_develop_rows_by_kind(f, match_result, limit_per_kind=5)
     develop_rows = (by_kind.get("KP") or []) + (by_kind.get("KHP") or []) + (by_kind.get("기타") or [])
-    urgent_n = len(_collect_urgent_rows(f, limit=9999))
+    urgent_n = len(_collect_urgent_rows(f, limit=None))
     reduce_n = len(_collect_reduce_rows(f, limit=9999))
     develop_n = sum(len(v) for v in by_kind.values())
     # 가속 모니터링은 전체 목록 길이 사용
@@ -2866,11 +2911,11 @@ def format_roadmap_markdown(
         "",
         "### 신규",
         (
-            f"- 공정서 미확보 개발 대상 {develop_n}건(기원 단위): KP/KHP 분리 목록을 기준으로 "
+            f"- 공정서 미확보 제조 대상 {develop_n}건(기원 단위): KP/KHP 분리 목록을 기준으로 "
             "표준생약 신규 확보 우선순위를 수립합니다."
             + (f" (예: {develop_ex})" if develop_ex else "")
         ),
-        "- 미확보 기원식물은 생약명과 별도로 구분·집계하며, 공정서 중요도를 반영해 연간 개발 파이프라인에 편성합니다.",
+        "- 미확보 기원식물은 생약명과 별도로 구분·집계하며, 공정서 중요도를 반영해 연간 제조 파이프라인에 편성합니다.",
         "",
         "### 축소",
         (
@@ -3342,7 +3387,7 @@ def ensure_mandatory_report_sections(
     *,
     include_appendix: bool = INCLUDE_REPORT_APPENDIX_DEFAULT,
 ) -> str:
-    """요약형 필수 섹션(현황·시급·축소·개발·로드맵) 본문을 항상 채운다."""
+    """요약형 필수 섹션(현황·시급·축소·제조·로드맵) 본문을 항상 채운다."""
     text = (md_text or "").strip()
     to_inject: list[tuple[str, str]] = []
     for key in MANDATORY_REPORT_SECTION_ORDER:
@@ -4204,13 +4249,14 @@ def build_ai_prompt(
         "- 수치를 임의로 바꾸거나 없는 품목을 지어내지 마세요.",
         "- 서술: ①현황 수치 → ②원인 → ③권고. '제언' 섹션 금지.",
         "- 보고서는 10~15페이지 요약형입니다. 전수 품목 나열 금지.",
-        "- 정량 표(시급 TOP20·축소 TOP15·개발 대상)는 앱이 주입하므로 모델은 해석·로드맵만 작성.",
+        "- 정량 표(시급 표준생약/지표성분 TOP20·축소·제조 대상)는 앱이 주입하므로 모델은 해석·로드맵만 작성.",
+        "- ## 종합현황 대시보드에는 KPI 수치만 두고, 로드맵·유지/확대/신규/축소 제안은 쓰지 마세요.",
         "",
         "[출력 — 요약형 5섹션만]",
-        "1. ## 종합현황 대시보드 — 핵심 KPI 해석 5줄 내외 (표 재구성 금지)",
-        "2. ## 제조 시급 품목 — TOP20 의미·위험 요인 요약",
+        "1. ## 종합현황 대시보드 — 핵심 KPI만 (표 재구성·로드맵 문구 금지)",
+        "2. ## 제조 시급 품목 — 표준생약/지표성분 TOP20(Need Score) 의미·위험 요인 요약",
         "3. ## 과다재고 및 제조 축소 권고 — 상위 품목 시사점",
-        "4. ## 공정서 미확보 개발 대상 — KP/KHP 분리 우선순위 제언",
+        "4. ## 공정서 미확보 표준생약 제조 대상 — KP/KHP 분리 우선순위 제언",
         "5. ## 로드맵 총괄 제안 — 반드시 ### 유지 / ### 확대 / ### 신규 / ### 축소 "
         "하위 헤딩을 두고 각 3~5문장(불릿)으로 작성. 한 줄 요약만 쓰지 마세요.",
         f"6. 제조필요도 공식 인용: {PRIORITY_FORMULA_KO}",
@@ -5011,7 +5057,6 @@ CANONICAL_REPORT_NAV = (
             "차년도 제조",
             "제조검토",
             "제조 검토",
-            "제조",
         ),
     ),
     (
@@ -5021,9 +5066,10 @@ CANONICAL_REPORT_NAV = (
     ),
     (
         "develop",
-        "개발",
+        "제조",
         (
             "미확보",
+            "제조 대상",
             "개발 대상",
             "공정서 미보유",
             "미보유",
@@ -5092,7 +5138,7 @@ def split_markdown_report_sections(
             "summary": "종합현황 대시보드",
             "urgent": "제조 시급 품목 리스트",
             "reduce": "과다재고 및 제조 축소 권고 품목",
-            "develop": "공정서 미확보 표준생약 개발 대상",
+            "develop": "공정서 미확보 표준생약 제조 대상",
             "roadmap": "로드맵 총괄 제안",
         }.get(key, short)
         built = build_mandatory_section_markdown(key, flags, match_result)

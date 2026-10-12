@@ -441,7 +441,7 @@ def test_split_markdown_report_sections():
         "## 종합현황 대시보드\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n"
         "## 제조 시급 품목 리스트\n\n내용A\n\n"
         "## 과다재고 및 제조 축소 권고 품목\n\n축소내용\n\n"
-        "## 공정서 미확보 표준생약 개발 대상\n\n지황\n\n"
+        "## 공정서 미확보 표준생약 제조 대상\n\n지황\n\n"
         "## 로드맵 총괄 제안\n\n유지 확대\n"
     )
     secs = split_markdown_report_sections(md)
@@ -449,19 +449,20 @@ def test_split_markdown_report_sections():
     assert by_id["summary"]["short"] == "현황"
     assert by_id["urgent"]["short"] == "시급"
     assert by_id["reduce"]["short"] == "축소"
-    assert by_id["develop"]["short"] == "개발"
+    assert by_id["develop"]["short"] == "제조"
     assert by_id["roadmap"]["short"] == "로드맵"
     assert "본문이 없습니다" not in by_id["urgent"]["markdown"]
     assert _report_section_short_label("제조 시급 품목") == "시급"
-    assert _report_section_short_label("공정서 미확보") == "개발"
+    assert _report_section_short_label("공정서 미확보") == "제조"
     assert _report_section_short_label("로드맵 총괄 제안") == "로드맵"
 
 
 def test_ensure_mandatory_report_sections():
-    """요약형 5섹션(현황·시급·축소·개발·로드맵)이 항상 본문을 갖는다."""
+    """요약형 5섹션(현황·시급·축소·제조·로드맵)이 항상 본문을 갖는다."""
     from stock_logic import (
         build_mandatory_section_markdown,
         ensure_mandatory_report_sections,
+        format_slim_dashboard_markdown,
         split_markdown_report_sections,
         ZERO_STOCK_CATEGORY,
         MANUFACTURE_REDUCE_RECOMMENDATION,
@@ -472,7 +473,7 @@ def test_ensure_mandatory_report_sections():
             "kpis": [
                 {"key": "managed", "label": "대상품목 수", "value": 3, "display": "3종"}
             ],
-            "summary_lines": ["요약"],
+            "summary_lines": ["요약", "로드맵 제안은 여기 있으면 안 됨"],
         },
         "depletion_category_items": {
             "긴급제조(<1년)": [
@@ -565,20 +566,29 @@ def test_ensure_mandatory_report_sections():
     assert "미보유품" in filled
     assert "로드맵 총괄 제안" in filled
     assert "본문이 없습니다" not in filled
+    assert "공정서 미확보 표준생약 제조 대상" in filled
+    # 현황에는 자동 종합 의견·로드맵 제안 문구 없음
+    summary_md = format_slim_dashboard_markdown(flags, match)
+    assert "자동 종합 의견" not in summary_md
+    assert "로드맵 제안은 여기 있으면 안 됨" not in summary_md
+    assert "전체 품목 수" in summary_md
 
     secs = split_markdown_report_sections(filled, flags=flags, match_result=match)
     by_id = {s["id"]: s for s in secs}
     for key in ("summary", "urgent", "reduce", "develop", "roadmap"):
         assert key in by_id, key
         assert "본문이 없습니다" not in by_id[key]["markdown"], key
+    assert by_id["develop"]["short"] == "제조"
     assert "소진품A" in by_id["urgent"]["markdown"] or "검토품" in by_id["urgent"]["markdown"]
+    assert "### 표준생약 TOP" in by_id["urgent"]["markdown"]
+    assert "### 지표성분 TOP" in by_id["urgent"]["markdown"]
     assert "과다품" in by_id["reduce"]["markdown"]
     assert "미보유품" in by_id["develop"]["markdown"]
     assert build_mandatory_section_markdown("urgent", flags).startswith("## 제조 시급")
 
 
 def test_truncated_ai_tables_replaced_with_slim_list():
-    """AI 중략 표는 요약형 개발 대상 표로 교체된다."""
+    """AI 중략 표는 요약형 제조 대상 표로 교체된다."""
     from stock_logic import (
         ensure_mandatory_report_sections,
         split_markdown_report_sections,
@@ -610,7 +620,7 @@ def test_truncated_ai_tables_replaced_with_slim_list():
         "compendium_stats": {"herb_missing": 5, "origin_missing": 5},
     }
     truncated = (
-        "## 공정서 미확보 표준생약 개발 대상\n\n"
+        "## 공정서 미확보 표준생약 제조 대상\n\n"
         "| # | 생약명(한글) | 기원행수 | 공정서 |\n"
         "| --- | --- | --- | --- |\n"
         "| 1 | 미보유1 | 1 | KP |\n"
@@ -622,6 +632,7 @@ def test_truncated_ai_tables_replaced_with_slim_list():
     assert "미보유3" in filled
     secs = split_markdown_report_sections(filled, flags=flags)
     develop = next(s for s in secs if s["id"] == "develop")
+    assert develop["short"] == "제조"
     assert "(중략)" not in develop["markdown"]
     assert "미보유1" in develop["markdown"]
 
@@ -1212,6 +1223,7 @@ def test_compendium_herb_vs_origin_and_hwonchogeun_khp():
 
 
 def test_strip_duplicate_auto_summary_opinion():
+    """현황 주입 시 자동 종합 의견·로드맵성 문구를 제거하고 KPI만 남긴다."""
     from stock_logic import _strip_auto_summary_opinion_blocks, ensure_mandatory_report_sections
 
     raw = (
@@ -1225,7 +1237,9 @@ def test_strip_duplicate_auto_summary_opinion():
 
     flags = {
         "dashboard": {
-            "kpis": [{"label": "대상품목 수", "display": "1종"}],
+            "kpis": [
+                {"key": "managed", "label": "대상품목 수", "value": 1, "display": "1종"}
+            ],
             "summary_lines": ["단일 요약"],
         },
         "depletion_category_items": {},
@@ -1233,8 +1247,10 @@ def test_strip_duplicate_auto_summary_opinion():
         "monitoring_targets": [],
     }
     filled = ensure_mandatory_report_sections(raw, flags=flags)
-    assert filled.count("### 자동 종합 의견") == 1
-    assert "단일 요약" in filled
+    assert "### 자동 종합 의견" not in filled
+    assert "단일 요약" not in filled
+    assert "## 종합현황 대시보드" in filled
+    assert "전체 품목 수" in filled
 
 
 def test_manufacture_section_always_has_priority_formula():
@@ -1555,10 +1571,11 @@ def test_export_docx_handles_large_table_as_plain_lines():
 
 
 def test_slim_report_five_sections_no_full_catalog_blowup():
-    """요약형 리포트는 5섹션이며 전수 장문 헤딩을 주입하지 않는다."""
+    """요약형 리포트는 5섹션이며 시급은 유형별 TOP20(Need Score)만 수록."""
     from stock_logic import (
         ensure_mandatory_report_sections,
         format_appendix_full_catalog_markdown,
+        format_urgent_manufacture_markdown,
         INCLUDE_REPORT_APPENDIX_DEFAULT,
     )
 
@@ -1569,7 +1586,13 @@ def test_slim_report_five_sections_no_full_catalog_blowup():
         },
         "depletion_category_items": {
             "긴급제조(<1년)": [
-                {"name_ko": f"시급{i}", "manage_no": f"U{i}", "years_left": 0.5, "priority_score": 90 - i}
+                {
+                    "name_ko": f"시급{i}",
+                    "manage_no": f"U{i}",
+                    "std_type": "표준생약" if i < 25 else "지표성분",
+                    "years_left": 0.5,
+                    "priority_score": 90 - i,
+                }
                 for i in range(30)
             ]
         },
@@ -1585,12 +1608,21 @@ def test_slim_report_five_sections_no_full_catalog_blowup():
     assert "## 종합현황 대시보드" in filled
     assert "## 제조 시급 품목 리스트" in filled
     assert "## 로드맵 총괄 제안" in filled
+    assert "공정서 미확보 표준생약 제조 대상" in filled
     assert INCLUDE_REPORT_APPENDIX_DEFAULT is False
     assert "부록(별첨) — 전수 목록" not in filled or "생략" in filled
-    # 리포트 본문 전수 수록 (TOP 축약 없음)
-    assert "시급19" in filled
-    assert "시급29" in filled
-    assert "전수" in filled
+    urgent_md = format_urgent_manufacture_markdown(flags)
+    assert "### 표준생약 TOP 20" in urgent_md
+    assert "### 지표성분 TOP 20" in urgent_md
+    # 표준생약 25건 중 Need Score 상위 20만 (시급0=90 … 시급19=71), 시급24는 제외
+    assert "시급0" in urgent_md
+    assert "시급19" in urgent_md
+    assert "시급24" not in urgent_md
+    # 지표성분: 시급25~29 (5건) 모두 수록
+    assert "시급25" in urgent_md
+    assert "시급29" in urgent_md
+    # Need Score 내림차순: 시급0(90)이 시급1(89)보다 앞에
+    assert urgent_md.index("시급0") < urgent_md.index("시급1")
     appendix = format_appendix_full_catalog_markdown(flags)
     assert "부록" in appendix
 
