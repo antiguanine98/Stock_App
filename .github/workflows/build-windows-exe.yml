@@ -64,9 +64,8 @@ jobs:
           generate_release_notes: true
           body: |
             ## Summary
-            - 시급 탭/리포트: 표준생약 TOP 20 · 지표성분 TOP 20 독립 표, Need Score(제조 필요도) 내림차순
-            - 리포트 탭 명칭 개발 → 제조 (공정서 미확보 표준생약 제조 대상)
-            - 현황 탭: 로드맵·자동 종합 의견 제거, KPI·공정서·재고 수치만 표시
+            - 시급 TOP20: Need Score·커버리지 하한선 제거 — 유형별 점수 내림차순 상위 20건 무조건 수록
+            - 종합현황 대시보드: v1.74 지표 양식·집계 복구, 로드맵/자동 종합 의견 미표출(Pure KPI)
 
             ## Assets
             - `${{ steps.exe.outputs.name }}` (Windows one-file, Python 3.12 / PE VERSIONINFO 포함)

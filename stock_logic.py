@@ -2437,44 +2437,96 @@ def _urgent_row_std_type(row: dict[str, Any]) -> str:
     return normalize_std_type(raw) or str(raw or "").strip()
 
 
+_URGENT_EXCLUDED_CATEGORIES = frozenset(
+    {ZERO_STOCK_CATEGORY, DORMANT_STOCK_CATEGORY}
+)
+
+
+def _urgent_row_key(row: dict[str, Any]) -> str:
+    return str(row.get("manage_no") or row.get("label") or row.get("name_ko") or "")
+
+
+def _urgent_row_is_stocked(row: dict[str, Any]) -> bool:
+    """미보유·재고0 행 제외 (시급 TOP 후보)."""
+    if row.get("stock_zero") or row.get("name_level_zero"):
+        return False
+    cat = str(row.get("depletion_category") or "")
+    if cat in _URGENT_EXCLUDED_CATEGORIES:
+        return False
+    return True
+
+
+def _collect_urgent_pool_rows(flags: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """시급 후보 전수 — 점수/커버리지 하한선 없이 보유 품목 전부."""
+    f = flags or {}
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(row: dict[str, Any]) -> None:
+        if not _urgent_row_is_stocked(row):
+            return
+        key = _urgent_row_key(row)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        rows.append(dict(row))
+
+    cat = f.get("depletion_category_items") or {}
+    for bucket, bucket_rows in cat.items():
+        if bucket in _URGENT_EXCLUDED_CATEGORIES:
+            continue
+        for r in bucket_rows or []:
+            _add(r)
+
+    # by_code: 카테고리 누락 보완 (std_type 있는 행만)
+    for code, st in (f.get("by_code") or {}).items():
+        if not isinstance(st, dict):
+            continue
+        row = dict(st)
+        row.setdefault("manage_no", code)
+        _add(row)
+
+    # manufacture_candidates: 커버리지 필터 없이 병합
+    mfg = f.get("manufacture_candidates") or {}
+    for bucket in (mfg.get("표준생약") or []) + (mfg.get("지표성분") or []):
+        _add(bucket)
+
+    return rows
+
+
 def _collect_urgent_rows(
     flags: dict[str, Any] | None,
     *,
     limit: int | None = REPORT_URGENT_TOP_N,
     std_type: str | None = None,
+    coverage_max_years: float | None = None,
+    min_priority_score: float | None = None,
 ) -> list[dict[str, Any]]:
-    """커버리지 1~2년(긴급제조·제조준비) 시급 품목.
+    """시급 품목 — Need Score 내림차순.
 
-    정렬: 제조 필요도 점수(Need Score) 내림차순.
-    std_type이 있으면 해당 유형만, limit이 None이면 전수.
+    기본: 점수·커버리지 하한선 없음(TOP N 무조건).
+    coverage_max_years / min_priority_score는 로드맵 집계 등 선택적 필터.
     """
-    f = flags or {}
-    cat = f.get("depletion_category_items") or {}
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for bucket in ("긴급제조(<1년)", "제조준비(1~2년)"):
-        for r in cat.get(bucket) or []:
-            key = str(r.get("manage_no") or r.get("label") or r.get("name_ko") or "")
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            rows.append(dict(r))
-    # fallback: manufacture candidates with years_left <= 2
-    need_fallback = limit is None or len(rows) < limit
-    if need_fallback:
-        mfg = f.get("manufacture_candidates") or {}
-        for bucket in (mfg.get("표준생약") or []) + (mfg.get("지표성분") or []):
-            yl = bucket.get("years_left")
-            if not isinstance(yl, (int, float)) or yl > 2.0:
-                continue
-            key = str(bucket.get("manage_no") or bucket.get("label") or "")
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            rows.append(dict(bucket))
+    rows = _collect_urgent_pool_rows(flags)
     if std_type:
         want = normalize_std_type(std_type) or std_type
         rows = [r for r in rows if _urgent_row_std_type(r) == want]
+    if coverage_max_years is not None:
+        cap = float(coverage_max_years)
+        filtered: list[dict[str, Any]] = []
+        for r in rows:
+            yl = r.get("years_left")
+            if isinstance(yl, (int, float)) and float(yl) <= cap:
+                filtered.append(r)
+        rows = filtered
+    if min_priority_score is not None:
+        thr = float(min_priority_score)
+        rows = [
+            r
+            for r in rows
+            if isinstance(r.get("priority_score"), (int, float))
+            and float(r["priority_score"]) >= thr
+        ]
     rows.sort(
         key=lambda r: (
             -float(r.get("priority_score") or 0),
@@ -2492,13 +2544,21 @@ def _collect_urgent_rows_by_std_type(
     *,
     limit_per_type: int = REPORT_URGENT_TOP_N,
 ) -> dict[str, list[dict[str, Any]]]:
-    """시급 품목을 표준생약 / 지표성분 TOP N으로 분리."""
+    """시급 품목을 표준생약 / 지표성분 Need Score TOP N으로 분리 (하한선 없음)."""
     return {
         "표준생약": _collect_urgent_rows(
-            flags, limit=limit_per_type, std_type="표준생약"
+            flags,
+            limit=limit_per_type,
+            std_type="표준생약",
+            coverage_max_years=None,
+            min_priority_score=None,
         ),
         "지표성분": _collect_urgent_rows(
-            flags, limit=limit_per_type, std_type="지표성분"
+            flags,
+            limit=limit_per_type,
+            std_type="지표성분",
+            coverage_max_years=None,
+            min_priority_score=None,
         ),
     }
 
@@ -2615,7 +2675,7 @@ def format_slim_dashboard_markdown(
     flags: dict[str, Any] | None = None,
     match_result: dict[str, Any] | None = None,
 ) -> str:
-    """① 종합현황 대시보드 — 핵심 지표만 (전수 목록 없음)."""
+    """① 종합현황 대시보드 — v1.74 지표 양식(순수 KPI, 로드맵·종합의견 없음)."""
     f = flags or {}
     dashboard = f.get("dashboard") or {}
     kpis = list(dashboard.get("kpis") or [])
@@ -2625,6 +2685,7 @@ def format_slim_dashboard_markdown(
 
     managed = next((k for k in kpis if k.get("key") == "managed"), None)
     total_n = int((managed or {}).get("value") or 0)
+    # v1.74와 동일: 관리구간 집계는 depletion_category_items 기준
     urgent_1_3 = (
         len(cat.get("긴급제조(<1년)") or [])
         + len(cat.get("제조준비(1~2년)") or [])
@@ -2635,6 +2696,13 @@ def format_slim_dashboard_markdown(
         cat.get("과다재고검토(10~15년)") or []
     )
     reduce_n = len(f.get("manufacture_reduce_items") or [])
+    # KPI 대시보드에 축소 건수가 있으면 우선 (build_kpi_dashboard와 정합)
+    reduce_kpi = next((k for k in kpis if k.get("key") == "manufacture_reduce"), None)
+    if reduce_kpi is not None and reduce_kpi.get("value") is not None:
+        try:
+            reduce_n = int(reduce_kpi.get("value") or reduce_n)
+        except (TypeError, ValueError):
+            pass
     herb_pct = st.get("herb_coverage_pct")
     origin_pct = st.get("origin_coverage_pct")
     herb_txt = (
@@ -2649,6 +2717,8 @@ def format_slim_dashboard_markdown(
     lines = [
         "## 종합현황 대시보드",
         "",
+        "요약형 핵심 지표 (10~15페이지 보고서 · 전수 목록은 부록에서 선택)",
+        "",
         "| 지표 | 값 |",
         "| --- | --- |",
         f"| 전체 품목 수 | {total_n}종 |",
@@ -2660,7 +2730,7 @@ def format_slim_dashboard_markdown(
         f"| 제조 축소/보존 검토 | {reduce_n}종 |",
         "",
     ]
-    # 보조 KPI(환산·신뢰도 등) — 최대 6개
+    # 보조 KPI(환산·신뢰도 등) — 최대 6개 (v1.74와 동일 키)
     extra_keys = {"total_value", "reliability_ab", "accel", "zero_stock", "manufacture"}
     extras = [k for k in kpis if k.get("key") in extra_keys][:6]
     if extras:
@@ -2671,7 +2741,7 @@ def format_slim_dashboard_markdown(
         for k in extras:
             lines.append(f"| {k.get('label')} | {k.get('display')} |")
         lines.append("")
-    # 로드맵·종합 의견은 현황 탭에 넣지 않음 (로드맵 탭과 중복 방지)
+    # 로드맵·자동 종합 의견은 현황 탭에 넣지 않음 (로드맵 탭과 중복 방지)
     return "\n".join(lines)
 
 
@@ -2680,16 +2750,15 @@ def format_urgent_manufacture_markdown(
     *,
     limit: int = REPORT_URGENT_TOP_N,
 ) -> str:
-    """② 제조 시급 — 표준생약 TOP N · 지표성분 TOP N (Need Score 내림차순)."""
+    """② 제조 시급 — 표준생약 TOP N · 지표성분 TOP N (Need Score 내림차순, 하한선 없음)."""
     by_type = _collect_urgent_rows_by_std_type(flags, limit_per_type=limit)
     std_rows = by_type.get("표준생약") or []
     ind_rows = by_type.get("지표성분") or []
     lines = [
         "## 제조 시급 품목 리스트",
         "",
-        "재고 커버리지 1~2년 이내 소진 예상 · "
         f"**표준생약 TOP {limit}** / **지표성분 TOP {limit}** "
-        "(제조 필요도 점수 높은 순)",
+        "(제조 필요도 점수 높은 순 · 점수·커버리지 하한선 없음)",
         "",
         f"{PRIORITY_FORMULA_KO}",
         "",
@@ -2870,11 +2939,12 @@ def format_roadmap_markdown(
 ) -> str:
     """⑤ 로드맵 총괄 제안 — 유지/확대/신규/축소 + 실데이터 건수·예시."""
     f = flags or {}
-    urgent_rows = _collect_urgent_rows(f, limit=5)
+    # 로드맵 '시급(1~2년)' 문구용 — 커버리지 상한만 적용 (점수 하한 없음)
+    urgent_rows = _collect_urgent_rows(f, limit=5, coverage_max_years=2.0)
     reduce_rows = _collect_reduce_rows(f, limit=5)
     by_kind = _collect_develop_rows_by_kind(f, match_result, limit_per_kind=5)
     develop_rows = (by_kind.get("KP") or []) + (by_kind.get("KHP") or []) + (by_kind.get("기타") or [])
-    urgent_n = len(_collect_urgent_rows(f, limit=None))
+    urgent_n = len(_collect_urgent_rows(f, limit=None, coverage_max_years=2.0))
     reduce_n = len(_collect_reduce_rows(f, limit=9999))
     develop_n = sum(len(v) for v in by_kind.values())
     # 가속 모니터링은 전체 목록 길이 사용
@@ -3336,7 +3406,7 @@ def _mandatory_section_has_source_data(
     if section_key == "summary":
         return bool((f.get("dashboard") or {}).get("kpis")) or bool(f.get("by_code"))
     if section_key in ("urgent", "deplete", "manufacture"):
-        return bool(_collect_urgent_rows(f, limit=1)) or bool(
+        return bool(_collect_urgent_rows(f, limit=1)) or bool(f.get("by_code")) or bool(
             (f.get("manufacture_candidates") or {}).get("표준생약")
         ) or bool((f.get("manufacture_candidates") or {}).get("지표성분"))
     if section_key == "reduce":
@@ -3475,6 +3545,7 @@ def collect_ai_analysis_flags(items: list[StockItem]) -> dict[str, Any]:
             "name_ko": it.name_ko,
             "name_en": _cell_str(getattr(it, "name_en", None)),
             "manage_no": it.manage_no,
+            "std_type": it.std_type,
             "speed": stats["speed"],
             "years_left": stats["years_left"],
             "coverage_years": stats.get("coverage_years", stats.get("years_left")),
@@ -4249,12 +4320,13 @@ def build_ai_prompt(
         "- 수치를 임의로 바꾸거나 없는 품목을 지어내지 마세요.",
         "- 서술: ①현황 수치 → ②원인 → ③권고. '제언' 섹션 금지.",
         "- 보고서는 10~15페이지 요약형입니다. 전수 품목 나열 금지.",
-        "- 정량 표(시급 표준생약/지표성분 TOP20·축소·제조 대상)는 앱이 주입하므로 모델은 해석·로드맵만 작성.",
+        "- 정량 표(시급 표준생약/지표성분 Need Score TOP20·축소·제조 대상)는 앱이 주입하므로 모델은 해석·로드맵만 작성.",
+        "- 시급 TOP20은 점수·커버리지 하한선 없이 유형별 상위 20건이다. 표 행을 줄이거나 재필터하지 마세요.",
         "- ## 종합현황 대시보드에는 KPI 수치만 두고, 로드맵·유지/확대/신규/축소 제안은 쓰지 마세요.",
         "",
         "[출력 — 요약형 5섹션만]",
         "1. ## 종합현황 대시보드 — 핵심 KPI만 (표 재구성·로드맵 문구 금지)",
-        "2. ## 제조 시급 품목 — 표준생약/지표성분 TOP20(Need Score) 의미·위험 요인 요약",
+        "2. ## 제조 시급 품목 — 표준생약/지표성분 TOP20(Need Score, 하한선 없음) 의미·위험 요인 요약",
         "3. ## 과다재고 및 제조 축소 권고 — 상위 품목 시사점",
         "4. ## 공정서 미확보 표준생약 제조 대상 — KP/KHP 분리 우선순위 제언",
         "5. ## 로드맵 총괄 제안 — 반드시 ### 유지 / ### 확대 / ### 신규 / ### 축소 "

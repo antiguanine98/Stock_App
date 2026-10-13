@@ -567,11 +567,14 @@ def test_ensure_mandatory_report_sections():
     assert "로드맵 총괄 제안" in filled
     assert "본문이 없습니다" not in filled
     assert "공정서 미확보 표준생약 제조 대상" in filled
-    # 현황에는 자동 종합 의견·로드맵 제안 문구 없음
+    # 현황: v1.74 지표 양식 + 자동 종합 의견·로드맵 제안 문구 없음
     summary_md = format_slim_dashboard_markdown(flags, match)
+    assert "요약형 핵심 지표" in summary_md
     assert "자동 종합 의견" not in summary_md
     assert "로드맵 제안은 여기 있으면 안 됨" not in summary_md
     assert "전체 품목 수" in summary_md
+    assert "공정서 품목 확보율" in summary_md
+    assert "보조 지표" in summary_md or "총 분양" in summary_md or "전체 품목 수" in summary_md
 
     secs = split_markdown_report_sections(filled, flags=flags, match_result=match)
     by_id = {s["id"]: s for s in secs}
@@ -1625,6 +1628,116 @@ def test_slim_report_five_sections_no_full_catalog_blowup():
     assert urgent_md.index("시급0") < urgent_md.index("시급1")
     appendix = format_appendix_full_catalog_markdown(flags)
     assert "부록" in appendix
+
+
+def test_urgent_top20_no_score_or_coverage_cutoff():
+    """시급 TOP20은 점수·커버리지 하한선 없이 유형별 상위 20건을 무조건 수록."""
+    from stock_logic import (
+        _collect_urgent_rows,
+        _collect_urgent_rows_by_std_type,
+        format_slim_dashboard_markdown,
+        format_urgent_manufacture_markdown,
+    )
+
+    # 커버리지 5년·점수 50 미만만 있어도 표준생약 25건 → TOP20 전부 출력
+    std_rows = [
+        {
+            "name_ko": f"표준{i}",
+            "manage_no": f"S{i}",
+            "std_type": "표준생약",
+            "years_left": 5.0,
+            "priority_score": 50 - i,  # 50 … 26 (80 미만)
+            "depletion_category": "적정(5~10년)",
+        }
+        for i in range(25)
+    ]
+    ind_rows = [
+        {
+            "name_ko": f"지표{i}",
+            "manage_no": f"I{i}",
+            "std_type": "지표성분",
+            "years_left": 8.0,
+            "priority_score": 40 - i,
+            "depletion_category": "적정(5~10년)",
+        }
+        for i in range(22)
+    ]
+    flags = {
+        "dashboard": {
+            "kpis": [
+                {"key": "managed", "label": "대상품목 수", "value": 47, "display": "47종"},
+                {
+                    "key": "manufacture_reduce",
+                    "label": "제조 축소/보존 검토",
+                    "value": 3,
+                    "display": "3종",
+                },
+                {
+                    "key": "total_value",
+                    "label": "총 분양 환산금액",
+                    "value": 1000,
+                    "display": "1,000원",
+                },
+            ],
+            "summary_lines": ["로드맵 제안은 현황에 나오면 안 됨"],
+        },
+        "depletion_category_items": {
+            "긴급제조(<1년)": [],  # 1~2년 버킷이 비어 있어도 TOP20 산출
+            "제조준비(1~2년)": [],
+            "적정(5~10년)": std_rows + ind_rows,
+        },
+        "manufacture_candidates": {"표준생약": [], "지표성분": []},
+        "manufacture_reduce_items": [{"name_ko": "축소1"}],
+        "compendium_stats": {
+            "herb_held": 10,
+            "herb_total": 20,
+            "herb_coverage_pct": 50.0,
+            "origin_held": 8,
+            "origin_total": 20,
+            "origin_coverage_pct": 40.0,
+        },
+    }
+
+    by_type = _collect_urgent_rows_by_std_type(flags, limit_per_type=20)
+    assert len(by_type["표준생약"]) == 20
+    assert len(by_type["지표성분"]) == 20
+    # 점수 하한(80)이 있으면 0건이 됨 — 없어야 함
+    assert all(float(r["priority_score"]) < 80 for r in by_type["표준생약"])
+    # 커버리지 >2년이어도 포함
+    assert all(float(r["years_left"]) > 2 for r in by_type["표준생약"])
+    # Need Score 내림차순
+    scores = [float(r["priority_score"]) for r in by_type["표준생약"]]
+    assert scores == sorted(scores, reverse=True)
+    assert by_type["표준생약"][0]["name_ko"] == "표준0"
+    assert "표준20" not in {r["name_ko"] for r in by_type["표준생약"]}
+
+    # min_priority_score를 명시해도 기본 수집 경로에서는 쓰지 않음
+    assert len(_collect_urgent_rows(flags, limit=20, std_type="표준생약")) == 20
+    assert (
+        len(
+            _collect_urgent_rows(
+                flags, limit=20, std_type="표준생약", min_priority_score=80
+            )
+        )
+        == 0
+    )
+
+    md = format_urgent_manufacture_markdown(flags)
+    assert "하한선 없음" in md
+    assert md.count("| 표준") >= 20 or "표준0" in md
+    assert "표준19" in md
+    assert "지표19" in md
+
+    # 현황: v1.74 양식(안내 문구·공정서·커버리지) + 종합의견 없음
+    summary = format_slim_dashboard_markdown(flags)
+    assert "요약형 핵심 지표" in summary
+    assert "전체 품목 수" in summary
+    assert "공정서 품목 확보율" in summary
+    assert "10/20" in summary
+    assert "재고 커버리지 1~2년(시급)" in summary
+    assert "보조 지표" in summary
+    assert "자동 종합 의견" not in summary
+    assert "로드맵 제안은 현황에 나오면 안 됨" not in summary
 
 
 def test_thin_roadmap_replaced_with_pillars_and_examples():
